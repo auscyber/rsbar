@@ -12,6 +12,8 @@ name = "rsbar"
 path = "src/main.rs"
 
 [dependencies]
+async-mach-ports = { workspace = true }
+clap = { version = "4.6", features = ["derive"] }
 rsbar-protocol = { workspace = true }
 
 [lints]

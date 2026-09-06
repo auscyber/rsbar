@@ -9,6 +9,10 @@ repository.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+postcard = { version = "1.1", features = ["use-std"] }
 
 [lints]
 workspace = true

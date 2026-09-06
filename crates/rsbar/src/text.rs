@@ -4,7 +4,6 @@
 //! but its strings change rarely, so [`Text`] keeps the `CTLine` and rebuilds
 //! it only when the string or the font actually changes.
 
-use crate::style::{Color, FontSpec};
 use objc2_core_foundation::{
     CFAttributedString, CFDictionary, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
     kCFBooleanTrue,
@@ -14,6 +13,7 @@ use objc2_core_text::{
     CTFont, CTFontDescriptor, CTLine, kCTFontAttributeName,
     kCTForegroundColorFromContextAttributeName,
 };
+use rsbar_protocol::style::{Color, FontSpec};
 use std::ptr;
 
 /// What a shaped line measures, in points.

@@ -14,6 +14,7 @@ rsbar-protocol = { path = "crates/protocol" }
 skylight = { path = "crates/skylight" }
 
 async-channel = "2.5"
+async-mach-ports = "0.1"
 async-executor = "1.14"
 async-lock = "3.4"
 bitflags = "2.13"
