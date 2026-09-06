@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/auscyber/rsbar"
+
+[workspace.dependencies]
+rsbar-protocol = { path = "crates/protocol" }
+skylight = { path = "crates/skylight" }
+
+async-channel = "2.5"
+async-executor = "1.14"
+async-lock = "3.4"
+bitflags = "2.13"
+futures-lite = "2.6"
+libc = "0.2"
+objc2 = { version = "0.6", features = ["catch-all", "exception"] }
+objc2-app-kit = { version = "0.3", default-features = false }
+objc2-core-foundation = { version = "0.3", default-features = false }
+objc2-core-graphics = { version = "0.3", default-features = false }
+objc2-core-text = { version = "0.3", default-features = false }
+objc2-foundation = { version = "0.3", default-features = false }
+objc2-quartz-core = { version = "0.3", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+tracing = "0.1"
+
+[workspace.lints.clippy]
+pedantic = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = true
