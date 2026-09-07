@@ -2,8 +2,9 @@ use crate::error::{Error, Result, ok};
 use crate::ffi::{self, ConnectionId, WindowId};
 use crate::region::Region;
 use crate::tags::WindowTags;
-use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{CFArray, CFNumber, CFRetained, CFType, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::CGImage;
+use std::cell::Cell;
 use std::ptr;
 use std::ptr::NonNull;
 
@@ -58,6 +59,14 @@ pub struct Window {
     /// A window adopted with [`Window::from_existing`] belongs to someone else
     /// and must not be released on drop.
     owned: bool,
+    /// What this process has asked the window server for, so
+    /// [`Self::set_tags`]/[`Self::clear_tags`] can skip a syscall — and the
+    /// repaint/reframe it can trigger downstream — when asked to apply a
+    /// value that is already in effect. Starts empty even for
+    /// [`Self::from_existing`], where the window's real tags are unknown
+    /// until read with [`Self::tags`]; a first `set_tags`/`clear_tags` call
+    /// on such a window is therefore not skipped even if it would be a no-op.
+    known_tags: Cell<WindowTags>,
 }
 
 impl Window {
@@ -99,6 +108,7 @@ impl Window {
             id,
             connection,
             owned: true,
+            known_tags: Cell::new(WindowTags::empty()),
         })
     }
 
@@ -109,6 +119,7 @@ impl Window {
             id,
             connection: connection(),
             owned: false,
+            known_tags: Cell::new(WindowTags::empty()),
         }
     }
 
@@ -179,24 +190,114 @@ impl Window {
             .map_err(Error::Blur)
     }
 
-    pub fn set_tags(&self, tags: WindowTags) -> Result<()> {
+    /// Adds `tags`, reporting whether any of them were not already set — so a
+    /// caller with its own damage tracking can skip whatever reframe or
+    /// repaint a no-op tag write would otherwise trigger downstream.
+    pub fn set_tags(&self, tags: WindowTags) -> Result<bool> {
+        let before = self.known_tags.get();
+        if before.contains(tags) {
+            return Ok(false);
+        }
         let mut bits = tags.bits();
         // SAFETY: `bits` is a valid in/out pointer of `TAG_BITS` bits.
-        ok(
-            unsafe {
-                ffi::SLSSetWindowTags(self.connection, self.id, &raw mut bits, ffi::TAG_BITS)
-            },
-        )
-        .map_err(Error::Tags)
+        ok(unsafe {
+            ffi::SLSSetWindowTags(self.connection, self.id, &raw mut bits, ffi::TAG_BITS)
+        })
+        .map_err(Error::Tags)?;
+        self.known_tags.set(before.union(tags));
+        Ok(true)
     }
 
-    pub fn clear_tags(&self, tags: WindowTags) -> Result<()> {
+    /// Removes `tags`, reporting whether any of them were set to begin with.
+    /// See [`Self::set_tags`].
+    pub fn clear_tags(&self, tags: WindowTags) -> Result<bool> {
+        let before = self.known_tags.get();
+        if before.intersection(tags).is_empty() {
+            return Ok(false);
+        }
         let mut bits = tags.bits();
         // SAFETY: `bits` is a valid in/out pointer of `TAG_BITS` bits.
         ok(unsafe {
             ffi::SLSClearWindowTags(self.connection, self.id, &raw mut bits, ffi::TAG_BITS)
         })
-        .map_err(Error::Tags)
+        .map_err(Error::Tags)?;
+        self.known_tags.set(before.difference(tags));
+        Ok(true)
+    }
+
+    /// Sets or clears [`WindowTags::STICKY`] as one unit, explicitly setting
+    /// the opposite [`WindowTags::NEVER_STICKY`] tag when turning it off —
+    /// the same set-the-opposite shape `Panels::set_clickable` in `rsbar`
+    /// uses for its own two-state tag toggle. Returns whether anything
+    /// changed.
+    pub fn set_sticky(&self, sticky: bool) -> Result<bool> {
+        let (set, clear) = if sticky {
+            (WindowTags::STICKY, WindowTags::NEVER_STICKY)
+        } else {
+            (WindowTags::NEVER_STICKY, WindowTags::STICKY)
+        };
+        let cleared = self.clear_tags(clear)?;
+        let set = self.set_tags(set)?;
+        Ok(cleared || set)
+    }
+
+    /// Sets or clears [`WindowTags::FRIEND_OF_FULLSCREEN`]. Returns whether
+    /// anything changed.
+    pub fn set_friend_of_fullscreen(&self, friend: bool) -> Result<bool> {
+        if friend {
+            self.set_tags(WindowTags::FRIEND_OF_FULLSCREEN)
+        } else {
+            self.clear_tags(WindowTags::FRIEND_OF_FULLSCREEN)
+        }
+    }
+
+    /// Reads this window's tags back from the window server, rather than
+    /// trusting what this process last asked for — the ground truth this
+    /// crate's own bookkeeping is checked against.
+    ///
+    /// No single-window tag getter is known to yabai, `rift` or `paneru`;
+    /// all three go through the same query-and-iterate path this mirrors
+    /// (yabai's `window_tags()` in `window.c`). Returns empty tags, rather
+    /// than an error, if the window server has nothing to say about this
+    /// window id — matching that C reference's own `uint64_t tags = 0;`
+    /// fallback.
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn tags(&self) -> Result<WindowTags> {
+        let id = CFNumber::new_i32(self.id as i32);
+        let list = CFArray::from_objects(&[&*id]);
+
+        // SAFETY: `list` is a live array of one element for the call, and the
+        // result is either null or a +1 query `list` does not need to outlive.
+        let Some(query) = NonNull::new(unsafe {
+            ffi::SLSWindowQueryWindows(self.connection, CFRetained::as_ptr(&list).as_ptr(), 1)
+        }) else {
+            return Ok(WindowTags::empty());
+        };
+        // SAFETY: `query` carries a +1 reference this now owns.
+        let query = unsafe { CFRetained::<CFType>::from_raw(query) };
+        let query = CFRetained::as_ptr(&query).as_ptr();
+
+        // SAFETY: `query` is live for the call; the result is either null or
+        // a +1 iterator this now owns.
+        let Some(iterator) = NonNull::new(unsafe { ffi::SLSWindowQueryResultCopyWindows(query) })
+        else {
+            return Ok(WindowTags::empty());
+        };
+        // SAFETY: as above.
+        let iterator = unsafe { CFRetained::<CFType>::from_raw(iterator) };
+        let iterator = CFRetained::as_ptr(&iterator).as_ptr();
+
+        // SAFETY: `iterator` is live for both calls below.
+        if unsafe { ffi::SLSWindowIteratorGetCount(iterator) } != 1
+            || !unsafe { ffi::SLSWindowIteratorAdvance(iterator) }
+        {
+            return Ok(WindowTags::empty());
+        }
+        // SAFETY: `iterator` is still live and has just been advanced to a
+        // real entry.
+        Ok(WindowTags::from_bits_retain(unsafe {
+            ffi::SLSWindowIteratorGetTags(iterator)
+        }))
     }
 
     /// Maps the window, above `relative_to` or above everything at its level.

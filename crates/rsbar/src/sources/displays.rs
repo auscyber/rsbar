@@ -58,6 +58,22 @@ impl Drop for Deregister {
     }
 }
 
+/// Whether `id` is the display built into the machine — what notch geometry
+/// keys off of, since only that display can have one. Backed by
+/// `CGDisplayIsBuiltin`; see `skylight::display`'s module docs for what was
+/// and was not verified live.
+#[must_use]
+pub fn is_builtin(id: CGDirectDisplayID) -> bool {
+    skylight::is_builtin(id)
+}
+
+/// Whether `id` is the display carrying the menu bar right now. Backed by
+/// `CGDisplayIsMain`.
+#[must_use]
+pub fn is_main(id: CGDirectDisplayID) -> bool {
+    skylight::is_main(id)
+}
+
 pub struct Displays;
 
 impl Source for Displays {

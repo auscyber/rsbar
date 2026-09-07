@@ -5,7 +5,7 @@
 //! `hs._asm.undocumented.spaces`. Nothing here is in a public SDK header, so
 //! every signature is a claim about an ABI Apple may change.
 
-use objc2_core_foundation::{CFArray, CFString, CFType, CGRect};
+use objc2_core_foundation::{CFArray, CFNumber, CFString, CFType, CGRect};
 use objc2_core_graphics::{CGContext, CGError, CGImage};
 use std::ffi::{c_int, c_void};
 
@@ -134,6 +134,20 @@ unsafe extern "C" {
         tags: *mut u64,
         tag_bits: c_int,
     ) -> CGError;
+
+    /// Reading a window's tags back needs this query-and-iterate pair; there
+    /// is no single-window getter in any of yabai, `rift` or `paneru`.
+    /// Cross-checked against yabai's `window_tags()` (`window.c`) and `rift`'s
+    /// `sys::skylight` bindings of the same four symbols.
+    pub fn SLSWindowQueryWindows(
+        cid: ConnectionId,
+        windows: *mut CFArray<CFNumber>,
+        count: c_int,
+    ) -> *mut CFType;
+    pub fn SLSWindowQueryResultCopyWindows(query: *mut CFType) -> *mut CFType;
+    pub fn SLSWindowIteratorAdvance(iterator: *mut CFType) -> bool;
+    pub fn SLSWindowIteratorGetCount(iterator: *mut CFType) -> c_int;
+    pub fn SLSWindowIteratorGetTags(iterator: *mut CFType) -> u64;
 
     // ---- drawing ----------------------------------------------------------
 

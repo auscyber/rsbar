@@ -22,6 +22,7 @@
 // `# Errors` section would restate that fifteen times.
 #![allow(clippy::missing_errors_doc)]
 
+mod display;
 mod error;
 pub mod ffi;
 mod region;
@@ -29,6 +30,7 @@ mod render;
 mod tags;
 mod window;
 
+pub use display::{is_builtin, is_main};
 pub use error::{Error, Result};
 pub use ffi::{ConnectionId, SpaceId, WindowId};
 pub use render::{draw, draw_damaged, present, without_implicit_animations};

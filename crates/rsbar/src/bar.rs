@@ -10,9 +10,13 @@ use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{CGContext, CGImage};
 use rsbar_protocol::style::Color;
 use rsbar_protocol::{BarPatch, BarState, Edge};
-use skylight::{Window, WindowTags, level};
+use skylight::{Window, WindowTags, is_builtin, level};
 
 #[derive(Resource, Debug, Clone, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each is an independent SketchyBar property, not a state machine in disguise"
+)]
 pub struct Settings {
     pub height: f64,
     pub edge: Edge,
@@ -37,6 +41,24 @@ pub struct Settings {
     pub padding_right: f64,
     /// Which displays the bar appears on at all.
     pub display: DisplayTarget,
+    /// Whether the bar stays put across a space switch.
+    ///
+    /// Defaults to `true`: a bar window carries no tags at all until
+    /// something applies them, so this default is what a freshly created
+    /// window is given at construction (see [`new_window`]) — without it the
+    /// bar would vanish the moment a space switch happened.
+    pub sticky: bool,
+    /// Whether the bar draws over a fullscreen app instead of being covered
+    /// by it. Defaults to `true` for the same reason as [`Self::sticky`].
+    pub show_in_fullscreen: bool,
+    /// Width of the gap the centre-left and centre-right buckets leave
+    /// around the notch. Built-in display only — see [`Self::frame_for`].
+    pub notch_width: f64,
+    /// Extra y-offset applied to the bar's frame. Built-in display only.
+    pub notch_offset: f64,
+    /// Overrides the bar's own height when greater than zero. Built-in
+    /// display only.
+    pub notch_display_height: f64,
 }
 
 impl Default for Settings {
@@ -54,6 +76,11 @@ impl Default for Settings {
             padding_left: 0.0,
             padding_right: 0.0,
             display: DisplayTarget::All,
+            sticky: true,
+            show_in_fullscreen: true,
+            notch_width: 0.0,
+            notch_offset: 0.0,
+            notch_display_height: 0.0,
         }
     }
 }
@@ -97,6 +124,30 @@ impl Settings {
             self.topmost = topmost;
             changes.insert(Changes::LEVEL);
         }
+        if let Some(sticky) = patch.sticky {
+            self.sticky = sticky;
+            changes.insert(Changes::STICKY);
+        }
+        if let Some(show) = patch.show_in_fullscreen {
+            self.show_in_fullscreen = show;
+            changes.insert(Changes::FULLSCREEN);
+        }
+        if let Some(w) = patch.notch_width {
+            // Only the centre-left/centre-right item layout reads this — the
+            // panel window's own frame does not change, so this deliberately
+            // does not set `Changes::GEOMETRY`. `Settings` being a `ResMut`
+            // resource is enough on its own to mark it changed and trigger
+            // `layout`'s next full repaint.
+            self.notch_width = w;
+        }
+        if let Some(o) = patch.notch_offset {
+            self.notch_offset = o;
+            changes.insert(Changes::GEOMETRY);
+        }
+        if let Some(h) = patch.notch_display_height {
+            self.notch_display_height = h;
+            changes.insert(Changes::GEOMETRY);
+        }
         if let Some(p) = patch.padding_left {
             self.padding_left = p;
         }
@@ -118,16 +169,29 @@ impl Settings {
     }
 
     /// Where the bar sits on one display.
+    ///
+    /// `notch_offset` and `notch_display_height` apply only on the built-in
+    /// display, matching `SketchyBar`'s own `bar_get_frame` (`bar.c`
+    /// lines 437-489) — an external monitor has no notch to make room for.
     #[must_use]
     pub fn frame_for(&self, display: &Display) -> CGRect {
         let bounds = display.bounds;
+        let builtin = is_builtin(display.id);
+        let notch_offset = if builtin { self.notch_offset } else { 0.0 };
+        let height = if builtin && self.notch_display_height > 0.0 {
+            self.notch_display_height
+        } else {
+            self.height
+        };
         let y = match self.edge {
-            Edge::Top => bounds.origin.y + self.y_offset,
-            Edge::Bottom => bounds.origin.y + bounds.size.height - self.height - self.y_offset,
+            Edge::Top => bounds.origin.y + self.y_offset + notch_offset,
+            Edge::Bottom => {
+                bounds.origin.y + bounds.size.height - height - self.y_offset - notch_offset
+            }
         };
         CGRect::new(
             CGPoint::new(bounds.origin.x + self.margin, y),
-            CGSize::new(bounds.size.width - 2.0 * self.margin, self.height),
+            CGSize::new(bounds.size.width - 2.0 * self.margin, height),
         )
     }
 
@@ -144,6 +208,11 @@ impl Settings {
             topmost: self.topmost,
             hidden: self.hidden,
             displays,
+            sticky: self.sticky,
+            show_in_fullscreen: self.show_in_fullscreen,
+            notch_width: self.notch_width,
+            notch_offset: self.notch_offset,
+            notch_display_height: self.notch_display_height,
         }
     }
 }
@@ -161,6 +230,11 @@ bitflags::bitflags! {
         /// Which displays have a panel at all, as opposed to [`Self::GEOMETRY`]
         /// which only moves panels that already exist.
         const DISPLAYS = 1 << 4;
+        /// `sticky` changed — [`Panels::set_sticky`] needs a call.
+        const STICKY = 1 << 5;
+        /// `show_in_fullscreen` changed — [`Panels::set_show_in_fullscreen`]
+        /// needs a call.
+        const FULLSCREEN = 1 << 6;
     }
 }
 
@@ -319,6 +393,47 @@ impl Panels {
         Ok(())
     }
 
+    /// Makes the bar stay put across a space switch, or not.
+    ///
+    /// # Errors
+    ///
+    /// Returns the window server's error if a window rejects the change.
+    pub fn set_sticky(&self, sticky: bool) -> skylight::Result<()> {
+        for panel in &self.panels {
+            panel.window.set_sticky(sticky)?;
+        }
+        Ok(())
+    }
+
+    /// Makes the bar draw over a fullscreen app, or not.
+    ///
+    /// # Errors
+    ///
+    /// Returns the window server's error if a window rejects the change.
+    pub fn set_show_in_fullscreen(&self, show: bool) -> skylight::Result<()> {
+        for panel in &self.panels {
+            panel.window.set_friend_of_fullscreen(show)?;
+        }
+        Ok(())
+    }
+
+    /// How wide one display's bar is, for anything that has to stay on it.
+    #[must_use]
+    pub fn width_for(&self, display: u32) -> Option<f64> {
+        self.panels
+            .iter()
+            .find(|p| p.display.id == display)
+            .map(|p| p.frame.size.width)
+    }
+
+    #[must_use]
+    pub fn scale_for(&self, display: u32) -> f64 {
+        self.panels
+            .iter()
+            .find(|p| p.display.id == display)
+            .map_or(1.0, |p| p.display.scale)
+    }
+
     /// # Errors
     ///
     /// Returns the window server's error if a window rejects the change.
@@ -360,6 +475,12 @@ fn new_window(
         WindowTags::IGNORE_FOR_EVENTS
     };
     window.set_tags(WindowTags::BAR | pointer)?;
+    // `WindowTags::BAR` deliberately excludes these two — they are options a
+    // running bar can flip, not fixed facts about being a bar — so a freshly
+    // created window needs them applied explicitly or it vanishes on the
+    // first space switch or fullscreen app.
+    window.set_sticky(settings.sticky)?;
+    window.set_friend_of_fullscreen(settings.show_in_fullscreen)?;
     if settings.blur_radius != 0 {
         window.set_blur_radius(settings.blur_radius)?;
     }
