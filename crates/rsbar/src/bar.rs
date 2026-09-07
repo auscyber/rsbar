@@ -20,6 +20,14 @@ pub struct Settings {
     pub corner_radius: f64,
     pub blur_radius: i32,
     pub hidden: bool,
+    /// Whether the bar draws above the system menu bar or below it.
+    ///
+    /// Below by default. The bar occupies the menu bar's own strip either
+    /// way — that is where a status bar goes — but underneath, the menu
+    /// extras and the notification centre still draw and still take clicks.
+    /// Above, the bar covers them with no way to get at them, which is
+    /// `SketchyBar`'s look and wants the system menu bar set to hide itself.
+    pub topmost: bool,
 }
 
 impl Default for Settings {
@@ -33,6 +41,7 @@ impl Default for Settings {
             corner_radius: 0.0,
             blur_radius: 0,
             hidden: false,
+            topmost: false,
         }
     }
 }
@@ -41,22 +50,22 @@ impl Settings {
     /// Applies a patch, reporting whether anything about the geometry moved —
     /// the caller has to reshape the windows if so.
     pub fn apply(&mut self, patch: &BarPatch) -> Changes {
-        let mut changes = Changes::default();
+        let mut changes = Changes::empty();
         if let Some(h) = patch.height {
             self.height = h;
-            changes.geometry = true;
+            changes.insert(Changes::GEOMETRY);
         }
         if let Some(e) = patch.edge {
             self.edge = e;
-            changes.geometry = true;
+            changes.insert(Changes::GEOMETRY);
         }
         if let Some(m) = patch.margin {
             self.margin = m;
-            changes.geometry = true;
+            changes.insert(Changes::GEOMETRY);
         }
         if let Some(y) = patch.y_offset {
             self.y_offset = y;
-            changes.geometry = true;
+            changes.insert(Changes::GEOMETRY);
         }
         if let Some(c) = patch.color {
             self.color = Color(c);
@@ -66,11 +75,15 @@ impl Settings {
         }
         if let Some(r) = patch.blur_radius {
             self.blur_radius = r;
-            changes.blur = true;
+            changes.insert(Changes::BLUR);
         }
         if let Some(hidden) = patch.hidden {
             self.hidden = hidden;
-            changes.visibility = true;
+            changes.insert(Changes::VISIBILITY);
+        }
+        if let Some(topmost) = patch.topmost {
+            self.topmost = topmost;
+            changes.insert(Changes::LEVEL);
         }
         changes
     }
@@ -99,18 +112,24 @@ impl Settings {
             y_offset: self.y_offset,
             corner_radius: self.corner_radius,
             blur_radius: self.blur_radius,
+            topmost: self.topmost,
             hidden: self.hidden,
             displays,
         }
     }
 }
 
-/// What a patch touched that needs more than a repaint.
-#[derive(Default, Debug, Clone, Copy)]
-pub struct Changes {
-    pub geometry: bool,
-    pub blur: bool,
-    pub visibility: bool,
+bitflags::bitflags! {
+    /// What a patch touched that needs more than a repaint.
+    #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Changes: u8 {
+        /// The windows have to be reframed.
+        const GEOMETRY = 1 << 0;
+        const BLUR = 1 << 1;
+        const VISIBILITY = 1 << 2;
+        /// Above or below the system menu bar.
+        const LEVEL = 1 << 3;
+    }
 }
 
 /// The bar on one display.
@@ -222,6 +241,18 @@ impl Panels {
         Ok(())
     }
 
+    /// Moves the bar above or below the system menu bar.
+    ///
+    /// # Errors
+    ///
+    /// Returns the window server's error if a window rejects the change.
+    pub fn set_level(&self, settings: &Settings) -> skylight::Result<()> {
+        for panel in &self.panels {
+            panel.window.set_level(bar_level(settings))?;
+        }
+        Ok(())
+    }
+
     /// Makes the bar take clicks, or let them through.
     ///
     /// Off by default, and turned on only once something wants a click. A bar
@@ -260,6 +291,15 @@ impl Panels {
     }
 }
 
+/// Where the bar sits relative to the system menu bar.
+fn bar_level(settings: &Settings) -> std::ffi::c_int {
+    if settings.topmost {
+        level::STATUS
+    } else {
+        level::BACKSTOP_MENU
+    }
+}
+
 fn new_window(
     frame: CGRect,
     display: &Display,
@@ -270,7 +310,7 @@ fn new_window(
     window.set_scale(display.scale)?;
     window.set_opaque(false)?;
     window.set_alpha(1.0)?;
-    window.set_level(level::STATUS)?;
+    window.set_level(bar_level(settings))?;
     let pointer = if clickable {
         WindowTags::OPAQUE_FOR_EVENTS
     } else {

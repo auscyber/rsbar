@@ -5,7 +5,7 @@
     reason = "Bevy system parameters are taken by value by contract"
 )]
 
-use crate::bar::{Panels, Settings};
+use crate::bar::{Changes, Panels, Settings};
 use crate::components::{
     Background, ClickScript, Drawing, Icon, Index, Label, Name, Offset, Padding, Placement,
     Routine, Run, Script, Stale, Subscriptions, bundle,
@@ -372,14 +372,17 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             tracing::debug!(?patch, "set bar");
             let changes = settings.apply(&patch);
             let result = (|| -> skylight::Result<()> {
-                if changes.geometry {
+                if changes.contains(Changes::GEOMETRY) {
                     panels.reframe(settings)?;
                 }
-                if changes.blur {
+                if changes.contains(Changes::BLUR) {
                     panels.set_blur(settings.blur_radius)?;
                 }
-                if changes.visibility {
+                if changes.contains(Changes::VISIBILITY) {
                     panels.set_hidden(settings.hidden)?;
+                }
+                if changes.contains(Changes::LEVEL) {
+                    panels.set_level(settings)?;
                 }
                 Ok(())
             })();

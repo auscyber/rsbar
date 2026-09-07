@@ -133,6 +133,8 @@ pub struct BarPatch {
     pub corner_radius: Option<f64>,
     pub blur_radius: Option<i32>,
     pub hidden: Option<bool>,
+    /// Whether the bar sits above the system menu bar or below it.
+    pub topmost: Option<bool>,
 }
 
 /// A partial update to one item.
@@ -207,6 +209,7 @@ pub struct BarState {
     pub y_offset: f64,
     pub corner_radius: f64,
     pub blur_radius: i32,
+    pub topmost: bool,
     pub hidden: bool,
     pub displays: usize,
 }

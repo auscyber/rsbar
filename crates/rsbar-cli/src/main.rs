@@ -76,6 +76,9 @@ struct BarOptions {
     blur_radius: Option<i32>,
     #[arg(long)]
     hidden: Option<bool>,
+    /// Draw over the system menu bar instead of underneath it.
+    #[arg(long)]
+    topmost: Option<bool>,
 }
 
 #[derive(Subcommand)]
@@ -186,6 +189,7 @@ impl From<BarOptions> for BarPatch {
             y_offset: o.y_offset,
             corner_radius: o.corner_radius,
             blur_radius: o.blur_radius,
+            topmost: o.topmost,
             hidden: o.hidden,
         }
     }
