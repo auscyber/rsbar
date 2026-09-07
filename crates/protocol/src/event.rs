@@ -11,6 +11,7 @@
 
 use crate::Json;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -132,13 +133,13 @@ macro_rules! events {
 
             impl $data {
                 /// This payload's fields, as a script sees them.
-                // Built by pushing because the field list is a macro
-                // repetition; `vec![]` cannot be written for one.
-                #[allow(unused_mut, clippy::vec_init_then_push)]
+                // Built by inserting because the field list is a macro
+                // repetition; a map literal cannot be written for one.
+                #[allow(unused_mut)]
                 #[must_use]
-                pub fn fields(&self) -> Vec<(String, String)> {
-                    let mut fields = Vec::new();
-                    $( fields.push((stringify!($field).to_owned(), self.$field.to_string())); )*
+                pub fn fields(&self) -> BTreeMap<String, String> {
+                    let mut fields = BTreeMap::new();
+                    $( fields.insert(stringify!($field).to_owned(), self.$field.to_string()); )*
                     fields
                 }
             }
@@ -171,7 +172,7 @@ macro_rules! events {
 
             /// The payload's fields, as a script sees them.
             #[must_use]
-            pub fn fields(&self) -> Vec<(String, String)> {
+            pub fn fields(&self) -> BTreeMap<String, String> {
                 match self {
                     $( Self::$variant(data) => data.fields(), )*
                     Self::Custom(custom) => custom.fields(),
@@ -279,10 +280,10 @@ pub struct Custom {
 }
 
 impl Custom {
-    fn fields(&self) -> Vec<(String, String)> {
+    fn fields(&self) -> BTreeMap<String, String> {
         match &self.data {
-            Json::Null => Vec::new(),
-            data => vec![("data".to_owned(), data.to_string())],
+            Json::Null => BTreeMap::new(),
+            data => BTreeMap::from([("data".to_owned(), data.to_string())]),
         }
     }
 }
@@ -296,23 +297,27 @@ impl Event {
     /// already reaches for. Every field also arrives under its own name, so a
     /// script that wants the volume can read `RSBAR_VOLUME` instead of parsing.
     #[must_use]
-    pub fn env(&self) -> Vec<(String, String)> {
+    pub fn env(&self) -> BTreeMap<String, String> {
         let fields = self.fields();
-        let info = match fields.as_slice() {
-            [] => String::new(),
-            [(_, only)] => only.clone(),
-            many => Json::Object(
-                many.iter()
-                    .map(|(k, v)| (k.clone(), Json::String(v.clone())))
-                    .collect(),
-            )
-            .to_string(),
+        let info = {
+            let mut values = fields.values();
+            match (values.next(), values.next()) {
+                (None, _) => String::new(),
+                (Some(only), None) => only.clone(),
+                _ => Json::Object(
+                    fields
+                        .iter()
+                        .map(|(k, v)| (k.clone(), Json::String(v.clone())))
+                        .collect(),
+                )
+                .to_string(),
+            }
         };
 
-        let mut env = vec![
+        let mut env = BTreeMap::from([
             ("RSBAR_SENDER".to_owned(), self.kind().name().to_owned()),
             ("RSBAR_INFO".to_owned(), info),
-        ];
+        ]);
         env.extend(
             fields
                 .into_iter()
@@ -390,9 +395,9 @@ mod tests {
     #[test]
     fn a_single_field_becomes_info_directly() {
         let env = Event::VolumeChanged(VolumeChange { volume: 42 }).env();
-        assert!(env.contains(&("RSBAR_SENDER".into(), "volume_changed".into())));
-        assert!(env.contains(&("RSBAR_INFO".into(), "42".into())));
-        assert!(env.contains(&("RSBAR_VOLUME".into(), "42".into())));
+        assert_eq!(env["RSBAR_SENDER"], "volume_changed");
+        assert_eq!(env["RSBAR_INFO"], "42");
+        assert_eq!(env["RSBAR_VOLUME"], "42");
     }
 
     #[test]
@@ -402,20 +407,19 @@ mod tests {
             space: 7,
         })
         .env();
-        assert!(env.contains(&("RSBAR_DISPLAY".into(), "2".into())));
-        assert!(env.contains(&("RSBAR_SPACE".into(), "7".into())));
-        let info = env.iter().find(|(k, _)| k == "RSBAR_INFO").unwrap();
+        assert_eq!(env["RSBAR_DISPLAY"], "2");
+        assert_eq!(env["RSBAR_SPACE"], "7");
+        let info = &env["RSBAR_INFO"];
         assert!(
-            info.1.contains("\"display\""),
-            "several fields render as an object: {}",
-            info.1
+            info.contains("\"display\""),
+            "several fields render as an object: {info}"
         );
     }
 
     #[test]
     fn an_empty_payload_still_sets_info_so_a_script_never_sees_it_unset() {
         let env = Event::SystemWoke(SystemWoke {}).env();
-        assert!(env.contains(&("RSBAR_INFO".into(), String::new())));
+        assert_eq!(env["RSBAR_INFO"], "");
     }
 
     #[test]
@@ -426,8 +430,8 @@ mod tests {
         });
         assert_eq!(event.kind(), Kind::Custom("my.event".into()));
         let env = event.env();
-        assert!(env.contains(&("RSBAR_SENDER".into(), "my.event".into())));
-        assert!(env.contains(&("RSBAR_INFO".into(), "hi".into())));
+        assert_eq!(env["RSBAR_SENDER"], "my.event");
+        assert_eq!(env["RSBAR_INFO"], "hi");
     }
 
     #[test]
@@ -477,8 +481,8 @@ mod tests {
             y: 8.0,
         });
         let env = click.env();
-        assert!(env.contains(&("RSBAR_BUTTON".into(), "right".into())));
-        assert!(env.contains(&("RSBAR_MODIFIERS".into(), "shift,cmd".into())));
+        assert_eq!(env["RSBAR_BUTTON"], "right");
+        assert_eq!(env["RSBAR_MODIFIERS"], "shift,cmd");
     }
 
     #[test]

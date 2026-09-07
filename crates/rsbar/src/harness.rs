@@ -283,8 +283,8 @@ mod tests {
             app: "Finder".into(),
         }));
         let env = jobs[0].event.env();
-        assert!(env.contains(&("RSBAR_SENDER".into(), "front_app_switched".into())));
-        assert!(env.contains(&("RSBAR_APP".into(), "Finder".into())));
+        assert_eq!(env["RSBAR_SENDER"], "front_app_switched");
+        assert_eq!(env["RSBAR_APP"], "Finder");
     }
 
     #[test]
