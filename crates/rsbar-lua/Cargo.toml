@@ -1,0 +1,68 @@
+[package]
+name = "rsbar-lua"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The rsbar Lua API: a host-agnostic `install()` plus an IPC client, used both by the daemon's embedded runtime and by the standalone `require(\"rsbar\")` module."
+publish = false
+
+# `rlib` is what the daemon links against to host the API in-process.
+# `cdylib` is the loadable Lua module a foreign interpreter's `require` can
+# dlopen (built with the `module` feature — see below).
+[lib]
+name = "rsbar_lua"
+crate-type = ["rlib", "cdylib"]
+
+# The recommended way to run a config: a small binary that hosts a vendored
+# LuaJIT itself, pre-loads `package.loaded.rsbar` and runs the given script.
+# No dynamic module loading involved, which sidesteps the two-Lua-runtimes
+# hazard described below.
+[[bin]]
+name = "rsbar-lua"
+path = "src/bin/rsbar_lua.rs"
+required-features = ["vendored"]
+
+# Building this crate happens in one of two, mutually exclusive, shapes:
+#
+#   cargo build -p rsbar-lua --features vendored,luajit
+#     The default for the bin above and for anything embedding this crate as
+#     an rlib (the daemon): mlua compiles its own LuaJIT and links it in.
+#
+#   cargo build -p rsbar-lua --no-default-features --features module,luajit --lib
+#     The cdylib for `require("rsbar")` from an *existing* Lua/LuaJIT process
+#     (a text editor's scripting host, say). `module` leaves the `lua_*`
+#     symbols undefined so they resolve against the host's own interpreter at
+#     load time — required here, because linking a second, independent copy of
+#     the Lua runtime into the same process and pointing it at a `lua_State*`
+#     the *other* copy created is unsound. mlua enforces that `vendored` and
+#     `module` are never both enabled.
+[features]
+# Vendored LuaJIT by default so `cargo check`/`cargo build` on this crate
+# alone — and until the daemon depends on it and picks its own features via
+# unification — just works with no system Lua install required.
+default = ["vendored", "luajit"]
+vendored = ["mlua/vendored"]
+luajit = ["mlua/luajit"]
+lua54 = ["mlua/lua54"]
+module = ["mlua/module"]
+
+[dependencies]
+# `async`: every verb in `api.rs` awaits the dispatcher instead of blocking.
+mlua = { version = "0.12", default-features = false, features = ["async"] }
+rsbar-protocol = { workspace = true }
+async-mach-ports = { workspace = true }
+futures-lite = { workspace = true }
+# `SelectAll`, for merging every subscribed item's event stream into one
+# `rsbar.run()` loop without spawning a task per item.
+futures-util = { version = "0.3", default-features = false, features = ["std", "alloc"] }
+# Only the bin needs an actual runtime (`rt`) to drive `exec_async`; the
+# library half uses `tokio::sync` per workspace convention.
+tokio = { workspace = true, features = ["rt"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+
+[lints]
+workspace = true
