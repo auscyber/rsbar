@@ -11,8 +11,10 @@
 //! arguments; with none, it starts the daemon instead. That split belongs to
 //! `main.rs`, not to this module.
 
+mod args;
 mod client;
 mod grammar;
+mod json;
 
 pub use grammar::ParseError;
 

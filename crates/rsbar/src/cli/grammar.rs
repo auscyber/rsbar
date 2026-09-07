@@ -2,9 +2,7 @@
 //!
 //! The domains, subdomains and property names below are `SketchyBar`'s own —
 //! see `src/misc/defines.h` and `src/message.c` in the `SketchyBar` source —
-//! not invented here. Where a real `SketchyBar` property has no matching field
-//! on [`ItemPatch`] or [`BarPatch`], parsing fails with [`ParseError::KnownGap`]
-//! naming it, rather than silently accepting and dropping it.
+//! not invented here.
 //!
 //! One call to [`parse`] walks the whole argument list once, in order, and
 //! returns every request it names. Lexing is [`lexopt`]'s: it hands back a
@@ -14,16 +12,31 @@
 //! right behaviour for a mandatory name) and [`lexopt::Parser::values`] (a
 //! greedy run that stops at the next flag-shaped token or the end of argv —
 //! exactly `message.c`'s own rule for where one domain ends and the next
-//! begins). No grammar beyond that lexing is needed: each domain has a fixed
-//! shape, so a flat `match` on the domain name is all there is.
+//! begins).
+//!
+//! A domain that carries `key=value` properties (`--bar`, `--set`,
+//! `--default`) does not match property names by hand: the tokens become a
+//! run of `(dotted.path, value)` pairs, and [`super::args::from_pairs`]
+//! deserializes that straight into [`BarPatch`] or [`ItemPatch`] via a
+//! hand-written [`serde::Deserializer`](serde::Deserializer). Coercion comes
+//! from the *target field's* type — `padding_left=4` parses as `f64` because
+//! that is what [`ItemPatch::padding_left`] is, not because this module knows
+//! it — so a new field on those patch structs is accepted here with no
+//! grammar change at all, and `#[serde(deny_unknown_fields)]` turns a typo
+//! into a named error by itself. What is left to this module by hand is
+//! exactly what a type cannot express: which `SketchyBar` properties are real
+//! but not modelled yet ([`ParseError::KnownGap`], checked against a short
+//! list before deserializing), the bare `icon=`/`label=` sugar, and telling a
+//! `/pattern/` bulk selector from a literal name by shape.
 
 use lexopt::{Arg, Parser, ValueExt};
 use rsbar_protocol::event::Custom;
-use rsbar_protocol::style::Color;
 use rsbar_protocol::{
-    BackgroundPatch, BarPatch, Edge, Event, ItemName, ItemPatch, Json, Kind, Position, Query,
-    Request, RunPatch,
+    BarPatch, ComponentKind, Event, ItemName, ItemPatch, Json, Kind, Position, Query, Relative,
+    Request, Selector,
 };
+
+use super::args::{self, ArgsError};
 
 /// A `SketchyBar` command line could not be turned into requests.
 ///
@@ -33,7 +46,8 @@ use rsbar_protocol::{
 pub enum ParseError {
     #[error(
         "`{0}` is not a recognised command: expected one of --bar, --set, --add, --remove, \
-         --subscribe, --trigger, --query, --reload, --update, --exit"
+         --subscribe, --trigger, --query, --default, --move, --reorder, --reload, --update, \
+         --exit"
     )]
     UnknownDomain(String),
 
@@ -45,9 +59,6 @@ pub enum ParseError {
 
     #[error("`{0}` is not `key=value`: expected e.g. `label.color=0xffffffff`")]
     NotKeyValue(String),
-
-    #[error("`{key}` is not a `{domain}` property")]
-    UnknownProperty { domain: &'static str, key: String },
 
     #[error("`{0}` names a real SketchyBar property that rsbar does not have yet: {1}")]
     KnownGap(String, &'static str),
@@ -62,7 +73,7 @@ pub enum ParseError {
     #[error(transparent)]
     InvalidName(#[from] rsbar_protocol::InvalidName),
 
-    #[error("`{0}` is not `item`, `bracket` or `alias`")]
+    #[error("`{0}` is not `item`, `bracket`, `alias`, `space`, `graph` or `slider`")]
     UnknownAddKind(String),
 
     #[error(
@@ -77,11 +88,23 @@ pub enum ParseError {
     )]
     BuiltinEventHasNoPayload(String),
 
+    /// From [`super::args`]'s deserializer: a bad value for a property whose
+    /// key it already knows, since it walked the same dotted path this
+    /// module built.
+    #[error("{0}")]
+    Args(String),
+
     /// `lexopt`'s own errors: a value that is not valid Unicode, or one asked
     /// for where none remains. `lexopt::Error` is neither `Clone` nor
     /// `PartialEq`, so its message is captured rather than the error itself.
     #[error("{0}")]
     Lex(String),
+}
+
+impl From<ArgsError> for ParseError {
+    fn from(err: ArgsError) -> Self {
+        Self::Args(err.to_string())
+    }
 }
 
 fn lex_err(err: &lexopt::Error) -> ParseError {
@@ -103,6 +126,9 @@ const DOMAINS: &[&str] = &[
     "subscribe",
     "trigger",
     "query",
+    "default",
+    "move",
+    "reorder",
     "reload",
     "update",
     "exit",
@@ -142,6 +168,14 @@ fn required_item_name(
     Ok(ItemName::new(required_string(parser, domain, expected)?)?)
 }
 
+fn required_selector(
+    parser: &mut Parser,
+    domain: &'static str,
+    expected: &'static str,
+) -> Result<Selector, ParseError> {
+    Ok(required_string(parser, domain, expected)?.parse()?)
+}
+
 /// A domain's greedy tail: every value up to the next flag-shaped token or
 /// the end of argv, via [`Parser::values`] — [`lexopt`]'s own version of
 /// `message.c`'s "read until the next domain" rule. Unlike `values` itself,
@@ -171,66 +205,10 @@ fn invalid(key: &str, value: &str, reason: impl std::fmt::Display) -> ParseError
     }
 }
 
-fn parse_f64(key: &str, value: &str) -> Result<f64, ParseError> {
-    value.parse().map_err(|e| invalid(key, value, e))
-}
-
-fn parse_u32(key: &str, value: &str) -> Result<u32, ParseError> {
-    value.parse().map_err(|e| invalid(key, value, e))
-}
-
-fn parse_i32(key: &str, value: &str) -> Result<i32, ParseError> {
-    value.parse().map_err(|e| invalid(key, value, e))
-}
-
-/// Colours as `0xaarrggbb` (`SketchyBar`'s own form) or `#rrggbb`/`#rgb`, both
-/// handled by [`Color`]'s own parser.
-fn parse_color(key: &str, value: &str) -> Result<u32, ParseError> {
-    value
-        .parse::<Color>()
-        .map(|c| c.0)
-        .map_err(|e| invalid(key, value, e))
-}
-
 fn parse_position_value(key: &str, value: &str) -> Result<Position, ParseError> {
     value
         .parse()
         .map_err(|e: rsbar_protocol::InvalidPosition| invalid(key, value, e))
-}
-
-fn parse_edge(key: &str, value: &str) -> Result<Edge, ParseError> {
-    match value.to_ascii_lowercase().as_str() {
-        "top" => Ok(Edge::Top),
-        "bottom" => Ok(Edge::Bottom),
-        _ => Err(invalid(key, value, "expected top or bottom")),
-    }
-}
-
-/// The boolean spellings `SketchyBar` itself accepts (`ARGUMENT_COMMON_VAL_*`
-/// in `defines.h`), `!`-negated forms included. `toggle` is a real spelling
-/// too, but flipping a value needs to know the current one, which a one-shot
-/// CLI does not — so it is a [`ParseError::KnownGap`], not a guess.
-fn parse_bool(key: &str, value: &str) -> Result<bool, ParseError> {
-    match value {
-        "on" | "!off" | "true" | "!false" | "1" | "!0" | "yes" | "!no" => Ok(true),
-        "off" | "!on" | "false" | "!true" | "0" | "!1" | "no" | "!yes" => Ok(false),
-        "toggle" => Err(ParseError::KnownGap(
-            key.to_owned(),
-            "`toggle` needs the item's current value, which a one-shot CLI never has",
-        )),
-        _ => Err(invalid(
-            key,
-            value,
-            "expected on/off, true/false, yes/no or 1/0 (optionally `!`-negated)",
-        )),
-    }
-}
-
-fn parse_members(value: &str) -> Result<Vec<ItemName>, ParseError> {
-    value
-        .split(',')
-        .map(|name| ItemName::new(name.trim()).map_err(ParseError::from))
-        .collect()
 }
 
 /// Accepts `SketchyBar`'s own event spelling (`volume_change`) alongside
@@ -259,208 +237,124 @@ fn parse_event_name(token: &str) -> Result<Kind, ParseError> {
         .map_err(|e| invalid("event", token, e))
 }
 
-/// `--bar <k>=<v> ...`. See `DOMAIN_BAR` in `defines.h`.
-fn apply_bar_property(patch: &mut BarPatch, key: &str, value: &str) -> Result<(), ParseError> {
+/// The bare `icon=`/`label=` sugar rewritten into its dotted form before a
+/// token list becomes the `(path, value)` pairs [`super::args::from_pairs`]
+/// deserializes: a config's own `icon=🔋` sets the same field as
+/// `icon.string=🔋`/`icon.text=🔋`, and neither [`ItemPatch`] nor `serde` has
+/// anywhere else to put that alias, since `icon` itself names a nested
+/// component, not a string.
+fn rewrite_bare_sugar(key: &str) -> &str {
     match key {
-        "height" => patch.height = Some(parse_f64(key, value)?),
-        "position" => patch.edge = Some(parse_edge(key, value)?),
-        "color" => patch.color = Some(parse_color(key, value)?),
-        "margin" => patch.margin = Some(parse_f64(key, value)?),
-        "y_offset" => patch.y_offset = Some(parse_f64(key, value)?),
-        "corner_radius" => patch.corner_radius = Some(parse_f64(key, value)?),
-        "blur_radius" => patch.blur_radius = Some(parse_i32(key, value)?),
-        "hidden" => patch.hidden = Some(parse_bool(key, value)?),
-        "topmost" => patch.topmost = Some(parse_bool(key, value)?),
-        "display"
-        | "space"
-        | "sticky"
-        | "show_in_fullscreen"
-        | "font_smoothing"
-        | "shadow"
-        | "align"
-        | "notch_width"
-        | "notch_offset"
-        | "notch_display_height"
-        | "horizontal" => {
-            return Err(ParseError::KnownGap(
-                key.to_owned(),
-                "no matching BarPatch field yet",
-            ));
-        }
-        _ => {
-            return Err(ParseError::UnknownProperty {
-                domain: "--bar",
-                key: key.to_owned(),
-            });
+        "icon" => "icon.text",
+        "label" => "label.text",
+        other => other,
+    }
+}
+
+fn pairs_from_tokens(tokens: &[String]) -> Result<Vec<(String, String)>, ParseError> {
+    tokens
+        .iter()
+        .map(|token| {
+            let (key, value) = split_kv(token)?;
+            Ok((rewrite_bare_sugar(key).to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+/// A real `SketchyBar` property with no home on the target patch struct yet.
+/// `(dotted key, reason)`. Checked before deserializing, so these still get a
+/// [`ParseError::KnownGap`] naming the struct rather than `serde`'s generic
+/// "unknown field" from `#[serde(deny_unknown_fields)]` — that message is
+/// exactly right for a typo, but wrong for a property `SketchyBar` really
+/// has.
+fn known_gap(pairs: &[(String, String)], gaps: &[(&str, &'static str)]) -> Result<(), ParseError> {
+    for (key, _) in pairs {
+        if let Some((_, reason)) = gaps.iter().find(|(gap, _)| gap == key) {
+            return Err(ParseError::KnownGap(key.clone(), reason));
         }
     }
     Ok(())
 }
 
-/// A bare (no-subdomain) `--set` property, e.g. `script=...`.
-///
-/// A bare `icon=`/`label=` is sugar for `icon.text=`/`label.text=`, the same
-/// way the Lua API treats a bare string.
-fn apply_item_bare_property(
-    patch: &mut ItemPatch,
-    key: &str,
-    value: &str,
-) -> Result<(), ParseError> {
-    match key {
-        "icon" => patch.icon.get_or_insert_with(RunPatch::default).text = Some(value.to_owned()),
-        "label" => {
-            patch.label.get_or_insert_with(RunPatch::default).text = Some(value.to_owned());
-        }
-        "drawing" => patch.drawing = Some(parse_bool(key, value)?),
-        "script" => patch.script = Some(value.to_owned()),
-        "click_script" => patch.click_script = Some(value.to_owned()),
-        "update_freq" => patch.update_freq = Some(parse_u32(key, value)?),
-        "position" => patch.position = Some(parse_position_value(key, value)?),
-        "padding_left" => patch.padding_left = Some(parse_f64(key, value)?),
-        "padding_right" => patch.padding_right = Some(parse_f64(key, value)?),
-        "y_offset" => patch.y_offset = Some(parse_f64(key, value)?),
-        // Neither of these is a SketchyBar property: SketchyBar identifies an
-        // alias by the argument to `--add alias`, and has no `--set` property
-        // for bracket membership at all. Both are real ItemPatch fields with
-        // no SketchyBar-shaped home, so they get the plainest key rsbar has.
-        "alias" => patch.alias = Some(value.to_owned()),
-        "members" => patch.members = Some(parse_members(value)?),
-        "updates" | "scroll_texts" | "width" | "align" | "associated_display" | "display"
-        | "associated_space" | "space" | "blur_radius" | "shadow" | "lazy" | "cache_scripts"
-        | "ignore_association" | "max_chars" => {
-            return Err(ParseError::KnownGap(
-                key.to_owned(),
-                "no matching ItemPatch field yet",
-            ));
-        }
-        _ => {
-            return Err(ParseError::UnknownProperty {
-                domain: "--set",
-                key: key.to_owned(),
-            });
-        }
-    }
-    Ok(())
-}
+const BAR_GAPS: &[(&str, &str)] = &[
+    ("space", "no matching BarPatch field yet"),
+    ("sticky", "no matching BarPatch field yet"),
+    ("show_in_fullscreen", "no matching BarPatch field yet"),
+    ("font_smoothing", "no matching BarPatch field yet"),
+    ("shadow", "no matching BarPatch field yet"),
+    ("align", "no matching BarPatch field yet"),
+    ("notch_width", "no matching BarPatch field yet"),
+    ("notch_offset", "no matching BarPatch field yet"),
+    ("notch_display_height", "no matching BarPatch field yet"),
+    ("horizontal", "no matching BarPatch field yet"),
+    ("border_color", "no matching BarPatch field yet"),
+    ("border_width", "no matching BarPatch field yet"),
+    ("x_offset", "no matching BarPatch field yet"),
+    ("image", "no matching BarPatch field yet"),
+    ("clip", "no matching BarPatch field yet"),
+    ("drawing", "no matching BarPatch field yet"),
+];
 
-/// A dotted `--set` property, e.g. `label.color=...` or `background.corner_radius=...`.
-///
-/// `icon`/`label`/`background` are components in their own right now
-/// ([`RunPatch`], [`RunPatch`], [`BackgroundPatch`]), mirroring the dotted key
-/// directly instead of translating it onto a flat field — so a property such
-/// as `icon.padding_left` is simply the field of the same name on the
-/// component it names, not a special case.
-fn apply_item_dotted_property(
-    patch: &mut ItemPatch,
-    subdomain: &str,
-    prop: &str,
-    full_key: &str,
-    value: &str,
-) -> Result<(), ParseError> {
-    match subdomain {
-        "icon" => apply_run_property(
-            patch.icon.get_or_insert_with(RunPatch::default),
-            prop,
-            full_key,
-            value,
-        )?,
-        "label" => apply_run_property(
-            patch.label.get_or_insert_with(RunPatch::default),
-            prop,
-            full_key,
-            value,
-        )?,
-        "background" => apply_background_property(
-            patch
-                .background
-                .get_or_insert_with(BackgroundPatch::default),
-            prop,
-            full_key,
-            value,
-        )?,
-        "popup" | "slider" | "knob" | "graph" | "shadow" | "image" | "alias" => {
-            return Err(ParseError::KnownGap(
-                full_key.to_owned(),
-                "no matching ItemPatch field yet",
-            ));
-        }
-        _ => {
-            return Err(ParseError::UnknownProperty {
-                domain: "--set",
-                key: full_key.to_owned(),
-            });
-        }
-    }
-    Ok(())
-}
+const ITEM_GAPS: &[(&str, &str)] = &[
+    ("scroll_texts", "no matching ItemPatch field yet"),
+    ("align", "no matching ItemPatch field yet"),
+    ("associated_display", "no matching ItemPatch field yet"),
+    ("associated_space", "no matching ItemPatch field yet"),
+    ("blur_radius", "no matching ItemPatch field yet"),
+    ("shadow", "no matching ItemPatch field yet"),
+    ("lazy", "no matching ItemPatch field yet"),
+    ("cache_scripts", "no matching ItemPatch field yet"),
+    ("ignore_association", "no matching ItemPatch field yet"),
+    ("max_chars", "no matching ItemPatch field yet"),
+    ("icon.highlight", "no matching RunPatch field yet"),
+    ("icon.highlight_color", "no matching RunPatch field yet"),
+    ("icon.y_offset", "no matching RunPatch field yet"),
+    ("icon.scroll_duration", "no matching RunPatch field yet"),
+    ("icon.width", "no matching RunPatch field yet"),
+    ("icon.align", "no matching RunPatch field yet"),
+    ("icon.max_chars", "no matching RunPatch field yet"),
+    ("label.highlight", "no matching RunPatch field yet"),
+    ("label.highlight_color", "no matching RunPatch field yet"),
+    ("label.y_offset", "no matching RunPatch field yet"),
+    ("label.scroll_duration", "no matching RunPatch field yet"),
+    ("label.width", "no matching RunPatch field yet"),
+    ("label.align", "no matching RunPatch field yet"),
+    ("label.max_chars", "no matching RunPatch field yet"),
+    (
+        "background.drawing",
+        "no matching BackgroundPatch field yet",
+    ),
+    ("background.clip", "no matching BackgroundPatch field yet"),
+    (
+        "background.x_offset",
+        "no matching BackgroundPatch field yet",
+    ),
+    ("background.image", "no matching BackgroundPatch field yet"),
+    (
+        "popup",
+        "no matching ItemPatch field yet: popups are not modelled",
+    ),
+    (
+        "slider",
+        "no matching ItemPatch field yet: no matching component",
+    ),
+    (
+        "knob",
+        "no matching ItemPatch field yet: no matching component",
+    ),
+    (
+        "graph",
+        "no matching ItemPatch field yet: no matching component",
+    ),
+    (
+        "image",
+        "no matching ItemPatch field yet: no matching component",
+    ),
+    ("alias.pid", "no matching ItemPatch field yet"),
+];
 
-/// `icon.*`/`label.*`, onto a [`RunPatch`].
-fn apply_run_property(
-    run: &mut RunPatch,
-    prop: &str,
-    full_key: &str,
-    value: &str,
-) -> Result<(), ParseError> {
-    match prop {
-        // `icon.string=`/`label.string=` is the dotted spelling of the bare
-        // sugar (`icon=`/`label=`); `.text=` is rsbar's own name for the
-        // field, accepted too since it is what the property is actually
-        // called.
-        "string" | "text" => run.text = Some(value.to_owned()),
-        "color" => run.color = Some(parse_color(full_key, value)?),
-        "font" => run.font = Some(value.to_owned()),
-        "drawing" => run.drawing = Some(parse_bool(full_key, value)?),
-        "padding_left" => run.padding_left = Some(parse_f64(full_key, value)?),
-        "padding_right" => run.padding_right = Some(parse_f64(full_key, value)?),
-        "highlight" | "highlight_color" | "y_offset" | "scroll_duration" | "width" | "align"
-        | "max_chars" => {
-            return Err(ParseError::KnownGap(
-                full_key.to_owned(),
-                "no matching RunPatch field yet",
-            ));
-        }
-        _ => {
-            return Err(ParseError::UnknownProperty {
-                domain: "--set",
-                key: full_key.to_owned(),
-            });
-        }
-    }
-    Ok(())
-}
-
-/// `background.*`, onto a [`BackgroundPatch`].
-fn apply_background_property(
-    background: &mut BackgroundPatch,
-    prop: &str,
-    full_key: &str,
-    value: &str,
-) -> Result<(), ParseError> {
-    match prop {
-        "color" => background.color = Some(parse_color(full_key, value)?),
-        "corner_radius" => background.corner_radius = Some(parse_f64(full_key, value)?),
-        "height" => background.height = Some(parse_f64(full_key, value)?),
-        "padding_left" => background.padding_left = Some(parse_f64(full_key, value)?),
-        "padding_right" => background.padding_right = Some(parse_f64(full_key, value)?),
-        "border_color" => background.border_color = Some(parse_color(full_key, value)?),
-        "border_width" => background.border_width = Some(parse_f64(full_key, value)?),
-        "drawing" | "clip" | "x_offset" | "y_offset" | "image" => {
-            return Err(ParseError::KnownGap(
-                full_key.to_owned(),
-                "no matching BackgroundPatch field yet",
-            ));
-        }
-        _ => {
-            return Err(ParseError::UnknownProperty {
-                domain: "--set",
-                key: full_key.to_owned(),
-            });
-        }
-    }
-    Ok(())
-}
-
-/// `--add item|bracket|alias ...`. See `DOMAIN_ADD` in `defines.h`.
+/// `--add item|bracket|alias|space|graph|slider ...`. See `DOMAIN_ADD` in
+/// `defines.h`.
 ///
 /// `--add alias <name> <position>` is treated exactly like `--add item`: in
 /// `SketchyBar` the argument to `--add alias` *is* the mirror target, but in
@@ -470,7 +364,11 @@ fn apply_background_property(
 /// and the target is set the way any other property is: chained, with
 /// `--set <name> alias="Owner,Name"` right after.
 fn parse_add(parser: &mut Parser) -> Result<Vec<Request>, ParseError> {
-    let kind = required_string(parser, "--add", "item, bracket or alias")?;
+    let kind = required_string(
+        parser,
+        "--add",
+        "item, bracket, alias, space, graph or slider",
+    )?;
     match kind.as_str() {
         "item" | "alias" => {
             let domain: &'static str = if kind == "item" {
@@ -494,7 +392,7 @@ fn parse_add(parser: &mut Parser) -> Result<Vec<Request>, ParseError> {
             }
             let members = member_group
                 .iter()
-                .map(|m| ItemName::new(m.as_str()).map_err(ParseError::from))
+                .map(|m| m.parse::<Selector>().map_err(ParseError::from))
                 .collect::<Result<Vec<_>, _>>()?;
             // SketchyBar's own `--add bracket` takes no position: a bracket's
             // frame comes from its members. rsbar's `AddItem` still needs one
@@ -514,10 +412,29 @@ fn parse_add(parser: &mut Parser) -> Result<Vec<Request>, ParseError> {
                 },
             ])
         }
-        "graph" | "space" | "slider" => Err(ParseError::KnownGap(
-            kind,
-            "this component type is not modelled by rsbar's ItemPatch",
-        )),
+        "space" | "graph" | "slider" => {
+            let domain: &'static str = "--add";
+            let name = required_item_name(parser, domain, "a name")?;
+            let position_token = required_string(parser, domain, "a position")?;
+            let position = parse_position_value("position", &position_token)?;
+            let component_kind = match kind.as_str() {
+                "space" => ComponentKind::Space,
+                "graph" => ComponentKind::Graph,
+                "slider" => ComponentKind::Slider,
+                _ => unreachable!("matched above"),
+            };
+            // `--add graph <name> <position> <width>` and
+            // `--add slider <name> <position> <width>` carry an extra
+            // positional width rsbar has nowhere to put yet, since nothing on
+            // the daemon side can draw either component. Consumed and
+            // dropped rather than left for the next domain to trip over.
+            let _ = greedy_strings(parser)?;
+            Ok(vec![Request::AddComponent {
+                name,
+                position,
+                kind: component_kind,
+            }])
+        }
         "event" => Err(ParseError::KnownGap(
             kind,
             "custom events need no registration in rsbar: --trigger accepts any name directly",
@@ -527,40 +444,39 @@ fn parse_add(parser: &mut Parser) -> Result<Vec<Request>, ParseError> {
 }
 
 fn parse_bar(parser: &mut Parser) -> Result<Request, ParseError> {
-    let mut patch = BarPatch::default();
-    for token in greedy_strings(parser)? {
-        let (key, value) = split_kv(&token)?;
-        apply_bar_property(&mut patch, key, value)?;
-    }
+    let pairs = pairs_from_tokens(&greedy_strings(parser)?)?;
+    known_gap(&pairs, BAR_GAPS)?;
+    let patch: BarPatch = args::from_pairs(&pairs)?;
     Ok(Request::SetBar(patch))
 }
 
+fn parse_item_patch(pairs: &[(String, String)]) -> Result<ItemPatch, ParseError> {
+    known_gap(pairs, ITEM_GAPS)?;
+    Ok(args::from_pairs(pairs)?)
+}
+
 fn parse_set(parser: &mut Parser) -> Result<Request, ParseError> {
-    let name = required_item_name(parser, "--set", "an item name")?;
-    let mut patch = ItemPatch::default();
-    for token in greedy_strings(parser)? {
-        let (key, value) = split_kv(&token)?;
-        match key.split_once('.') {
-            Some((sub, prop)) => apply_item_dotted_property(&mut patch, sub, prop, key, value)?,
-            None => apply_item_bare_property(&mut patch, key, value)?,
-        }
-    }
-    Ok(Request::SetItem {
-        name,
-        patch: Box::new(patch),
+    let selector = required_selector(parser, "--set", "an item name")?;
+    let pairs = pairs_from_tokens(&greedy_strings(parser)?)?;
+    let patch = Box::new(parse_item_patch(&pairs)?);
+    Ok(match selector {
+        Selector::Name(name) => Request::SetItem { name, patch },
+        Selector::Pattern(pattern) => Request::SetMatching { pattern, patch },
     })
 }
 
+fn parse_default(parser: &mut Parser) -> Result<Request, ParseError> {
+    let pairs = pairs_from_tokens(&greedy_strings(parser)?)?;
+    let patch = parse_item_patch(&pairs)?;
+    Ok(Request::SetDefault(Box::new(patch)))
+}
+
 fn parse_remove(parser: &mut Parser) -> Result<Request, ParseError> {
-    let token = required_string(parser, "--remove", "an item name")?;
-    if token.len() > 1 && token.starts_with('/') && token.ends_with('/') {
-        return Err(ParseError::KnownGap(
-            token,
-            "regex removal (SketchyBar's /pattern/) is not supported; rsbar removes one exact \
-             name at a time",
-        ));
-    }
-    Ok(Request::RemoveItem(ItemName::new(token)?))
+    let selector = required_selector(parser, "--remove", "an item name")?;
+    Ok(match selector {
+        Selector::Name(name) => Request::RemoveItem(name),
+        Selector::Pattern(pattern) => Request::RemoveMatching(pattern),
+    })
 }
 
 fn parse_subscribe(parser: &mut Parser) -> Result<Request, ParseError> {
@@ -606,19 +522,14 @@ fn parse_query(parser: &mut Parser) -> Result<Request, ParseError> {
     let token = required_string(
         parser,
         "--query",
-        "bar, items, menu-items, app-menus or an item name",
+        "bar, items, menu-items, app-menus, defaults or an item name",
     )?;
     let query = match token.as_str() {
         "bar" => Query::Bar,
         "items" => Query::Items,
         "menu-items" | "menu_items" | "default_menu_items" => Query::MenuItems,
         "app-menus" | "app_menus" => Query::AppMenus,
-        "defaults" => {
-            return Err(ParseError::KnownGap(
-                token,
-                "there is no notion of --default properties for rsbar to query yet",
-            ));
-        }
+        "defaults" => Query::Defaults,
         "events" => {
             return Err(ParseError::KnownGap(
                 token,
@@ -648,6 +559,43 @@ fn parse_press(parser: &mut Parser) -> Result<Request, ParseError> {
     Ok(Request::PressAlias(ItemName::new(token.as_str())?))
 }
 
+fn parse_move(parser: &mut Parser) -> Result<Request, ParseError> {
+    let name = required_item_name(parser, "--move", "an item name")?;
+    let relative_token = required_string(parser, "--move", "before or after")?;
+    let relative = match relative_token.as_str() {
+        "before" => Relative::Before,
+        "after" => Relative::After,
+        _ => {
+            return Err(invalid(
+                "direction",
+                &relative_token,
+                "expected before or after",
+            ));
+        }
+    };
+    let reference = required_item_name(parser, "--move", "a reference item name")?;
+    Ok(Request::Move {
+        name,
+        relative,
+        reference,
+    })
+}
+
+fn parse_reorder(parser: &mut Parser) -> Result<Request, ParseError> {
+    let tokens = greedy_strings(parser)?;
+    if tokens.is_empty() {
+        return Err(ParseError::MissingArgument {
+            domain: "--reorder",
+            expected: "at least one item name",
+        });
+    }
+    let names = tokens
+        .iter()
+        .map(|n| ItemName::new(n.as_str()).map_err(ParseError::from))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Request::Reorder(names))
+}
+
 fn parse_reload(parser: &mut Parser) -> Result<Request, ParseError> {
     let group = greedy_strings(parser)?;
     if let Some(path) = group.into_iter().next() {
@@ -675,6 +623,9 @@ pub fn parse(args: &[String]) -> Result<Vec<Request>, ParseError> {
             Arg::Long("subscribe") => requests.push(parse_subscribe(&mut parser)?),
             Arg::Long("trigger") => requests.push(parse_trigger(&mut parser)?),
             Arg::Long("query") => requests.push(parse_query(&mut parser)?),
+            Arg::Long("default") => requests.push(parse_default(&mut parser)?),
+            Arg::Long("move") => requests.push(parse_move(&mut parser)?),
+            Arg::Long("reorder") => requests.push(parse_reorder(&mut parser)?),
             Arg::Long("press") => requests.push(parse_press(&mut parser)?),
             Arg::Long("reload") => requests.push(parse_reload(&mut parser)?),
             Arg::Long("update") => requests.push(Request::UpdateAll),
@@ -697,8 +648,9 @@ pub fn parse(args: &[String]) -> Result<Vec<Request>, ParseError> {
 mod tests {
     use super::*;
     use rsbar_protocol::event::PowerChange;
+    use rsbar_protocol::{BackgroundPatch, Color, FontSpec, RunPatch};
 
-    fn args(tokens: &[&str]) -> Vec<String> {
+    fn args_(tokens: &[&str]) -> Vec<String> {
         tokens.iter().map(|s| (*s).to_owned()).collect()
     }
 
@@ -706,14 +658,18 @@ mod tests {
         ItemName::new(s).unwrap()
     }
 
+    fn sel(s: &str) -> Selector {
+        s.parse().unwrap()
+    }
+
     #[test]
     fn bar_properties_apply_in_one_request() {
-        let requests = parse(&args(&["--bar", "height=32", "color=0xff000000"])).unwrap();
+        let requests = parse(&args_(&["--bar", "height=32", "color=0xff000000"])).unwrap();
         assert_eq!(
             requests,
             vec![Request::SetBar(BarPatch {
                 height: Some(32.0),
-                color: Some(0xff00_0000),
+                color: Some(Color(0xff00_0000)),
                 ..Default::default()
             })]
         );
@@ -721,11 +677,11 @@ mod tests {
 
     #[test]
     fn hash_colours_still_parse() {
-        let requests = parse(&args(&["--bar", "color=#ff0000"])).unwrap();
+        let requests = parse(&args_(&["--bar", "color=#ff0000"])).unwrap();
         assert_eq!(
             requests,
             vec![Request::SetBar(BarPatch {
-                color: Some(0xffff_0000),
+                color: Some(Color(0xffff_0000)),
                 ..Default::default()
             })]
         );
@@ -733,7 +689,7 @@ mod tests {
 
     #[test]
     fn dotted_item_properties_map_onto_the_matching_component() {
-        let requests = parse(&args(&[
+        let requests = parse(&args_(&[
             "--set",
             "clock",
             "label.color=0xffffffff",
@@ -747,11 +703,11 @@ mod tests {
                 name: name("clock"),
                 patch: Box::new(ItemPatch {
                     label: Some(RunPatch {
-                        color: Some(0xffff_ffff),
+                        color: Some(Color(0xffff_ffff)),
                         ..Default::default()
                     }),
                     icon: Some(RunPatch {
-                        font: Some("Hack:Bold:14".into()),
+                        font: Some(FontSpec::parse("Hack:Bold:14")),
                         ..Default::default()
                     }),
                     background: Some(BackgroundPatch {
@@ -766,7 +722,7 @@ mod tests {
 
     #[test]
     fn a_bare_icon_or_label_is_sugar_for_its_text_field() {
-        let requests = parse(&args(&["--set", "clock", "icon=🕐", "label=09:41"])).unwrap();
+        let requests = parse(&args_(&["--set", "clock", "icon=🕐", "label=09:41"])).unwrap();
         assert_eq!(
             requests,
             vec![Request::SetItem {
@@ -787,11 +743,26 @@ mod tests {
     }
 
     #[test]
+    fn sketchybars_string_spelling_is_accepted_alongside_text() {
+        let requests = parse(&args_(&["--set", "clock", "icon.string=🕐"])).unwrap();
+        assert_eq!(
+            requests,
+            vec![Request::SetItem {
+                name: name("clock"),
+                patch: Box::new(ItemPatch {
+                    icon: Some(RunPatch {
+                        text: Some("🕐".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }]
+        );
+    }
+
+    #[test]
     fn icon_padding_is_expressible_now_that_it_is_its_own_component() {
-        // This used to be a `ParseError::KnownGap`: flat `ItemPatch` had
-        // nowhere to put an icon-specific padding distinct from the item's
-        // own. Nested `RunPatch` gives it a home.
-        let requests = parse(&args(&["--set", "clock", "icon.padding_left=4"])).unwrap();
+        let requests = parse(&args_(&["--set", "clock", "icon.padding_left=4"])).unwrap();
         assert_eq!(
             requests,
             vec![Request::SetItem {
@@ -809,7 +780,7 @@ mod tests {
 
     #[test]
     fn background_height_and_border_are_expressible_now_too() {
-        let requests = parse(&args(&[
+        let requests = parse(&args_(&[
             "--set",
             "clock",
             "background.height=20",
@@ -824,7 +795,7 @@ mod tests {
                 patch: Box::new(ItemPatch {
                     background: Some(BackgroundPatch {
                         height: Some(20.0),
-                        border_color: Some(0xff00_ff00),
+                        border_color: Some(Color(0xff00_ff00)),
                         border_width: Some(2.0),
                         ..Default::default()
                     }),
@@ -835,8 +806,36 @@ mod tests {
     }
 
     #[test]
+    fn fields_added_to_the_patch_types_need_no_grammar_change() {
+        // `updates`, `width` and `display` used to be `ParseError::KnownGap`
+        // entries here, restating a field list `ItemPatch` already owns —
+        // exactly the drift deriving from the type is meant to remove. They
+        // are real fields now, and nothing in this module named them.
+        let requests = parse(&args_(&[
+            "--set",
+            "clock",
+            "updates=off",
+            "width=40",
+            "display=2",
+        ]))
+        .unwrap();
+        assert_eq!(
+            requests,
+            vec![Request::SetItem {
+                name: name("clock"),
+                patch: Box::new(ItemPatch {
+                    updates: Some(false),
+                    width: Some(40.0),
+                    display: Some("2".into()),
+                    ..Default::default()
+                }),
+            }]
+        );
+    }
+
+    #[test]
     fn several_domains_chain_in_one_invocation() {
-        let requests = parse(&args(&[
+        let requests = parse(&args_(&[
             "--add",
             "item",
             "clock",
@@ -894,7 +893,7 @@ mod tests {
 
     #[test]
     fn add_bracket_sets_members_via_a_second_request() {
-        let requests = parse(&args(&[
+        let requests = parse(&args_(&[
             "--add",
             "bracket",
             "group",
@@ -912,7 +911,30 @@ mod tests {
                 Request::SetItem {
                     name: name("group"),
                     patch: Box::new(ItemPatch {
-                        members: Some(vec![name("left_item"), name("right_item")]),
+                        members: Some(vec![sel("left_item"), sel("right_item")]),
+                        ..Default::default()
+                    }),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn add_bracket_accepts_a_pattern_member() {
+        // ~/dendritic/sketchybar/items/menus.lua:
+        // sbar.add("bracket", { "/menu\\..*/" }, { ... })
+        let requests = parse(&args_(&["--add", "bracket", "group", r"/menu\..*/"])).unwrap();
+        assert_eq!(
+            requests,
+            vec![
+                Request::AddItem {
+                    name: name("group"),
+                    position: Position::Left,
+                },
+                Request::SetItem {
+                    name: name("group"),
+                    patch: Box::new(ItemPatch {
+                        members: Some(vec![sel(r"/menu\..*/")]),
                         ..Default::default()
                     }),
                 },
@@ -922,7 +944,7 @@ mod tests {
 
     #[test]
     fn add_alias_creates_a_plain_item_for_a_chained_set_to_target() {
-        let requests = parse(&args(&[
+        let requests = parse(&args_(&[
             "--add",
             "alias",
             "mirror",
@@ -951,8 +973,31 @@ mod tests {
     }
 
     #[test]
+    fn add_accepts_component_kinds_it_cannot_yet_draw() {
+        let requests = parse(&args_(&["--add", "graph", "cpu", "right", "50"])).unwrap();
+        assert_eq!(
+            requests,
+            vec![Request::AddComponent {
+                name: name("cpu"),
+                position: Position::Right,
+                kind: ComponentKind::Graph,
+            }]
+        );
+
+        let requests = parse(&args_(&["--add", "space", "space.1", "left"])).unwrap();
+        assert_eq!(
+            requests,
+            vec![Request::AddComponent {
+                name: name("space.1"),
+                position: Position::Left,
+                kind: ComponentKind::Space,
+            }]
+        );
+    }
+
+    #[test]
     fn subscribe_accepts_sketchybars_shorter_event_spelling() {
-        let requests = parse(&args(&[
+        let requests = parse(&args_(&[
             "--subscribe",
             "battery",
             "power_source_change",
@@ -970,7 +1015,7 @@ mod tests {
 
     #[test]
     fn trigger_with_no_payload_uses_the_events_default() {
-        let requests = parse(&args(&["--trigger", "power_source_changed"])).unwrap();
+        let requests = parse(&args_(&["--trigger", "power_source_changed"])).unwrap();
         assert_eq!(
             requests,
             vec![Request::Trigger(Event::PowerSourceChanged(
@@ -981,7 +1026,7 @@ mod tests {
 
     #[test]
     fn trigger_on_a_custom_event_collects_key_value_pairs_into_one_object() {
-        let requests = parse(&args(&["--trigger", "my.event", "foo=1", "bar=hello"])).unwrap();
+        let requests = parse(&args_(&["--trigger", "my.event", "foo=1", "bar=hello"])).unwrap();
         assert_eq!(
             requests,
             vec![Request::Trigger(Event::Custom(Custom {
@@ -996,7 +1041,7 @@ mod tests {
 
     #[test]
     fn a_builtin_event_rejects_a_payload() {
-        let err = parse(&args(&["--trigger", "volume_changed", "level=5"])).unwrap_err();
+        let err = parse(&args_(&["--trigger", "volume_changed", "level=5"])).unwrap_err();
         assert_eq!(
             err,
             ParseError::BuiltinEventHasNoPayload("volume_changed".into())
@@ -1006,24 +1051,28 @@ mod tests {
     #[test]
     fn query_keywords_and_item_names_are_told_apart() {
         assert_eq!(
-            parse(&args(&["--query", "bar"])).unwrap(),
+            parse(&args_(&["--query", "bar"])).unwrap(),
             vec![Request::Query(Query::Bar)]
         );
         assert_eq!(
-            parse(&args(&["--query", "items"])).unwrap(),
+            parse(&args_(&["--query", "items"])).unwrap(),
             vec![Request::Query(Query::Items)]
         );
         assert_eq!(
-            parse(&args(&["--query", "menu-items"])).unwrap(),
+            parse(&args_(&["--query", "menu-items"])).unwrap(),
             vec![Request::Query(Query::MenuItems)]
         );
         assert_eq!(
-            parse(&args(&["--query", "clock"])).unwrap(),
+            parse(&args_(&["--query", "clock"])).unwrap(),
             vec![Request::Query(Query::Item(name("clock")))]
         );
         assert_eq!(
-            parse(&args(&["--query", "app-menus"])).unwrap(),
+            parse(&args_(&["--query", "app-menus"])).unwrap(),
             vec![Request::Query(Query::AppMenus)]
+        );
+        assert_eq!(
+            parse(&args_(&["--query", "defaults"])).unwrap(),
+            vec![Request::Query(Query::Defaults)]
         );
     }
 
@@ -1032,11 +1081,11 @@ mod tests {
         // The Apple menu is index 0, which is what the config's click script
         // passed to its helper.
         assert_eq!(
-            parse(&args(&["--press", "0"])).unwrap(),
+            parse(&args_(&["--press", "0"])).unwrap(),
             vec![Request::PressAppMenu(0)]
         );
         assert_eq!(
-            parse(&args(&["--press", "Amphetamine,Amphetamine"])).unwrap(),
+            parse(&args_(&["--press", "Amphetamine,Amphetamine"])).unwrap(),
             vec![Request::PressAlias(name("Amphetamine,Amphetamine"))]
         );
     }
@@ -1044,20 +1093,105 @@ mod tests {
     #[test]
     fn remove_reload_update_and_exit() {
         assert_eq!(
-            parse(&args(&["--remove", "clock"])).unwrap(),
+            parse(&args_(&["--remove", "clock"])).unwrap(),
             vec![Request::RemoveItem(name("clock"))]
         );
-        assert_eq!(parse(&args(&["--reload"])).unwrap(), vec![Request::Reload]);
+        assert_eq!(parse(&args_(&["--reload"])).unwrap(), vec![Request::Reload]);
         assert_eq!(
-            parse(&args(&["--update"])).unwrap(),
+            parse(&args_(&["--update"])).unwrap(),
             vec![Request::UpdateAll]
         );
-        assert_eq!(parse(&args(&["--exit"])).unwrap(), vec![Request::Shutdown]);
+        assert_eq!(parse(&args_(&["--exit"])).unwrap(), vec![Request::Shutdown]);
+    }
+
+    #[test]
+    fn set_on_a_pattern_is_a_bulk_request_the_daemon_resolves() {
+        // ~/dendritic/sketchybar/items/menus.lua:
+        // sbar.set("/menu\\..*/", { drawing = false })
+        let requests = parse(&args_(&["--set", r"/menu\..*/", "drawing=off"])).unwrap();
+        assert_eq!(
+            requests,
+            vec![Request::SetMatching {
+                pattern: r"menu\..*".into(),
+                patch: Box::new(ItemPatch {
+                    drawing: Some(false),
+                    ..Default::default()
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn remove_on_a_pattern_is_now_implemented_rather_than_a_gap() {
+        let requests = parse(&args_(&["--remove", "/clock.*/"])).unwrap();
+        assert_eq!(requests, vec![Request::RemoveMatching("clock.*".into())]);
+    }
+
+    #[test]
+    fn default_stashes_only_the_properties_it_was_given() {
+        // ~/dendritic/sketchybar/default.lua sets icon/label fonts and
+        // colours, and padding — but never every ItemPatch field, and the
+        // daemon's damage tracking depends on that staying true here too.
+        let requests = parse(&args_(&[
+            "--default",
+            "padding_left=5",
+            "icon.color=0xffffffff",
+        ]))
+        .unwrap();
+        assert_eq!(
+            requests,
+            vec![Request::SetDefault(Box::new(ItemPatch {
+                padding_left: Some(5.0),
+                icon: Some(RunPatch {
+                    color: Some(Color(0xffff_ffff)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))]
+        );
+    }
+
+    #[test]
+    fn move_reorders_relative_to_a_reference_item() {
+        // ~/dendritic/sketchybar/items/left.lua:
+        // sketchybar --move chevron after <space>
+        let requests = parse(&args_(&["--move", "chevron", "after", "space.1"])).unwrap();
+        assert_eq!(
+            requests,
+            vec![Request::Move {
+                name: name("chevron"),
+                relative: Relative::After,
+                reference: name("space.1"),
+            }]
+        );
+    }
+
+    #[test]
+    fn move_rejects_a_direction_that_is_neither_before_nor_after() {
+        let err = parse(&args_(&["--move", "chevron", "sideways", "space.1"])).unwrap_err();
+        assert!(matches!(
+            err,
+            ParseError::InvalidValue { key, value, .. }
+                if key == "direction" && value == "sideways"
+        ));
+    }
+
+    #[test]
+    fn reorder_takes_the_bars_new_left_to_right_order() {
+        let requests = parse(&args_(&["--reorder", "front_app", "space.1", "clock"])).unwrap();
+        assert_eq!(
+            requests,
+            vec![Request::Reorder(vec![
+                name("front_app"),
+                name("space.1"),
+                name("clock"),
+            ])]
+        );
     }
 
     #[test]
     fn an_unrecognised_domain_names_itself() {
-        let err = parse(&args(&["--nope", "clock"])).unwrap_err();
+        let err = parse(&args_(&["--nope", "clock"])).unwrap_err();
         assert_eq!(err, ParseError::UnknownDomain("--nope".into()));
     }
 
@@ -1066,7 +1200,7 @@ mod tests {
         // Without the flag-shaped guard, `lexopt`'s `value()` would happily
         // hand back "--bar" as if it were the item name (it is valid
         // `ItemName` syntax) and swallow the whole next domain with it.
-        let err = parse(&args(&["--set", "--bar", "height=1"])).unwrap_err();
+        let err = parse(&args_(&["--set", "--bar", "height=1"])).unwrap_err();
         assert_eq!(
             err,
             ParseError::MissingArgument {
@@ -1081,7 +1215,7 @@ mod tests {
         // `y_offset=-5` does not itself start with `-`, so it is business as
         // usual for `lexopt`; a negative offset should not need special
         // handling in the grammar.
-        let requests = parse(&args(&["--set", "clock", "y_offset=-5"])).unwrap();
+        let requests = parse(&args_(&["--set", "clock", "y_offset=-5"])).unwrap();
         assert_eq!(
             requests,
             vec![Request::SetItem {
@@ -1096,37 +1230,25 @@ mod tests {
 
     #[test]
     fn a_missing_key_value_pair_names_the_bad_token() {
-        let err = parse(&args(&["--set", "clock", "label"])).unwrap_err();
+        let err = parse(&args_(&["--set", "clock", "label"])).unwrap_err();
         assert_eq!(err, ParseError::NotKeyValue("label".into()));
     }
 
     #[test]
     fn an_unknown_item_property_names_itself() {
-        let err = parse(&args(&["--set", "clock", "wat=1"])).unwrap_err();
-        assert_eq!(
-            err,
-            ParseError::UnknownProperty {
-                domain: "--set",
-                key: "wat".into(),
-            }
-        );
+        let err = parse(&args_(&["--set", "clock", "wat=1"])).unwrap_err();
+        assert!(matches!(err, ParseError::Args(msg) if msg.contains("wat")));
     }
 
     #[test]
     fn an_unknown_subdomain_is_an_unknown_property_not_a_known_gap() {
-        let err = parse(&args(&["--set", "clock", "wat.color=1"])).unwrap_err();
-        assert_eq!(
-            err,
-            ParseError::UnknownProperty {
-                domain: "--set",
-                key: "wat.color".into(),
-            }
-        );
+        let err = parse(&args_(&["--set", "clock", "wat.color=1"])).unwrap_err();
+        assert!(matches!(err, ParseError::Args(msg) if msg.contains("wat")));
     }
 
     #[test]
     fn a_real_but_unmapped_property_is_a_known_gap() {
-        let err = parse(&args(&[
+        let err = parse(&args_(&[
             "--set",
             "clock",
             "icon.highlight_color=0xffffffff",
@@ -1143,42 +1265,19 @@ mod tests {
 
     #[test]
     fn a_bad_colour_names_the_value_and_the_key() {
-        let err = parse(&args(&["--bar", "color=not-a-colour"])).unwrap_err();
-        assert!(matches!(
-            err,
-            ParseError::InvalidValue { key, value, .. }
-                if key == "color" && value == "not-a-colour"
-        ));
+        let err = parse(&args_(&["--bar", "color=not-a-colour"])).unwrap_err();
+        assert!(matches!(err, ParseError::Args(msg) if msg.contains("color")));
     }
 
     #[test]
     fn reload_with_a_path_is_reported_rather_than_silently_dropped() {
-        let err = parse(&args(&["--reload", "/tmp/other.rc"])).unwrap_err();
+        let err = parse(&args_(&["--reload", "/tmp/other.rc"])).unwrap_err();
         assert_eq!(err, ParseError::ReloadTakesNoPath("/tmp/other.rc".into()));
     }
 
     #[test]
-    fn regex_remove_is_a_reported_gap() {
-        let err = parse(&args(&["--remove", "/clock.*/"])).unwrap_err();
-        assert_eq!(
-            err,
-            ParseError::KnownGap(
-                "/clock.*/".into(),
-                "regex removal (SketchyBar's /pattern/) is not supported; rsbar removes one \
-                 exact name at a time"
-            )
-        );
-    }
-
-    #[test]
-    fn toggle_is_a_known_gap_not_a_guess() {
-        let err = parse(&args(&["--bar", "hidden=toggle"])).unwrap_err();
-        assert_eq!(
-            err,
-            ParseError::KnownGap(
-                "hidden".into(),
-                "`toggle` needs the item's current value, which a one-shot CLI never has"
-            )
-        );
+    fn toggle_is_still_rejected_since_a_one_shot_cli_has_no_current_value() {
+        let err = parse(&args_(&["--bar", "hidden=toggle"])).unwrap_err();
+        assert!(matches!(err, ParseError::Args(msg) if msg.contains("hidden")));
     }
 }

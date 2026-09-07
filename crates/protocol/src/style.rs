@@ -1,10 +1,16 @@
 //! Colours and font specifications.
 
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::str::FromStr;
 
 /// A straight ARGB colour, the way a config writes one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Defaults to fully transparent, same as [`Color::TRANSPARENT`] — the value
+/// an unset colour field on a patch struct would otherwise have no way to
+/// name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Color(pub u32);
 
 impl Color {
@@ -84,6 +90,25 @@ impl fmt::Display for Color {
     }
 }
 
+/// `0xaarrggbb`, `SketchyBar`'s own spelling (`"0x%x"` in `background.c`),
+/// rather than [`Display`]'s `#rrggbb`-family form: this is the string a
+/// config's own `--query` output has to match, independent of what a human
+/// reading `{color:?}` would rather see.
+impl Serialize for Color {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&format_args!("0x{:08x}", self.0))
+    }
+}
+
+/// Accepts anything [`FromStr`] does, so a value written back by the daemon
+/// and one typed by a config both parse.
+impl<'de> Deserialize<'de> for Color {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        text.parse().map_err(D::Error::custom)
+    }
+}
+
 /// A font, as named rather than as resolved.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FontSpec {
@@ -133,6 +158,21 @@ impl FontSpec {
 impl fmt::Display for FontSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}:{}", self.family, self.style, self.size)
+    }
+}
+
+impl Serialize for FontSpec {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+/// [`FontSpec::parse`] never fails — a short or empty spec just keeps the
+/// defaults — so this never does either.
+impl<'de> Deserialize<'de> for FontSpec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        Ok(Self::parse(&text))
     }
 }
 
