@@ -313,6 +313,7 @@ fn apply_requests(
     mut settings: ResMut<Settings>,
     mut panels: NonSendMut<Panels>,
     mut cache: NonSendMut<Cache>,
+    mut captures: NonSendMut<crate::alias::Captures>,
     mut sources: NonSendMut<Sources>,
     mut subscribers: NonSendMut<crate::subscribers::Subscribers>,
     mut queue: ResMut<Queue>,
@@ -340,6 +341,7 @@ fn apply_requests(
             settings,
             panels: &mut panels,
             cache: &mut cache,
+            captures: &mut captures,
             sources: &mut sources.0,
             subscribers: &mut subscribers,
             subscriber,
@@ -433,6 +435,7 @@ fn settle_reload(
     mut commands: Commands,
     mut index: ResMut<Index>,
     mut cache: NonSendMut<Cache>,
+    mut captures: NonSendMut<crate::alias::Captures>,
     stale: Query<(Entity, &Name), With<Stale>>,
     config: Res<ConfigHandle>,
 ) {
@@ -451,6 +454,7 @@ fn settle_reload(
     for (entity, name) in &stale {
         if succeeded {
             cache.forget(entity);
+            captures.forget(entity);
             index.remove(&name.0);
             // The item's claims are components, so the despawn releases them
             // and a source nothing wants any more stops on the next settle.

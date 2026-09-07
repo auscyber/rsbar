@@ -362,6 +362,8 @@ pub struct Context<'a> {
     pub settings: &'a mut Settings,
     pub panels: &'a mut Panels,
     pub cache: &'a mut Cache,
+    /// The mirrored images, so an item that goes takes its capture with it.
+    pub captures: &'a mut crate::alias::Captures,
     pub sources: &'a mut Registry,
     pub subscribers: &'a mut Subscribers,
     /// A port this request arrived with, if the client wants its events
@@ -379,6 +381,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
         settings,
         panels,
         cache,
+        captures,
         sources,
         subscribers,
         subscriber,
@@ -455,6 +458,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
                 return no_such(&name);
             };
             cache.forget(entity);
+            captures.forget(entity);
             subscribers.clear(entity);
             // The item's claims go with it: `Watching` is a component, so the
             // despawn drops them and the sources nothing wants any more stop.
@@ -551,6 +555,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             tracing::debug!(count = dropped.len(), "config ended");
             for (entity, name) in dropped {
                 cache.forget(entity);
+                captures.forget(entity);
                 subscribers.clear(entity);
                 items.index.remove(&name);
                 items.commands.entity(entity).despawn();

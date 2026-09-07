@@ -28,6 +28,7 @@ pub struct Harness {
     settings: Settings,
     panels: Panels,
     cache: Cache,
+    captures: crate::alias::Captures,
     sources: Registry,
     subscribers: crate::subscribers::Subscribers,
 }
@@ -47,6 +48,7 @@ impl Harness {
             settings: Settings::default(),
             panels: Panels::default(),
             cache: Cache::default(),
+            captures: crate::alias::Captures::default(),
             sources: Registry::new(crate::config::shared(), waker),
             subscribers: crate::subscribers::Subscribers::default(),
         }
@@ -63,6 +65,7 @@ impl Harness {
                 settings: &mut self.settings,
                 panels: &mut self.panels,
                 cache: &mut self.cache,
+                captures: &mut self.captures,
                 sources: &mut self.sources,
                 subscribers: &mut self.subscribers,
                 subscriber: None,
