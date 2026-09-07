@@ -85,6 +85,8 @@ pub struct Run {
     /// Space either side of this half alone, on top of the item's own.
     pub padding_left: f64,
     pub padding_right: f64,
+    /// Shifts this half alone, on top of the item's own offset.
+    pub y_offset: f64,
     /// Whether this half of the item is shown.
     ///
     /// Separate from the item's own `Drawing` so an icon can be shown without
@@ -106,6 +108,7 @@ impl From<&Run> for rsbar_protocol::Run {
             drawing: run.drawing,
             padding_left: run.padding_left,
             padding_right: run.padding_right,
+            y_offset: run.y_offset,
         }
     }
 }
@@ -119,6 +122,7 @@ impl From<&rsbar_protocol::Run> for Run {
             drawing: run.drawing,
             padding_left: run.padding_left,
             padding_right: run.padding_right,
+            y_offset: run.y_offset,
         }
     }
 }
@@ -163,6 +167,7 @@ impl Run {
             drawing: true,
             padding_left: 0.0,
             padding_right: 0.0,
+            y_offset: 0.0,
         }
     }
 

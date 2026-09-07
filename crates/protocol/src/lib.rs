@@ -515,6 +515,9 @@ mod parts {
         /// Space either side of this half alone, on top of the item's own.
         pub padding_left: f64,
         pub padding_right: f64,
+        /// Shifts this half alone, on top of the item's own offset -- how a
+        /// config nudges a glyph into line with the text beside it.
+        pub y_offset: f64,
     }
 
     /// A bare string is sugar for the text, which is how every config writes the

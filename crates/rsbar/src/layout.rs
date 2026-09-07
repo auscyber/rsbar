@@ -196,6 +196,7 @@ pub fn arrange<T: Copy>(
     items: &[Placed<T>],
     width: f64,
     padding: BarPadding,
+    notch_width: f64,
 ) -> Vec<(T, f64, f64)> {
     let in_bucket = |bucket: Position| items.iter().filter(move |i| i.position == bucket);
     let group_width = |bucket: Position| in_bucket(bucket).map(|i| i.width).sum::<f64>();
@@ -226,7 +227,12 @@ pub fn arrange<T: Copy>(
     }
     let centre_end = x;
 
-    let mut x = centre_start;
+    // The notch only ever pushes these further out. `SketchyBar` anchors both
+    // at the bar's own midpoint (`bar_center_left_first_item_x` in `bar.c`),
+    // which would overlap any centre item; rsbar hangs them off the centre
+    // group's edges instead, and taking whichever is further from the middle
+    // keeps that while still clearing the notch.
+    let mut x = centre_start.min(f64::midpoint(width, -notch_width));
     for item in in_bucket(Position::CenterLeft)
         .collect::<Vec<_>>()
         .into_iter()
@@ -236,7 +242,7 @@ pub fn arrange<T: Copy>(
         placed.push((item.id, x, item.width));
     }
 
-    let mut x = centre_end;
+    let mut x = centre_end.max(f64::midpoint(width, notch_width));
     for item in in_bucket(Position::CenterRight) {
         placed.push((item.id, x, item.width));
         x += item.width;
@@ -257,6 +263,7 @@ fn place(
     captures: &Captures,
     size: CGSize,
     padding: BarPadding,
+    notch_width: f64,
     ordinal: u32,
 ) -> Vec<(Entity, CGRect)> {
     // Sorted, because a query yields archetype order, which is not the order
@@ -298,7 +305,7 @@ fn place(
         })
         .collect();
 
-    let mut placed: Vec<(Entity, CGRect)> = arrange(&measured, size.width, padding)
+    let mut placed: Vec<(Entity, CGRect)> = arrange(&measured, size.width, padding, notch_width)
         .into_iter()
         .map(|(entity, x, w)| {
             (
@@ -634,6 +641,46 @@ pub(crate) fn intersects(a: CGRect, b: CGRect) -> bool {
 ///
 /// Returns whether it found shaped text to draw against, so the caller can
 /// count what actually got painted.
+/// Draws whichever of a graph or a slider sits between the icon and the label.
+fn draw_sandwich(ctx: &objc2_core_graphics::CGContext, rect: CGRect, row: &DrawnItem<'_, '_>) {
+    if let Some(graph) = row.graph {
+        draw_graph(ctx, rect, graph);
+    } else if let Some(slider) = row.slider {
+        draw_slider(ctx, rect, slider);
+    }
+}
+
+/// Draws one half of an item's text, shifted by its own `y_offset`.
+fn draw_run(
+    ctx: &objc2_core_graphics::CGContext,
+    shaped: &crate::shaping::Shaped,
+    run: &crate::components::Run,
+    which: Half,
+    at: CGPoint,
+    height: f64,
+) -> f64 {
+    let w = match which {
+        Half::Icon => shaped.icon_metrics().width,
+        Half::Label => shaped.label_metrics().width,
+    };
+    let box_ = CGRect::new(
+        CGPoint::new(at.x, at.y + run.y_offset),
+        CGSize::new(w, height),
+    );
+    match which {
+        Half::Icon => shaped.draw_icon(ctx, box_, run.color),
+        Half::Label => shaped.draw_label(ctx, box_, run.color),
+    }
+    w
+}
+
+/// Which half of an item [`draw_run`] is drawing.
+#[derive(Clone, Copy)]
+enum Half {
+    Icon,
+    Label,
+}
+
 pub(crate) fn draw_item(
     ctx: &objc2_core_graphics::CGContext,
     cache: &Cache,
@@ -719,27 +766,25 @@ pub(crate) fn draw_item(
     let label_present = !label.0.is_empty();
     if icon_present {
         x += icon.0.padding_left;
-        let w = shaped.icon_metrics().width;
-        let box_ = CGRect::new(CGPoint::new(x, y), CGSize::new(w, frame.size.height));
-        shaped.draw_icon(ctx, box_, icon.0.color);
+        let w = draw_run(
+            ctx,
+            shaped,
+            &icon.0,
+            Half::Icon,
+            CGPoint::new(x, y),
+            frame.size.height,
+        );
         x += w + icon.0.padding_right;
         if sandwich_present {
             x += padding.between;
         }
     }
-    if let Some(graph) = row.graph {
+    if sandwich_present {
         let box_ = CGRect::new(
             CGPoint::new(x, y),
             CGSize::new(sandwich_w, frame.size.height),
         );
-        draw_graph(ctx, box_, graph);
-        x += sandwich_w;
-    } else if let Some(slider) = row.slider {
-        let box_ = CGRect::new(
-            CGPoint::new(x, y),
-            CGSize::new(sandwich_w, frame.size.height),
-        );
-        draw_slider(ctx, box_, slider);
+        draw_sandwich(ctx, box_, &row);
         x += sandwich_w;
     }
     if (icon_present || sandwich_present) && label_present {
@@ -747,9 +792,14 @@ pub(crate) fn draw_item(
     }
     if label_present {
         x += label.0.padding_left;
-        let w = shaped.label_metrics().width;
-        let box_ = CGRect::new(CGPoint::new(x, y), CGSize::new(w, frame.size.height));
-        shaped.draw_label(ctx, box_, label.0.color);
+        draw_run(
+            ctx,
+            shaped,
+            &label.0,
+            Half::Label,
+            CGPoint::new(x, y),
+            frame.size.height,
+        );
     }
     true
 }
@@ -861,7 +911,13 @@ fn paint_panels(
         };
         // Layout depends on the panel's width and which display it is, so
         // both are per-panel rather than computed once for the whole bar.
-        let placed = place(items, cache, captures, size, padding, panel.ordinal);
+        // Only the built-in display has a notch to leave room for.
+        let notch = if skylight::is_builtin(panel.display.id) {
+            settings.notch_width
+        } else {
+            0.0
+        };
+        let placed = place(items, cache, captures, size, padding, notch, panel.ordinal);
         let before = pass.previous.iter().find(|p| p.display == panel.display.id);
         let torn = damage(pass.everything, pass.changed, before, panel.frame, &placed);
 
@@ -1041,6 +1097,7 @@ mod tests {
             &[item(1, Position::Left, 30.0), item(2, Position::Left, 20.0)],
             200.0,
             no_padding(),
+            0.0,
         );
         assert!((x_of(&placed, 1) - 0.0).abs() < 1e-9);
         assert!((x_of(&placed, 2) - 30.0).abs() < 1e-9);
@@ -1055,6 +1112,7 @@ mod tests {
             ],
             200.0,
             no_padding(),
+            0.0,
         );
         // Last added sits hard against the right edge; the first sits left of it.
         assert!((x_of(&placed, 2) - 180.0).abs() < 1e-9);
@@ -1063,8 +1121,8 @@ mod tests {
 
     #[test]
     fn right_stays_pinned_when_content_grows() {
-        let narrow = arrange(&[item(1, Position::Right, 20.0)], 200.0, no_padding());
-        let wide = arrange(&[item(1, Position::Right, 60.0)], 200.0, no_padding());
+        let narrow = arrange(&[item(1, Position::Right, 20.0)], 200.0, no_padding(), 0.0);
+        let wide = arrange(&[item(1, Position::Right, 60.0)], 200.0, no_padding(), 0.0);
         // The trailing edge is what must not move, not the origin.
         assert!((x_of(&narrow, 1) + 20.0 - 200.0).abs() < 1e-9);
         assert!((x_of(&wide, 1) + 60.0 - 200.0).abs() < 1e-9);
@@ -1079,6 +1137,7 @@ mod tests {
             ],
             200.0,
             no_padding(),
+            0.0,
         );
         // Group is 100 wide, so it starts at 50 and ends at 150.
         assert!((x_of(&placed, 1) - 50.0).abs() < 1e-9);
@@ -1095,6 +1154,7 @@ mod tests {
             ],
             200.0,
             no_padding(),
+            0.0,
         );
         // Centre spans 80..120, so its neighbours abut it without re-centring.
         assert!((x_of(&placed, 1) - 80.0).abs() < 1e-9);
@@ -1112,6 +1172,7 @@ mod tests {
             ],
             200.0,
             no_padding(),
+            0.0,
         );
         assert!((x_of(&placed, 1) - 0.0).abs() < 1e-9);
         assert!((x_of(&placed, 2) - 75.0).abs() < 1e-9);
@@ -1120,7 +1181,45 @@ mod tests {
 
     #[test]
     fn an_empty_bar_places_nothing() {
-        assert!(arrange::<u8>(&[], 200.0, no_padding()).is_empty());
+        assert!(arrange::<u8>(&[], 200.0, no_padding(), 0.0).is_empty());
+    }
+
+    #[test]
+    fn a_notch_pushes_the_centre_adjacent_buckets_apart() {
+        // Only the two centre-adjacent buckets move -- `bar_center_first_item_x`
+        // in SketchyBar's own `bar.c` has no notch term, so a centred item
+        // stays centred and would sit under the notch either way.
+        let items = [
+            item(1, Position::CenterLeft, 20.0),
+            item(2, Position::CenterRight, 20.0),
+        ];
+
+        let without = arrange(&items, 200.0, no_padding(), 0.0);
+        assert!((without[0].1 - 80.0).abs() < 1e-9, "left of the middle");
+        assert!((without[1].1 - 100.0).abs() < 1e-9, "right of the middle");
+
+        let with = arrange(&items, 200.0, no_padding(), 60.0);
+        assert!(
+            (with[0].1 - 50.0).abs() < 1e-9,
+            "pushed a further half-notch left"
+        );
+        assert!((with[1].1 - 130.0).abs() < 1e-9, "and a half-notch right");
+    }
+
+    #[test]
+    fn a_notch_never_pulls_a_bucket_inwards() {
+        // The centre-adjacent buckets hang off the centre group's edges here,
+        // which is already outside the midpoint. A notch narrower than that
+        // group must not drag them back in over it.
+        let items = [
+            item(1, Position::CenterLeft, 20.0),
+            item(2, Position::Center, 100.0),
+        ];
+        let placed = arrange(&items, 200.0, no_padding(), 10.0);
+        assert!(
+            (placed[1].1 - 30.0).abs() < 1e-9,
+            "still clear of the centre group, not at the midpoint"
+        );
     }
 
     #[test]
@@ -1136,6 +1235,7 @@ mod tests {
             ],
             200.0,
             padding,
+            0.0,
         );
         assert!((x_of(&placed, 1) - 10.0).abs() < 1e-9, "left starts inset");
         assert!(
@@ -1153,8 +1253,9 @@ mod tests {
                 left: 50.0,
                 right: 50.0,
             },
+            0.0,
         );
-        let without = arrange(&[item(1, Position::Center, 40.0)], 200.0, no_padding());
+        let without = arrange(&[item(1, Position::Center, 40.0)], 200.0, no_padding(), 0.0);
         assert!(
             (x_of(&with_padding, 1) - x_of(&without, 1)).abs() < 1e-9,
             "the centre group is centred on the whole bar, not the padded area"
@@ -1180,6 +1281,26 @@ mod width_tests {
             right: 0.0,
             between: 0.0,
         }
+    }
+
+    #[test]
+    fn shifting_a_run_does_not_change_what_it_measures() {
+        // `y_offset` moves a glyph up or down within the item it is already
+        // in. If it fed into `width()` the item would resize as well, and
+        // every neighbour would shift with it.
+        let cache = Cache::default();
+        let id = entity();
+        let mut icon = Icon(crate::components::Run::new("Menlo:Bold:15", Color::WHITE));
+        icon.0.string = "x".into();
+        let label = Label(crate::components::Run::new(
+            "Menlo:Regular:13",
+            Color::WHITE,
+        ));
+
+        let flat = width(&cache, id, &icon, &label, &padding(), None, None);
+        icon.0.y_offset = -5.0;
+        let shifted = width(&cache, id, &icon, &label, &padding(), None, None);
+        assert!((flat - shifted).abs() < 1e-9);
     }
 
     /// The draw path adds a run's own padding on top of its metrics; layout
@@ -1383,6 +1504,7 @@ mod place_tests {
             &Captures::default(),
             size(),
             BarPadding::default(),
+            0.0,
             1,
         );
 
@@ -1417,6 +1539,7 @@ mod place_tests {
             &Captures::default(),
             size(),
             BarPadding::default(),
+            0.0,
             1,
         );
         let on_two = place(
@@ -1425,6 +1548,7 @@ mod place_tests {
             &Captures::default(),
             size(),
             BarPadding::default(),
+            0.0,
             2,
         );
 
@@ -1462,6 +1586,7 @@ mod place_tests {
             &Captures::default(),
             size(),
             BarPadding::default(),
+            0.0,
             1,
         );
 

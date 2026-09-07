@@ -247,6 +247,7 @@ struct IconOrLabel {
     drawing: Option<bool>,
     padding_left: Option<f64>,
     padding_right: Option<f64>,
+    y_offset: Option<f64>,
 }
 
 impl IconOrLabel {
@@ -260,6 +261,7 @@ impl IconOrLabel {
             drawing: self.drawing,
             padding_left: self.padding_left,
             padding_right: self.padding_right,
+            y_offset: self.y_offset,
         };
         (patch != rsbar_protocol::RunPatch::default()).then_some(patch)
     }
@@ -376,14 +378,8 @@ fn nearest<'a>(key: &str, known: &[&'a str]) -> Option<&'a str> {
 }
 
 /// A real `SketchyBar` `icon`/`label` property this crate has no field for
-/// yet. `y_offset` needs a `Run`/`RunPatch::y_offset` field, which in turn
-/// needs the daemon's own `components::Run` (and its two hand-written
-/// conversions to and from this crate's `Run`) to grow the same field —
-/// outside `crates/rsbar-lua`, so logged rather than modelled here.
-const ICON_LABEL_UNSUPPORTED: &[(&str, &str)] = &[(
-    "y_offset",
-    "shifting the icon/label independently of the item; needs a `Run`/`RunPatch::y_offset` field (tracked separately)",
-)];
+/// yet. Empty at the moment.
+const ICON_LABEL_UNSUPPORTED: &[(&str, &str)] = &[];
 
 impl IconOrLabel {
     // `string` is the spelling a real SketchyBar config uses for the text
@@ -397,6 +393,7 @@ impl IconOrLabel {
         "drawing",
         "padding_left",
         "padding_right",
+        "y_offset",
     ];
 
     fn read(table: &Table, key: &str) -> mlua::Result<Self> {
@@ -417,6 +414,7 @@ impl IconOrLabel {
                     drawing: opt_bool(&sub, "drawing")?,
                     padding_left: opt(&sub, "padding_left")?,
                     padding_right: opt(&sub, "padding_right")?,
+                    y_offset: opt(&sub, "y_offset")?,
                 })
             }
             other => Err(mlua::Error::RuntimeError(format!(

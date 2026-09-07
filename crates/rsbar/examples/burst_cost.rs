@@ -13,6 +13,7 @@ use std::time::Instant;
 
 fn run(text: &str) -> Run {
     Run {
+        y_offset: 0.0,
         string: text.to_owned(),
         font: FontSpec::default(),
         color: Color(0xffff_ffff),
@@ -55,7 +56,7 @@ fn main() {
                 width: s.label_metrics().width,
             })
             .collect();
-        let placed = arrange(&measured, 3840.0, BarPadding::default());
+        let placed = arrange(&measured, 3840.0, BarPadding::default(), 0.0);
         let layout = started.elapsed();
 
         let n = u32::try_from(count).unwrap_or(1);
