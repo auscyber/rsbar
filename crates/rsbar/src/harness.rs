@@ -94,6 +94,16 @@ impl Harness {
         &self.settings
     }
 
+    /// Whether a source is registered right now.
+    #[must_use]
+    pub fn running(&self, id: &'static str) -> bool {
+        self.sources.running(crate::sources::SourceId(id))
+    }
+
+    pub fn start_eager(&mut self) {
+        self.sources.start_eager();
+    }
+
     /// Convenience: add an item and set it in one go.
     pub fn add(&mut self, name: &str, position: rsbar_protocol::Position) -> ItemName {
         let name = ItemName::new(name).expect("valid name");
@@ -116,6 +126,75 @@ mod tests {
     use super::Harness;
     use rsbar_protocol::event::{Forced, FrontApp, VolumeChange};
     use rsbar_protocol::{Event, ItemName, ItemPatch, Kind, Position, Request, Response};
+
+    /// The workspace source, which `front_app_switched` is the lazy way in to.
+    const WORKSPACE: &str = "workspace";
+
+    #[test]
+    fn nothing_is_running_until_an_item_wants_it() {
+        let bar = Harness::new();
+        assert!(
+            !bar.running(WORKSPACE),
+            "a bar nobody has configured observes nothing"
+        );
+    }
+
+    #[test]
+    fn subscribing_starts_the_source_and_removing_the_item_stops_it() {
+        let mut bar = Harness::new();
+        let item = bar.add("front", Position::Left);
+        bar.apply(Request::Subscribe {
+            name: item.clone(),
+            events: vec![Kind::FrontAppSwitched],
+        });
+        assert!(bar.running(WORKSPACE));
+
+        bar.apply(Request::RemoveItem(item));
+        assert!(
+            !bar.running(WORKSPACE),
+            "the last item wanting it went, so it should have stopped"
+        );
+    }
+
+    #[test]
+    fn a_source_survives_one_of_two_items_losing_interest() {
+        // The reference count earning itself: releasing on any unsubscribe
+        // would silently stop an event the other item is still waiting for.
+        let mut bar = Harness::new();
+        let first = bar.add("one", Position::Left);
+        let second = bar.add("two", Position::Left);
+        for item in [&first, &second] {
+            bar.apply(Request::Subscribe {
+                name: item.clone(),
+                events: vec![Kind::FrontAppSwitched],
+            });
+        }
+
+        bar.apply(Request::Subscribe {
+            name: first,
+            events: vec![],
+        });
+        assert!(
+            bar.running(WORKSPACE),
+            "the second item still wants front_app_switched"
+        );
+
+        bar.apply(Request::Subscribe {
+            name: second,
+            events: vec![],
+        });
+        assert!(!bar.running(WORKSPACE));
+    }
+
+    #[test]
+    fn an_eager_source_runs_with_nobody_subscribed() {
+        let mut bar = Harness::new();
+        bar.start_eager();
+        assert!(
+            bar.running("displays"),
+            "the bar's own geometry depends on it, so it declares itself eager"
+        );
+    }
 
     fn name(s: &str) -> ItemName {
         ItemName::new(s).expect("valid name")

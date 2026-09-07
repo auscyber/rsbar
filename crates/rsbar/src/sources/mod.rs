@@ -41,11 +41,14 @@
 pub mod config;
 pub mod displays;
 pub mod mouse;
+pub mod observers;
 pub mod power;
 pub mod volume;
 pub mod workspace;
 
+use bevy_ecs::entity::Entity;
 use rsbar_protocol::{Event, Kind};
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 
 /// How many events may be queued before the oldest producer starts losing
@@ -259,6 +262,17 @@ pub trait Source: Send {
     /// against this to decide what to start.
     fn provides(&self) -> Vec<Kind>;
 
+    /// Whether this has to run whether or not anything subscribed.
+    ///
+    /// Lazy by default, which is the answer for anything an item asks for: a
+    /// bar that never mentions the volume should not be paying `CoreAudio` to
+    /// watch it. Eager is for what the bar itself depends on — the displays it
+    /// draws on, the config file it reloads from — where there is no
+    /// subscription to wait for because the daemon is the subscriber.
+    fn eager(&self) -> bool {
+        false
+    }
+
     /// Registers observers that write into `emit`.
     ///
     /// Called on the main thread, with the app's run loop current. The returned
@@ -380,10 +394,7 @@ impl<T: Payload> CallbackState<T> {
 /// # Errors
 ///
 /// Returns [`StartError`] if the framework refuses.
-pub fn start(
-    mut source: Box<dyn Source>,
-    waker: &crate::runloop::Waker,
-) -> Result<Feed, StartError> {
+pub fn start(source: &mut dyn Source, waker: &crate::runloop::Waker) -> Result<Feed, StartError> {
     let id = source.id();
     let (queue, events) = tokio::sync::mpsc::channel(QUEUE_DEPTH);
     let registration = source.register(Emitter {
@@ -399,7 +410,22 @@ pub fn start(
 /// config never mentions `volume_changed` should not pay it, so a source starts
 /// the first time an item subscribes to something it provides.
 pub struct Registry {
-    entries: Vec<Entry>,
+    /// Every source, by name. Keyed rather than listed so that starting one is
+    /// a lookup, and so that a source is started once however many of the
+    /// events it provides get asked for.
+    sources: HashMap<SourceId, Registered>,
+    /// Which sources produce a given event.
+    ///
+    /// Many-valued on purpose. A kind is not guaranteed a single provider —
+    /// per-item pointer events will come from sources indexed by the entity
+    /// they watch — so this maps to a list rather than pretending otherwise.
+    providers: HashMap<Kind, Vec<SourceId>>,
+    /// What each item is currently keeping alive.
+    ///
+    /// The reference count, held as the set it was derived from rather than a
+    /// number: replacing an item's subscriptions has to release exactly what it
+    /// used to want, which a count cannot tell you.
+    held: HashMap<Entity, HashSet<SourceId>>,
     /// Events with no framework behind them — a click, or `--trigger`.
     manual: Feed,
     emit: Emitter,
@@ -408,11 +434,19 @@ pub struct Registry {
     waker: crate::runloop::Waker,
 }
 
-struct Entry {
-    source: Option<Box<dyn Source>>,
-    provides: Vec<Kind>,
-    id: SourceId,
+/// A source, and its feed once it is running.
+struct Registered {
+    source: Box<dyn Source>,
     feed: Option<Feed>,
+    /// The items keeping it alive. Emptying this stops the source.
+    users: HashSet<Entity>,
+    /// Kept running regardless of who wants it: the bar's own geometry and its
+    /// config file are not anybody's subscription.
+    pinned: bool,
+    /// A source that refused to start is not asked again. These fail for
+    /// structural reasons — a missing config file, a framework saying no — so a
+    /// second attempt fails identically.
+    failed: bool,
 }
 
 impl Registry {
@@ -428,23 +462,40 @@ impl Registry {
             Box::new(volume::Volume),
         ];
 
-        let entries = sources
-            .into_iter()
-            .map(|source| Entry {
-                id: source.id(),
-                provides: source.provides(),
-                source: Some(source),
-                feed: None,
-            })
-            .collect();
+        let mut providers: HashMap<Kind, Vec<SourceId>> = HashMap::new();
+        let mut registered = HashMap::with_capacity(sources.len());
+        for source in sources {
+            let id = source.id();
+            for kind in source.provides() {
+                providers.entry(kind).or_default().push(id);
+            }
+            registered.insert(
+                id,
+                Registered {
+                    pinned: source.eager(),
+                    source,
+                    feed: None,
+                    users: HashSet::new(),
+                    failed: false,
+                },
+            );
+        }
 
         let (emit, manual) = Feed::manual(SourceId("local"), waker.clone());
         Self {
-            entries,
+            sources: registered,
+            providers,
+            held: HashMap::new(),
             manual,
             emit,
             waker,
         }
+    }
+
+    /// Whether a source is currently registered with its framework.
+    #[must_use]
+    pub fn running(&self, id: SourceId) -> bool {
+        self.sources.get(&id).is_some_and(|e| e.feed.is_some())
     }
 
     /// A sink for events this process observes outside any source.
@@ -453,43 +504,99 @@ impl Registry {
         self.emit.clone()
     }
 
-    /// Starts the sources worth running whether or not anything subscribed.
+    /// Starts the sources that declared themselves eager.
     ///
-    /// The workspace notifications are five observers on one notification
-    /// centre. Displays and the config are here not because anything subscribed
-    /// but because the bar's own geometry and contents depend on them.
+    /// Everything else waits for an item to want it. Nothing releases these —
+    /// they answer the daemon's own needs, and the daemon is always here.
     pub fn start_eager(&mut self) {
-        self.ensure(&Kind::FrontAppSwitched);
-        self.ensure(&Kind::DisplayChanged);
-        self.ensure(&Kind::ConfigReloaded);
-    }
-
-    /// Starts whatever provides `event`, if it is not running already.
-    ///
-    /// Cheap to call repeatedly: a subscription change runs this over every
-    /// event an item asked for.
-    pub fn ensure(&mut self, kind: &Kind) {
-        for entry in &mut self.entries {
-            if entry.feed.is_some() || !entry.provides.contains(kind) {
-                continue;
-            }
-            let Some(source) = entry.source.take() else {
-                continue;
-            };
-            match start(source, &self.waker) {
-                Ok(feed) => {
-                    tracing::debug!(source = %entry.id, %kind, "started event source");
-                    entry.feed = Some(feed);
-                }
-                Err(err) => tracing::warn!(%err, "event source unavailable"),
-            }
+        let eager: Vec<SourceId> = self
+            .sources
+            .iter()
+            .filter(|(_, entry)| entry.pinned)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in eager {
+            self.reconcile(id, None);
         }
     }
 
-    /// Starts everything needed for a set of subscriptions at once.
-    pub fn ensure_all<'a>(&mut self, kinds: impl IntoIterator<Item = &'a Kind>) {
+    /// Records everything `who` needs, releasing whatever it needed before.
+    ///
+    /// This is the whole lifecycle: a source starts when the first item wants
+    /// an event it provides, and stops when the last one stops wanting it. An
+    /// item that drops `volume_changed` from its subscriptions stops the audio
+    /// listener, and a config reload that removes the item entirely does too.
+    pub fn holds(&mut self, who: Entity, kinds: impl IntoIterator<Item = Kind>) {
+        let mut wanted = HashSet::new();
+        let mut touched = Vec::new();
         for kind in kinds {
-            self.ensure(kind);
+            if let Some(ids) = self.providers.get(&kind) {
+                wanted.extend(ids.iter().copied());
+                touched.push(kind);
+            } else {
+                tracing::debug!(%kind, "nothing provides this event");
+            }
+        }
+
+        let previously = self.held.insert(who, wanted.clone()).unwrap_or_default();
+        for id in previously.difference(&wanted) {
+            if let Some(entry) = self.sources.get_mut(id) {
+                entry.users.remove(&who);
+            }
+        }
+        for id in &wanted {
+            if let Some(entry) = self.sources.get_mut(id) {
+                entry.users.insert(who);
+            }
+        }
+        if wanted.is_empty() {
+            self.held.remove(&who);
+        }
+
+        for id in previously.union(&wanted).copied().collect::<Vec<_>>() {
+            self.reconcile(id, touched.first());
+        }
+    }
+
+    /// Releases everything an item was keeping alive, because it is gone.
+    pub fn release(&mut self, who: Entity) {
+        let Some(held) = self.held.remove(&who) else {
+            return;
+        };
+        for id in held {
+            if let Some(entry) = self.sources.get_mut(&id) {
+                entry.users.remove(&who);
+            }
+            self.reconcile(id, None);
+        }
+    }
+
+    /// Brings one source into line with whether anything still wants it.
+    fn reconcile(&mut self, id: SourceId, because: Option<&Kind>) {
+        let Self { sources, waker, .. } = self;
+        let Some(entry) = sources.get_mut(&id) else {
+            return;
+        };
+        let wanted = entry.pinned || !entry.users.is_empty();
+
+        match (wanted, entry.feed.is_some()) {
+            (true, false) if !entry.failed => match start(entry.source.as_mut(), waker) {
+                Ok(feed) => {
+                    tracing::debug!(source = %id, kind = ?because, "started event source");
+                    entry.feed = Some(feed);
+                }
+                Err(err) => {
+                    entry.failed = true;
+                    tracing::warn!(%err, "event source unavailable");
+                }
+            },
+            // Dropping the feed drops the registration, which deregisters — on
+            // this thread, which is the one that registered.
+            (false, true) => {
+                tracing::debug!(source = %id, "stopped event source; nothing wants it");
+                entry.feed = None;
+            }
+            _ => {}
         }
     }
 
@@ -499,7 +606,7 @@ impl Registry {
     /// arriving from somewhere unexpected is traceable rather than anonymous.
     pub fn drain(&mut self) -> Vec<(SourceId, Event)> {
         let mut drained = Vec::new();
-        let feeds = self.entries.iter_mut().filter_map(|e| e.feed.as_mut());
+        let feeds = self.sources.values_mut().filter_map(|e| e.feed.as_mut());
         for feed in feeds.chain(std::iter::once(&mut self.manual)) {
             let id = feed.id();
             while let Some(event) = feed.try_next() {

@@ -55,6 +55,8 @@ fn main() -> std::process::ExitCode {
 
     let config = rsbar::config::shared();
     let mut registry = Registry::new(rsbar::config::Shared::clone(&config), waker.clone());
+    // Only the sources that declared themselves eager. Everything else waits
+    // for an item to want it, and stops again when the last one does not.
     registry.start_eager();
 
     let (tx, requests) = mpsc::sync_channel::<IpcRequest>(REQUEST_QUEUE);

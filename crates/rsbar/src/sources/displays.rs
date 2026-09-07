@@ -1,17 +1,27 @@
-//! Displays being added, removed or rearranged.
+//! Displays: the set of them changing, and which one has focus.
 //!
-//! `NSWorkspace` does not report this — its display notification fires when the
-//! *active* display changes, not when the set of them does. Plugging in a
-//! monitor arrives only here, and it invalidates every panel's geometry.
+//! Two different facts, one event. `CoreGraphics`' reconfiguration callback is
+//! the only thing that reports a monitor being plugged in or rearranged, which
+//! invalidates every panel's geometry. `NSWorkspace`'s display notification
+//! reports focus moving to another display, which is what `SketchyBar`'s
+//! `display_change` means. Both are `display_changed`, and both belong to this
+//! source — split across two, subscribing to the event started both of them.
 
+use crate::sources::observers::{Observers, ToEvent};
 use crate::sources::{CallbackState, Cause, Emitter, Registration, Source, SourceId, StartError};
+use objc2_app_kit::NSWorkspace;
 use objc2_core_graphics::{
     CGDirectDisplayID, CGDisplayChangeSummaryFlags, CGDisplayRegisterReconfigurationCallback,
     CGDisplayRemoveReconfigurationCallback,
 };
+use objc2_foundation::{NSNotification, NSString};
 use rsbar_protocol::event::DisplayChange;
 use rsbar_protocol::{Event, Kind};
 use std::ffi::c_void;
+
+fn display_changed(_: &NSNotification) -> Event {
+    Event::DisplayChanged(DisplayChange {})
+}
 
 extern "C-unwind" fn reconfigured(
     _display: CGDirectDisplayID,
@@ -56,6 +66,10 @@ impl Source for Displays {
         vec![Kind::DisplayChanged]
     }
 
+    fn eager(&self) -> bool {
+        true
+    }
+
     fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {
         let state = CallbackState::new(emit);
         let status = state.with_ptr(|context| {
@@ -65,6 +79,14 @@ impl Source for Displays {
         if status != objc2_core_graphics::CGError::Success {
             return Err(StartError::new(self.id(), Cause::CoreGraphics(status)));
         }
-        Ok(Box::new(Deregister(state)))
+
+        // `NSWorkspaceActiveDisplayDidChangeNotification` is undocumented and
+        // absent from the generated bindings, so it is named by string — the
+        // same way SketchyBar reaches it.
+        let focus_moved = NSString::from_str("NSWorkspaceActiveDisplayDidChangeNotification");
+        let mut observers = Observers::new(NSWorkspace::sharedWorkspace().notificationCenter());
+        observers.observe(&focus_moved, state.get(), display_changed as ToEvent);
+
+        Ok(Box::new((Deregister(state), observers)))
     }
 }

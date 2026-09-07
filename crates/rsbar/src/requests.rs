@@ -19,6 +19,7 @@ use rsbar_protocol::style::{Color, FontSpec};
 use rsbar_protocol::{
     Event, ItemName, ItemPatch, ItemState, Kind, Query as ProtocolQuery, Request, Response,
 };
+use std::collections::BTreeSet;
 
 /// Every component a request can write.
 type WriteComponents = (
@@ -319,12 +320,24 @@ fn is_pointer(kind: &Kind) -> bool {
     )
 }
 
-/// Starts the mouse source and lets the bar take clicks.
+/// Everything an item keeps running: what it subscribed to, plus the pointer
+/// if it has a click script.
 ///
-/// Both happen together on purpose: without the source nothing is reported, and
-/// without the window tag nothing is delivered to report.
-fn make_clickable(sources: &mut Registry, panels: &Panels) {
-    sources.ensure(&Kind::MouseClicked);
+/// A click script is not a subscription but needs the same source, so it is
+/// folded in here rather than being a second, competing claim — the registry
+/// takes one set per item and replacing it releases the rest.
+fn needs(subscribed: &BTreeSet<Kind>, clickable: bool) -> impl Iterator<Item = Kind> + use<'_> {
+    subscribed
+        .iter()
+        .cloned()
+        .chain(clickable.then_some(Kind::MouseClicked))
+}
+
+/// Lets the bar take clicks at all.
+///
+/// The source reports them and this tag is what gets them delivered; without
+/// either there is nothing to report.
+fn take_clicks(panels: &Panels) {
     if let Err(err) = panels.set_clickable(true) {
         tracing::error!(%err, "could not make the bar take clicks");
     }
@@ -403,13 +416,15 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
                 return no_such(&name);
             };
             let wants_clicks = patch.click_script.as_ref().is_some_and(|s| !s.is_empty());
+            let subscribed = wants_clicks.then(|| row.9.0.clone());
             set_item(entity, row, &patch, &mut items.commands);
             // Touching an item during a reload is what keeps it: a config that
             // only sets an existing item, without re-adding it, must not have
             // it swept up as stale.
             items.commands.entity(entity).remove::<Stale>();
-            if wants_clicks {
-                make_clickable(sources, panels);
+            if let Some(subscribed) = subscribed {
+                sources.holds(entity, needs(&subscribed, true));
+                take_clicks(panels);
             }
             Outcome::ok()
         }
@@ -420,6 +435,9 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
                 return no_such(&name);
             };
             cache.forget(entity);
+            // Before the despawn: this is what stops a source nothing wants any
+            // more, and the entity is the handle it is held by.
+            sources.release(entity);
             items.commands.entity(entity).despawn();
             Outcome::ok()
         }
@@ -433,12 +451,15 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
                 return no_such(&name);
             };
             // Subscribing is where a config decides what this process actually
-            // observes, so it is what starts a source.
-            sources.ensure_all(&events);
-            if events.iter().any(is_pointer) {
-                make_clickable(sources, panels);
+            // observes, so it is what starts and stops a source.
+            let subscribed: BTreeSet<Kind> = events.into_iter().collect();
+            let clickable = row.11.is_some_and(|script| !script.0.is_empty())
+                || subscribed.iter().any(is_pointer);
+            sources.holds(entity, needs(&subscribed, clickable));
+            if clickable {
+                take_clicks(panels);
             }
-            row.9.0 = events.into_iter().collect();
+            row.9.0 = subscribed;
             Outcome::ok()
         }
 

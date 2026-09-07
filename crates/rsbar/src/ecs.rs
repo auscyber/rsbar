@@ -324,6 +324,7 @@ fn settle_reload(
     mut commands: Commands,
     mut index: ResMut<Index>,
     mut cache: NonSendMut<Cache>,
+    mut sources: NonSendMut<Sources>,
     stale: Query<(Entity, &Name), With<Stale>>,
     config: Res<ConfigHandle>,
 ) {
@@ -343,6 +344,9 @@ fn settle_reload(
         if succeeded {
             cache.forget(entity);
             index.remove(&name.0);
+            // A config that dropped the only item watching the volume stops
+            // the audio listener with it.
+            sources.0.release(entity);
             commands.entity(entity).despawn();
         } else {
             commands.entity(entity).remove::<Stale>();

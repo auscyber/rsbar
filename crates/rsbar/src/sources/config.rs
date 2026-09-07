@@ -26,6 +26,10 @@ impl Source for Watcher {
         vec![Kind::ConfigReloaded]
     }
 
+    fn eager(&self) -> bool {
+        true
+    }
+
     fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {
         let Some(path) = self.config.blocking_read().path.clone() else {
             return Err(StartError::new(self.id(), Cause::NoConfigFile));
