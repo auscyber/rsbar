@@ -189,6 +189,8 @@ pub enum Request {
     },
     /// Runs every item's script immediately, ignoring update frequency.
     UpdateAll,
+    /// Re-runs the config from scratch, as a file change does.
+    Reload,
     Query(Query),
     Shutdown,
 }

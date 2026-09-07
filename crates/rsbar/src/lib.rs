@@ -3,6 +3,7 @@
 
 pub mod bar;
 pub mod components;
+pub mod config;
 pub mod display;
 pub mod ecs;
 pub mod layout;

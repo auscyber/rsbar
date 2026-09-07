@@ -42,6 +42,8 @@ enum Command {
     },
     /// Run every item's script immediately, ignoring update frequency.
     Update,
+    /// Tear the bar down and re-run the config.
+    Reload,
     /// Ask the daemon to exit.
     Shutdown,
 }
@@ -224,6 +226,7 @@ fn main() -> ExitCode {
         }),
         Command::Trigger { event, info } => Request::Trigger { event, info },
         Command::Update => Request::UpdateAll,
+        Command::Reload => Request::Reload,
         Command::Shutdown => Request::Shutdown,
     };
 

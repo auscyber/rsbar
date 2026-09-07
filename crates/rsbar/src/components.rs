@@ -16,6 +16,15 @@ use std::collections::{BTreeSet, HashMap};
 #[derive(Component)]
 pub struct Item;
 
+/// Marks an item that predates the config run currently in flight.
+///
+/// A reload cannot simply clear the bar first: the config might fail, and a
+/// broken edit should change nothing rather than leave an empty bar. So items
+/// are marked instead, the mark is lifted from any item the config touches, and
+/// what is still marked when the run *succeeds* is what the new config dropped.
+#[derive(Component)]
+pub struct Stale;
+
 #[derive(Component, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Name(pub ItemName);
 
@@ -154,4 +163,69 @@ pub fn bundle(name: ItemName, position: Position) -> impl Bundle {
         },
         Subscriptions::default(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_zero_frequency_never_comes_due() {
+        let mut routine = Routine {
+            every: 0,
+            elapsed: 0,
+        };
+        // Event-driven items sit at zero; ticking them forever must do nothing.
+        for _ in 0..100 {
+            assert!(!routine.tick());
+        }
+    }
+
+    #[test]
+    fn a_frequency_fires_on_its_period_and_resets() {
+        let mut routine = Routine {
+            every: 3,
+            elapsed: 0,
+        };
+        assert!(!routine.tick());
+        assert!(!routine.tick());
+        assert!(routine.tick(), "due on the third second");
+        assert!(!routine.tick(), "and the clock restarts");
+        assert!(!routine.tick());
+        assert!(routine.tick());
+    }
+
+    #[test]
+    fn every_second_fires_every_second() {
+        let mut routine = Routine {
+            every: 1,
+            elapsed: 0,
+        };
+        assert!(routine.tick());
+        assert!(routine.tick());
+    }
+
+    #[test]
+    fn the_index_is_keyed_by_name() {
+        // Name is the identity that survives a reload: the same name must map
+        // back to the same entity, which is what lets a config update an item
+        // in place rather than replacing it.
+        let mut index = Index::default();
+        let clock = ItemName::new("clock").unwrap();
+        let entity = Entity::from_raw_u32(7).unwrap();
+
+        assert_eq!(index.get(&clock), None);
+        index.insert(clock.clone(), entity);
+        assert_eq!(index.get(&clock), Some(entity));
+
+        assert_eq!(index.remove(&clock), Some(entity));
+        assert_eq!(index.get(&clock), None);
+        assert_eq!(index.remove(&clock), None, "removing twice is not an error");
+    }
+
+    #[test]
+    fn an_empty_run_contributes_no_width() {
+        let run = Run::new("Menlo:Bold:15", Color::WHITE);
+        assert!(run.is_empty(), "a fresh run has no text");
+    }
 }

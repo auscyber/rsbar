@@ -13,10 +13,7 @@ repository = "https://github.com/auscyber/rsbar"
 rsbar-protocol = { path = "crates/protocol" }
 skylight = { path = "crates/skylight" }
 
-async-channel = "2.5"
 async-mach-ports = "0.1"
-async-executor = "1.14"
-async-lock = "3.4"
 bevy_app = { version = "0.19", default-features = false, features = ["std"] }
 # `debug` names the system and the components in a B0001 access-conflict
 # panic. Without it the message is six copies of "Enable the debug feature to
@@ -25,6 +22,7 @@ bevy_ecs = { version = "0.19", default-features = false, features = ["std", "deb
 bevy_time = { version = "0.19", default-features = false, features = ["std"] }
 bitflags = "2.13"
 futures-lite = "2.6"
+notify = "8"
 libc = "0.2"
 objc2 = { version = "0.6", features = ["catch-all", "exception"] }
 objc2-app-kit = { version = "0.3", default-features = false }
@@ -34,6 +32,10 @@ objc2-core-text = { version = "0.3", default-features = false }
 objc2-foundation = { version = "0.3", default-features = false }
 objc2-quartz-core = { version = "0.3", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
+# The `sync` feature alone: channels and locks work with no runtime, which
+# matters because this daemon deliberately has none — its executor is the
+# CFRunLoop-driven Bevy runner.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 thiserror = "2.0"
 tracing = "0.1"
 

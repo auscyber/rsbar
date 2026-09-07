@@ -27,6 +27,8 @@ pub enum Event {
     WifiChanged,
     MediaChanged,
     SpaceWindowsChanged,
+    /// The config file changed on disk and has been re-run.
+    ConfigReloaded,
     Custom(String),
 }
 
@@ -48,12 +50,13 @@ impl Event {
             Self::WifiChanged => "wifi_changed",
             Self::MediaChanged => "media_changed",
             Self::SpaceWindowsChanged => "space_windows_changed",
+            Self::ConfigReloaded => "config_reloaded",
             Self::Custom(name) => name,
         }
     }
 
     /// The events a config can name, excluding `Custom`.
-    pub const BUILT_IN: [Self; 13] = [
+    pub const BUILT_IN: [Self; 14] = [
         Self::Routine,
         Self::Forced,
         Self::FrontAppSwitched,
@@ -67,6 +70,7 @@ impl Event {
         Self::WifiChanged,
         Self::MediaChanged,
         Self::SpaceWindowsChanged,
+        Self::ConfigReloaded,
     ];
 }
 

@@ -8,8 +8,8 @@
 
 use crate::sources::{Emission, Emitter, Source, StartError};
 use rsbar_protocol::Event;
-use std::cell::RefCell;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, Ordering};
 type AudioObjectId = u32;
 type OsStatus = i32;
 
@@ -115,39 +115,42 @@ mod ffi_safe {
         (status == 0).then_some(value)
     }
 
-    /// Registers `listener`. The listener must outlive the registration, which
-    /// is why every caller here passes a `fn` item rather than a closure.
-    pub(super) fn add_listener(
+    /// Registers `listener`, which will be handed `context` on every call.
+    ///
+    /// # Safety
+    ///
+    /// `context` must stay valid and shared-referenceable for as long as the
+    /// registration lives — `CoreAudio` may call back from its own thread at
+    /// any time until the matching [`remove_listener`].
+    pub(super) unsafe fn add_listener(
         object: AudioObjectId,
         address: PropertyAddress,
         listener: ListenerProc,
+        context: *mut c_void,
     ) -> OsStatus {
-        // SAFETY: `address` outlives the call; `listener` is a `fn` item with
-        // static lifetime and the null context is never dereferenced.
-        unsafe {
-            AudioObjectAddPropertyListener(
-                object,
-                &raw const address,
-                listener,
-                std::ptr::null_mut(),
-            )
-        }
+        // SAFETY: `address` outlives the call; the caller guarantees `context`.
+        unsafe { AudioObjectAddPropertyListener(object, &raw const address, listener, context) }
     }
 
-    /// Removes a registration made by [`add_listener`] with the same triple.
-    pub(super) fn remove_listener(
+    /// Removes a registration made by [`add_listener`].
+    ///
+    /// `CoreAudio` matches on the listener *and* the context, so this has to be
+    /// given the same pointer the registration was made with or the listener
+    /// stays installed.
+    ///
+    /// # Safety
+    ///
+    /// Same requirement as [`add_listener`]: `context` must still be the
+    /// pointer that registration used.
+    pub(super) unsafe fn remove_listener(
         object: AudioObjectId,
         address: PropertyAddress,
         listener: ListenerProc,
+        context: *mut c_void,
     ) {
-        // SAFETY: same arguments the matching `add_listener` was given.
+        // SAFETY: the caller passes the pointer the registration used.
         unsafe {
-            AudioObjectRemovePropertyListener(
-                object,
-                &raw const address,
-                listener,
-                std::ptr::null_mut(),
-            );
+            AudioObjectRemovePropertyListener(object, &raw const address, listener, context);
         }
     }
 }
@@ -226,43 +229,75 @@ pub fn current_percentage() -> Option<u32> {
     current_scalar().map(percent)
 }
 
-thread_local! {
-    /// `CoreAudio` delivers on the thread that registered, so the handler and
-    /// the device currently being listened to live here rather than behind a
-    /// context pointer that would have to be leaked.
-    static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+/// What the listeners need, reachable from whatever thread `CoreAudio` calls
+/// back on.
+///
+/// The previous version kept this in a `thread_local`, on the belief that
+/// `CoreAudio` delivers on the thread that registered. It does not — by default
+/// it uses an internal notification thread — so the callback found an empty
+/// slot and every volume change was silently dropped. The state travels as the
+/// listener's context pointer instead, which is what that argument is for.
+///
+/// No lock: the only mutable state is two words, and a callback that blocks is
+/// a callback that stalls `CoreAudio`'s notification thread. Atomics also mean
+/// there is no guard to poison and nothing that can panic in a callback.
+struct Shared {
+    emit: Emitter,
+    /// The device currently listened to, or [`NO_DEVICE`].
+    listening_to: AtomicU32,
+    /// The last scalar reported, as bits. `CoreAudio` fires several times for
+    /// one user-visible change — per channel, and for mute alongside volume —
+    /// so only a real move is passed on.
+    last: AtomicU32,
 }
 
-struct State {
-    emit: Emitter,
-    listening_to: Option<AudioObjectId>,
-    /// `CoreAudio` fires several times for one user-visible change — per
-    /// channel, and for mute alongside volume. Only a real move is reported.
-    last: f32,
-}
+/// `kAudioObjectUnknown`, which is never a real device.
+const NO_DEVICE: AudioObjectId = 0;
 
 /// How much the volume must move to count as a change. `SketchyBar`'s value.
 const EPSILON: f32 = 1e-2;
+
+impl Shared {
+    /// The context pointer form, for handing to `CoreAudio`.
+    fn as_context(&'static self) -> *mut c_void {
+        std::ptr::from_ref(self).cast_mut().cast::<c_void>()
+    }
+}
+
+/// Recovers the state a listener was registered with.
+///
+/// # Safety
+///
+/// `context` must be the pointer from [`Shared::as_context`] on a `Shared` that
+/// is still alive — which is why the one this module makes is leaked.
+unsafe fn shared_from(context: *mut c_void) -> Option<&'static Shared> {
+    // SAFETY: the caller guarantees provenance and liveness.
+    unsafe { context.cast::<Shared>().as_ref() }
+}
 
 extern "C-unwind" fn changed(
     _object: AudioObjectId,
     _count: u32,
     _addresses: *const PropertyAddress,
-    _context: *mut c_void,
+    context: *mut c_void,
 ) -> OsStatus {
-    STATE.with_borrow_mut(|state| {
-        let Some(state) = state else { return };
-        let Some(scalar) = current_scalar() else {
-            return;
-        };
-        if (scalar - state.last).abs() < EPSILON {
-            return;
-        }
-        state.last = scalar;
-        let emission = Emission::new(Event::VolumeChanged, Some(percent(scalar).to_string()));
-        // Dropping beats blocking: this is a `CoreAudio` callback.
-        let _ = state.emit.try_send(emission);
-    });
+    // SAFETY: every registration passes the leaked `Shared`.
+    let Some(shared) = (unsafe { shared_from(context) }) else {
+        return 0;
+    };
+    let Some(scalar) = current_scalar() else {
+        return 0;
+    };
+
+    let last = f32::from_bits(shared.last.load(Ordering::Relaxed));
+    if (scalar - last).abs() < EPSILON {
+        return 0;
+    }
+    shared.last.store(scalar.to_bits(), Ordering::Relaxed);
+
+    let emission = Emission::new(Event::VolumeChanged, Some(percent(scalar).to_string()));
+    // Dropping beats blocking: this is a `CoreAudio` callback.
+    let _ = shared.emit.try_send(emission);
     0
 }
 
@@ -271,16 +306,15 @@ extern "C-unwind" fn device_changed(
     _object: AudioObjectId,
     _count: u32,
     _addresses: *const PropertyAddress,
-    _context: *mut c_void,
+    context: *mut c_void,
 ) -> OsStatus {
-    STATE.with_borrow_mut(|state| {
-        if let Some(state) = state {
-            state.relisten();
-        }
-    });
+    // SAFETY: every registration passes the leaked `Shared`.
+    if let Some(shared) = unsafe { shared_from(context) } {
+        shared.relisten();
+    }
     // The device changing is itself a volume change from a script's point of
     // view: the number it should display just became a different number.
-    changed(0, 0, std::ptr::null(), std::ptr::null_mut())
+    changed(0, 0, std::ptr::null(), context)
 }
 
 /// Both elements of both properties, which is what has to be watched to catch
@@ -292,60 +326,69 @@ const WATCHED: [(u32, u32); 4] = [
     (MUTE, ELEMENT_LEFT),
 ];
 
-impl State {
-    fn unlisten(&mut self) {
-        let Some(previous) = self.listening_to.take() else {
+impl Shared {
+    fn unlisten(&'static self) {
+        let previous = self.listening_to.swap(NO_DEVICE, Ordering::Relaxed);
+        if previous == NO_DEVICE {
             return;
-        };
+        }
         for (selector, element) in WATCHED {
-            remove_listener(
-                previous,
-                PropertyAddress {
-                    selector,
-                    scope: SCOPE_OUTPUT,
-                    element,
-                },
-                changed,
-            );
+            // SAFETY: the same context the matching registration used, on a
+            // leaked `Shared` that outlives every listener.
+            unsafe {
+                remove_listener(
+                    previous,
+                    PropertyAddress {
+                        selector,
+                        scope: SCOPE_OUTPUT,
+                        element,
+                    },
+                    changed,
+                    self.as_context(),
+                );
+            }
         }
     }
 
-    fn relisten(&mut self) {
+    fn relisten(&'static self) {
         self.unlisten();
         let Some(device) = default_output_device() else {
             return;
         };
         for (selector, element) in WATCHED {
-            add_listener(
-                device,
-                PropertyAddress {
-                    selector,
-                    scope: SCOPE_OUTPUT,
-                    element,
-                },
-                changed,
-            );
+            // SAFETY: as above.
+            unsafe {
+                add_listener(
+                    device,
+                    PropertyAddress {
+                        selector,
+                        scope: SCOPE_OUTPUT,
+                        element,
+                    },
+                    changed,
+                    self.as_context(),
+                );
+            }
         }
-        self.listening_to = Some(device);
+        self.listening_to.store(device, Ordering::Relaxed);
     }
 }
 
 /// Deregisters the listeners when the source stops.
-struct Listeners;
+struct Listeners(&'static Shared);
 
 impl Drop for Listeners {
     fn drop(&mut self) {
-        STATE.with_borrow_mut(|slot| {
-            if let Some(state) = slot.as_mut() {
-                state.unlisten();
-            }
-            *slot = None;
-        });
-        remove_listener(
-            SYSTEM_OBJECT,
-            PropertyAddress::new(DEFAULT_OUTPUT_DEVICE, SCOPE_GLOBAL),
-            device_changed,
-        );
+        self.0.unlisten();
+        // SAFETY: the same context the registration in `install` used.
+        unsafe {
+            remove_listener(
+                SYSTEM_OBJECT,
+                PropertyAddress::new(DEFAULT_OUTPUT_DEVICE, SCOPE_GLOBAL),
+                device_changed,
+                self.0.as_context(),
+            );
+        }
     }
 }
 
@@ -368,21 +411,27 @@ impl Source for Volume {
             });
         }
 
-        STATE.with_borrow_mut(|slot| {
-            let mut state = State {
-                emit,
-                listening_to: None,
-                last: -1.0,
-            };
-            state.relisten();
-            *slot = Some(state);
-        });
+        // Leaked, deliberately. `CoreAudio` may already be inside a callback
+        // when the listeners are removed, and there is no call that waits for
+        // one to finish — so the state a callback dereferences must outlive
+        // deregistration. The registry starts a source at most once per
+        // process, so this is one small allocation, not a growing leak.
+        let shared: &'static Shared = Box::leak(Box::new(Shared {
+            emit,
+            listening_to: AtomicU32::new(NO_DEVICE),
+            last: AtomicU32::new((-1.0f32).to_bits()),
+        }));
+        shared.relisten();
 
-        let status = add_listener(
-            SYSTEM_OBJECT,
-            PropertyAddress::new(DEFAULT_OUTPUT_DEVICE, SCOPE_GLOBAL),
-            device_changed,
-        );
+        // SAFETY: `shared` is leaked, so the context outlives the listener.
+        let status = unsafe {
+            add_listener(
+                SYSTEM_OBJECT,
+                PropertyAddress::new(DEFAULT_OUTPUT_DEVICE, SCOPE_GLOBAL),
+                device_changed,
+                shared.as_context(),
+            )
+        };
         if status != 0 {
             return Err(StartError {
                 name: "volume",
@@ -390,6 +439,6 @@ impl Source for Volume {
             });
         }
 
-        Ok(Box::new(Listeners))
+        Ok(Box::new(Listeners(shared)))
     }
 }

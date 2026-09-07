@@ -6,10 +6,18 @@
 //!
 //! **A source runs on its own thread, and reaches the rest of the daemon only
 //! through an async channel.** The frameworks behind these are all callback
-//! driven and all want a run loop, so each source gets one of its own; what
-//! comes back out is a channel the tokio runtime awaits alongside everything
-//! else. Nothing a source does can stall drawing, and a source that wedges
-//! takes only its own thread with it.
+//! driven and all want a run loop, so each source gets one of its own. Nothing
+//! a source does can stall drawing, and a source that wedges takes only its own
+//! thread with it.
+//!
+//! The channel is `tokio::sync::mpsc`, which is waker-based: a producer's
+//! `try_send` hands the value over and wakes whoever is waiting, rather than
+//! parking a thread or being polled on a timer. That matters because the
+//! producers are OS callbacks — a notification block, a `CoreAudio` listener,
+//! an `IOKit` run loop source — and a callback that blocks is a callback that
+//! stalls the framework that called it. `try_send` never blocks: a full queue
+//! drops the event, which is the right trade when the alternative is wedging
+//! the window server's notification thread.
 //!
 //! The channel is not only for sources. Some events have no framework behind
 //! them and can only originate on the main thread — a click lands on a window
@@ -22,6 +30,7 @@
 //! config never mentions `volume_changed` should not pay it, so the registry
 //! starts a source the first time an item subscribes to something it provides.
 
+pub mod config;
 pub mod displays;
 pub mod power;
 pub mod volume;
@@ -29,6 +38,11 @@ pub mod workspace;
 
 use objc2_core_foundation::{CFRetained, CFRunLoop};
 use rsbar_protocol::Event;
+
+/// How many events may be queued before the oldest producer starts losing
+/// them. A burst this deep means the daemon is not draining, which is a bug
+/// rather than a backlog to absorb.
+const QUEUE_DEPTH: usize = 256;
 
 /// Something happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,10 +64,50 @@ impl Emission {
 ///
 /// Cloneable and `Send`: source threads hold one each, and so does the main
 /// thread for the events only it can observe.
-pub type Emitter = std::sync::mpsc::SyncSender<Emission>;
+pub type Emitter = tokio::sync::mpsc::Sender<Emission>;
 
 /// The end the schedule drains.
-pub type Events = std::sync::mpsc::Receiver<Emission>;
+///
+/// A newtype rather than the bare receiver because `tokio`'s takes `&mut self`
+/// to receive, while the draining system holds the inbox immutably. The
+/// `try_lock` is uncontended by construction — exactly one thread ever drains —
+/// so it is a borrow adapter, not synchronisation.
+#[derive(Debug)]
+pub struct Events(tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Emission>>);
+
+impl Events {
+    fn new(receiver: tokio::sync::mpsc::Receiver<Emission>) -> Self {
+        Self(tokio::sync::Mutex::new(receiver))
+    }
+
+    /// Takes the next event if one is queued.
+    ///
+    /// Returns `Err` when the queue is empty, so a caller drains with
+    /// `while let Ok(event) = events.try_recv()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`tokio::sync::mpsc::error::TryRecvError`] when nothing is
+    /// queued, or when every sender has been dropped.
+    pub fn try_recv(&self) -> Result<Emission, tokio::sync::mpsc::error::TryRecvError> {
+        use tokio::sync::mpsc::error::TryRecvError;
+        let Ok(mut receiver) = self.0.try_lock() else {
+            // Someone else is draining; from this caller's point of view there
+            // is nothing to take right now.
+            return Err(TryRecvError::Empty);
+        };
+        receiver.try_recv()
+    }
+
+    /// Waits for the next event.
+    ///
+    /// Unused by the `CFRunLoop`-driven runner, which drains on each wake, but
+    /// this is the shape an executor would poll — and it is what makes the
+    /// producers' `try_send` a wakeup rather than a write into a void.
+    pub async fn recv(&self) -> Option<Emission> {
+        self.0.lock().await.recv().await
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("could not start the {name} event source: {reason}")]
@@ -156,16 +210,17 @@ impl Registry {
     /// Builds the registry over the sources this build knows about, and hands
     /// back the stream every one of them writes into.
     #[must_use]
-    pub fn new() -> (Self, Events) {
+    pub fn new(config: crate::config::Shared) -> (Self, Events) {
         // Bounded: a producer outrunning the daemon is misbehaving, and an
         // unbounded queue would turn that into unbounded memory. Producers use
         // `try_send` and drop on a full queue rather than blocking, because
         // every one of them is on a callback the system wants back promptly.
-        let (emit, events) = std::sync::mpsc::sync_channel(256);
+        let (emit, events) = tokio::sync::mpsc::channel(QUEUE_DEPTH);
 
         let sources: Vec<Box<dyn Source>> = vec![
             Box::new(workspace::Workspace),
             Box::new(displays::Displays),
+            Box::new(config::Watcher { config }),
             Box::new(power::Power),
             Box::new(volume::Volume),
         ];
@@ -180,7 +235,7 @@ impl Registry {
             })
             .collect();
 
-        (Self { emit, entries }, events)
+        (Self { emit, entries }, Events::new(events))
     }
 
     /// A sink for events this process observes outside any source — clicks,
@@ -199,6 +254,9 @@ impl Registry {
         // depends on it: a monitor appearing has to reach the panels whether or
         // not a config ever mentions `display_changed`.
         self.ensure(&Event::DisplayChanged);
+        // Likewise: the config drives everything, so it is watched whether or
+        // not anything subscribed to hearing about it.
+        self.ensure(&Event::ConfigReloaded);
     }
 
     /// Starts whatever provides `event`, if it is not running already.
@@ -244,11 +302,20 @@ fn spawn(mut source: Box<dyn Source>, emit: Emitter) -> Result<Running, StartErr
     let name = source.name();
     // The thread reports back once, so a framework refusing to register is a
     // synchronous error to the caller rather than a silently dead thread.
-    let (ready, started) = std::sync::mpsc::sync_channel(1);
+    // A one-shot: the thread reports once and never again.
+    let (ready, started) = tokio::sync::oneshot::channel();
 
     let thread = std::thread::Builder::new()
         .name(format!("rsbar-source-{name}"))
         .spawn(move || {
+            // A run loop with no input sources finishes immediately, and
+            // `CFRunLoop::run` returns rather than blocking — which would drop
+            // the observers below and silently kill the source. Not every
+            // framework adds a source of its own: notify and CoreAudio both
+            // run threads of their own and add nothing here. So give the run
+            // loop one unconditionally; it is also what `stop` interrupts.
+            let keepalive = crate::runloop::Waker::install(|| {});
+
             let observers = match source.install(emit) {
                 Ok(observers) => {
                     let run_loop = CFRunLoop::current().expect("no run loop on a fresh thread");
@@ -270,13 +337,17 @@ fn spawn(mut source: Box<dyn Source>, emit: Emitter) -> Result<Running, StartErr
             // Explicit, so it is obvious the teardown happens here — on the
             // thread that registered — and not wherever the registry lives.
             drop(observers);
+            drop(keepalive);
         })
         .map_err(|err| StartError {
             name,
             reason: err.to_string(),
         })?;
 
-    match started.recv() {
+    // `blocking_recv` panics inside a tokio runtime. There is none here — this
+    // daemon's executor is the CFRunLoop-driven Bevy runner — and this is the
+    // registry's thread, not a task.
+    match started.blocking_recv() {
         Ok(Ok(run_loop)) => Ok(Running::Threaded {
             run_loop: Some(run_loop),
             thread: Some(thread),

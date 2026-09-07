@@ -48,7 +48,8 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    let (mut registry, events) = Registry::new();
+    let config = rsbar::config::shared();
+    let (mut registry, events) = Registry::new(rsbar::config::Shared::clone(&config));
     registry.start_eager();
 
     let (tx, requests) = mpsc::sync_channel::<IpcRequest>(REQUEST_QUEUE);
@@ -57,13 +58,15 @@ fn main() -> std::process::ExitCode {
     let waker = Waker::install(|| {});
     spawn_ipc(receiver, tx, waker);
 
-    tracing::info!(%service, "rsbar is up");
+    tracing::info!(service = %service, "rsbar is up");
     let app = ecs::build(
         Inbox { requests, events },
         settings,
         panels,
         registry,
         Runner::start(SCRIPT_WORKERS),
+        config,
+        service,
     );
     match ecs::run(app) {
         bevy_app::AppExit::Success => std::process::ExitCode::SUCCESS,

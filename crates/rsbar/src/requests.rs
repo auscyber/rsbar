@@ -8,7 +8,7 @@
 use crate::bar::{Panels, Settings};
 use crate::components::{
     Background, Drawing, Icon, Index, Label, Name, Offset, Padding, Placement, Routine, Run,
-    Script, Subscriptions, bundle,
+    Script, Stale, Subscriptions, bundle,
 };
 use crate::script::Job;
 use crate::shaping::Cache;
@@ -231,6 +231,8 @@ pub struct Outcome {
     pub response: Response,
     pub jobs: Vec<Job>,
     pub exit: bool,
+    /// The caller should tear the item world down and re-run the config.
+    pub reload: bool,
 }
 
 impl Outcome {
@@ -239,6 +241,7 @@ impl Outcome {
             response: Response::Ok,
             jobs: Vec::new(),
             exit: false,
+            reload: false,
         }
     }
 
@@ -247,6 +250,7 @@ impl Outcome {
             response: Response::Error(message),
             jobs: Vec::new(),
             exit: false,
+            reload: false,
         }
     }
 
@@ -255,6 +259,7 @@ impl Outcome {
             response,
             jobs: Vec::new(),
             exit: false,
+            reload: false,
         }
     }
 }
@@ -308,10 +313,14 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
         Request::AddItem { name, position } => {
             tracing::debug!(%name, ?position, "add item");
             if let Some(entity) = items.index.get(&name) {
-                // Re-adding moves it rather than duplicating it.
+                // Re-adding an item that exists moves it rather than replacing
+                // it. That is what makes a reload cheap: entity identity
+                // survives, so change detection sees only what actually
+                // changed rather than every item disappearing and coming back.
                 if let Ok(mut row) = items.write.get_mut(entity) {
                     row.6.0 = position;
                 }
+                items.commands.entity(entity).remove::<Stale>();
                 return Outcome::ok();
             }
             let entity = items.commands.spawn(bundle(name.clone(), position)).id();
@@ -377,6 +386,14 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             Some(state) => Outcome::answer(Response::Item(Box::new(state))),
             None => no_such(&name),
         },
+
+        Request::Reload => {
+            tracing::info!("reload requested");
+            Outcome {
+                reload: true,
+                ..Outcome::ok()
+            }
+        }
 
         Request::Shutdown => {
             tracing::info!("shutting down");

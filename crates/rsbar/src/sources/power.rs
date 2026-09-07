@@ -52,28 +52,33 @@ struct Watch {
     run_loop: CFRetained<CFRunLoop>,
 }
 
-thread_local! {
-    /// The `IOKit` callback carries a context pointer, but keeping the handler
-    /// here avoids leaking a box for the life of the process.
-    static ON_CHANGE: std::cell::RefCell<Option<Box<dyn Fn()>>> =
-        const { std::cell::RefCell::new(None) };
+/// Recovers the emitter a notification was registered with.
+///
+/// # Safety
+///
+/// `context` must be the pointer `install` passed, on an emitter that is still
+/// alive — which is why the one this module makes is leaked.
+unsafe fn emitter_from(context: *mut c_void) -> Option<&'static Emitter> {
+    // SAFETY: the caller guarantees provenance and liveness.
+    unsafe { context.cast::<Emitter>().as_ref() }
 }
 
 impl Watch {
     /// Starts reporting power source changes on the current run loop.
-    fn install<F: Fn() + 'static>(handler: F) -> Result<Self, StartError> {
-        extern "C-unwind" fn changed(_context: *mut c_void) {
-            ON_CHANGE.with_borrow(|handler| {
-                if let Some(handler) = handler {
-                    handler();
-                }
-            });
+    fn install(emit: &'static Emitter) -> Result<Self, StartError> {
+        extern "C-unwind" fn changed(context: *mut c_void) {
+            // SAFETY: the registration passes the leaked emitter.
+            let Some(emit) = (unsafe { emitter_from(context) }) else {
+                return;
+            };
+            let emission = Emission::new(Event::PowerSourceChanged, Some(providing_source()));
+            // Dropping beats blocking: this is an `IOKit` callback.
+            let _ = emit.try_send(emission);
         }
 
-        ON_CHANGE.with_borrow_mut(|slot| *slot = Some(Box::new(handler)));
-
-        // SAFETY: the callback reads only the thread-local set above.
-        let source = unsafe { IOPSNotificationCreateRunLoopSource(changed, std::ptr::null_mut()) };
+        // SAFETY: `emit` is leaked, so the context outlives the registration.
+        let context = std::ptr::from_ref(emit).cast_mut().cast::<c_void>();
+        let source = unsafe { IOPSNotificationCreateRunLoopSource(changed, context) };
         let Some(source) = std::ptr::NonNull::new(source) else {
             return Err(StartError {
                 name: "power",
@@ -103,12 +108,11 @@ impl Source for Power {
     }
 
     fn install(&mut self, emit: Emitter) -> Result<Box<dyn std::any::Any>, StartError> {
-        let watch = Watch::install(move || {
-            let emission = Emission::new(Event::PowerSourceChanged, Some(providing_source()));
-            // Dropping beats blocking: this is an `IOKit` callback.
-            let _ = emit.try_send(emission);
-        })?;
-        Ok(Box::new(watch))
+        // Leaked for the same reason the volume source leaks its state: the
+        // callback dereferences this, and there is no call that waits for one
+        // in flight to finish. A source starts at most once per process.
+        let emit: &'static Emitter = Box::leak(Box::new(emit));
+        Ok(Box::new(Watch::install(emit)?))
     }
 }
 

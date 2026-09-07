@@ -32,7 +32,8 @@
 )]
 
 use crate::bar::{Panels, Settings};
-use crate::components::{Icon, Index, Label, Name, Routine, Script};
+use crate::components::{Icon, Index, Item, Label, Name, Routine, Script, Stale};
+use crate::config::Shared as SharedConfig;
 use crate::layout::{self, ForceRepaint};
 use crate::requests::{Context, Items, ItemsRead};
 use crate::script::{Job, Runner};
@@ -82,6 +83,18 @@ pub struct Queue(pub Vec<Job>);
 #[derive(Resource)]
 pub struct Scripts(pub Runner);
 
+/// The config, shared with the watcher thread.
+#[derive(Resource)]
+pub struct ConfigHandle(pub SharedConfig);
+
+/// The bootstrap name, so a reloaded config script can find us.
+#[derive(Resource)]
+pub struct Service(pub String);
+
+/// Set when the item world should be torn down and the config re-run.
+#[derive(Resource, Default)]
+pub struct Reloading(pub bool);
+
 /// Builds the app.
 pub fn build(
     inbox: Inbox,
@@ -89,7 +102,10 @@ pub fn build(
     panels: Panels,
     registry: Registry,
     scripts: Runner,
+    config: SharedConfig,
+    service: String,
 ) -> App {
+    let config_exists = config.blocking_read().path.is_some();
     let mut app = App::new();
 
     app.add_plugins(bevy_time::TimePlugin)
@@ -104,14 +120,30 @@ pub fn build(
         .insert_resource(settings)
         .init_resource::<Index>()
         .init_resource::<Queue>()
+        .init_resource::<ReloadWatch>()
         .init_resource::<ForceRepaint>()
+        // Starts true, so the first tick runs the config. The bar comes up
+        // empty and fills in a moment later, which is what a config run is.
+        .insert_resource(Reloading(config_exists))
+        .insert_resource(ConfigHandle(config))
+        .insert_resource(Service(service))
         .insert_resource(Scripts(scripts));
 
     // Explicit ordering rather than DAG tie-breaks, which reorder silently when
     // a system is added.
     app.add_systems(First, drain_events)
         .add_systems(PreUpdate, apply_requests)
-        .add_systems(Update, (dispatch_events, tick, run_queued).chain())
+        .add_systems(
+            Update,
+            (
+                dispatch_events,
+                tick,
+                run_queued,
+                reload_config,
+                settle_reload,
+            )
+                .chain(),
+        )
         .add_systems(PostUpdate, (rebuild_panels, reshape))
         .add_systems(
             Last,
@@ -195,6 +227,7 @@ fn apply_requests(
     mut cache: NonSendMut<Cache>,
     mut sources: NonSendMut<Sources>,
     mut queue: ResMut<Queue>,
+    mut reloading: ResMut<Reloading>,
     mut exit: MessageWriter<bevy_app::AppExit>,
 ) {
     while let Ok(IpcRequest { request, reply }) = inbox.requests.try_recv() {
@@ -206,6 +239,9 @@ fn apply_requests(
         };
         let outcome = crate::requests::apply(*request, &mut items, &mut ctx);
         queue.0.extend(outcome.jobs);
+        if outcome.reload {
+            reloading.0 = true;
+        }
         if outcome.exit {
             exit.write(bevy_app::AppExit::Success);
         }
@@ -221,12 +257,87 @@ fn dispatch_events(
     mut events: MessageReader<EventMessage>,
     read: ItemsRead,
     mut queue: ResMut<Queue>,
+    mut reloading: ResMut<Reloading>,
 ) {
     for EventMessage(emission) in events.read() {
         tracing::debug!(event = %emission.event, info = ?emission.info, "event");
+        if emission.event == rsbar_protocol::Event::ConfigReloaded {
+            reloading.0 = true;
+        }
+        // Dispatched as well as acted on, so a config can subscribe to its own
+        // reload the same way it subscribes to anything else.
         queue
             .0
             .extend(read.jobs_for(&emission.event, emission.info.as_deref()));
+    }
+}
+
+/// Starts a reload: marks every item stale, then runs the config.
+///
+/// Nothing is despawned here. The config might fail, and a broken edit should
+/// change nothing rather than leave an empty bar; and re-adding an item that
+/// already exists updates it in place, so entity identity survives a reload and
+/// change detection sees only what actually changed.
+fn reload_config(
+    mut reloading: ResMut<Reloading>,
+    mut commands: Commands,
+    items: Query<Entity, With<Item>>,
+    config: Res<ConfigHandle>,
+    service: Res<Service>,
+    mut settle: ResMut<ReloadWatch>,
+) {
+    if !reloading.0 {
+        return;
+    }
+    reloading.0 = false;
+
+    for entity in &items {
+        commands.entity(entity).insert(Stale);
+    }
+    settle.pending = true;
+    crate::sources::config::reload(&config.0, service.0.clone());
+}
+
+/// Tracks a reload that is in flight.
+#[derive(Resource, Default)]
+pub struct ReloadWatch {
+    pending: bool,
+    seen_generation: u64,
+}
+
+/// Finishes a reload once the config thread has stopped.
+///
+/// On success, whatever is still marked stale is what the new config dropped,
+/// so it goes. On failure nothing goes — the mark is simply lifted and the
+/// previous bar stands.
+fn settle_reload(
+    mut watch: ResMut<ReloadWatch>,
+    mut commands: Commands,
+    mut index: ResMut<Index>,
+    mut cache: NonSendMut<Cache>,
+    stale: Query<(Entity, &Name), With<Stale>>,
+    config: Res<ConfigHandle>,
+) {
+    if !watch.pending {
+        return;
+    }
+    let guard = config.0.blocking_read();
+    if guard.running {
+        return;
+    }
+    let succeeded = guard.generation > watch.seen_generation;
+    watch.seen_generation = guard.generation;
+    drop(guard);
+    watch.pending = false;
+
+    for (entity, name) in &stale {
+        if succeeded {
+            cache.forget(entity);
+            index.remove(&name.0);
+            commands.entity(entity).despawn();
+        } else {
+            commands.entity(entity).remove::<Stale>();
+        }
     }
 }
 
