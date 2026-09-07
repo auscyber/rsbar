@@ -6,6 +6,8 @@ pub mod components;
 pub mod config;
 pub mod display;
 pub mod ecs;
+#[cfg(test)]
+mod harness;
 pub mod layout;
 pub mod requests;
 pub mod runloop;

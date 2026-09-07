@@ -196,10 +196,14 @@ impl ItemsRead<'_, '_> {
         self.read
             .iter()
             .filter(|row| row.7.0.iter().any(|kind| kind.matches(event)))
-            .filter_map(|(_, name, .., script)| {
+            .filter_map(|row| {
                 Some(Job {
-                    item: name.0.clone(),
-                    script: script?.0.clone(),
+                    item: row.1.0.clone(),
+                    // Indexed, not destructured with `..`. A `(_, name, ..,
+                    // script)` pattern silently followed the row when a column
+                    // was added, binding the click script instead — which broke
+                    // every subscription-driven script and raised no error.
+                    script: row.8?.0.clone(),
                     event: event.clone(),
                 })
             })
@@ -211,10 +215,10 @@ impl ItemsRead<'_, '_> {
     pub fn all_jobs(&self) -> Vec<Job> {
         self.read
             .iter()
-            .filter_map(|(_, name, .., script)| {
+            .filter_map(|row| {
                 Some(Job {
-                    item: name.0.clone(),
-                    script: script?.0.clone(),
+                    item: row.1.0.clone(),
+                    script: row.8?.0.clone(),
                     event: Event::Forced(rsbar_protocol::event::Forced {}),
                 })
             })
