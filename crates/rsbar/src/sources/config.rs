@@ -8,6 +8,7 @@ use crate::sources::{Cause, Registering, Registration, Source, SourceId, StartEr
 use notify::{RecursiveMode, Watcher as _};
 use rsbar_protocol::event::ConfigReload;
 use rsbar_protocol::{Event, Kind};
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 /// How long one save is allowed to keep producing events.
@@ -30,7 +31,11 @@ impl Source for Watcher {
         true
     }
 
-    fn register(&mut self, cx: &mut Registering<'_>) -> Result<Registration, StartError> {
+    fn register(
+        &mut self,
+        _wanted: &BTreeSet<Kind>,
+        cx: &mut Registering<'_>,
+    ) -> Result<Registration, StartError> {
         let emit = cx.emitter();
         let Some(path) = self.config.blocking_read().path.clone() else {
             return Err(StartError::new(self.id(), Cause::NoConfigFile));

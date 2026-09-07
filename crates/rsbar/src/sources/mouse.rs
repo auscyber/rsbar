@@ -31,6 +31,7 @@ use objc2_core_graphics::{CGEvent, CGEventField, CGEventFlags};
 use rsbar_protocol::event::{MouseClick, Scroll};
 use rsbar_protocol::{Event, Kind, Modifiers, MouseButton};
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::ffi::c_void;
 
 type OsStatus = i32;
@@ -216,7 +217,11 @@ impl Source for Mouse {
         ]
     }
 
-    fn register(&mut self, cx: &mut Registering<'_>) -> Result<Registration, StartError> {
+    fn register(
+        &mut self,
+        _wanted: &BTreeSet<Kind>,
+        cx: &mut Registering<'_>,
+    ) -> Result<Registration, StartError> {
         let emit = cx.emitter();
         if objc2::MainThreadMarker::new().is_none() {
             return Err(StartError::new(self.id(), Cause::NotMainThread));

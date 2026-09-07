@@ -6,6 +6,7 @@ use crate::sources::{
 use objc2_core_foundation::{CFRetained, CFRunLoop, CFRunLoopSource, CFString, CFType};
 use rsbar_protocol::event::PowerChange;
 use rsbar_protocol::{Event, Kind, PowerSource};
+use std::collections::BTreeSet;
 use std::ffi::c_void;
 
 #[link(name = "IOKit", kind = "framework")]
@@ -96,7 +97,11 @@ impl Source for Power {
         vec![Kind::PowerSourceChanged]
     }
 
-    fn register(&mut self, cx: &mut Registering<'_>) -> Result<Registration, StartError> {
+    fn register(
+        &mut self,
+        _wanted: &BTreeSet<Kind>,
+        cx: &mut Registering<'_>,
+    ) -> Result<Registration, StartError> {
         let emit = cx.emitter();
         let state = CallbackState::new(emit);
         Ok(Box::new(Watch::install(&state)?))

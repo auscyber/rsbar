@@ -48,7 +48,7 @@ pub mod workspace;
 
 use bevy_ecs::entity::Entity;
 use rsbar_protocol::{Event, Kind};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
 
 /// How many events may be queued before the oldest producer starts losing
@@ -127,9 +127,12 @@ pub type Registration = Box<dyn std::any::Any>;
 pub struct Feed {
     id: SourceId,
     events: tokio::sync::mpsc::Receiver<Event>,
+    /// Kept so a source being adjusted writes into the same queue it already
+    /// does, rather than being handed a second one nothing reads.
+    emit: Emitter,
     /// Dropped on whichever thread owns this feed, which is the thread that
     /// registered. Never read.
-    _registration: Registration,
+    registration: Registration,
 }
 
 impl Feed {
@@ -137,12 +140,14 @@ impl Feed {
     fn new(
         id: SourceId,
         events: tokio::sync::mpsc::Receiver<Event>,
+        emit: Emitter,
         registration: Registration,
     ) -> Self {
         Self {
             id,
             events,
-            _registration: registration,
+            emit,
+            registration,
         }
     }
 
@@ -154,15 +159,24 @@ impl Feed {
     #[must_use]
     pub fn manual(id: SourceId, waker: crate::runloop::Waker) -> (Emitter, Self) {
         let (queue, events) = tokio::sync::mpsc::channel(QUEUE_DEPTH);
-        (
-            Emitter { queue, waker },
-            Self::new(id, events, Box::new(())),
-        )
+        let emit = Emitter { queue, waker };
+        (emit.clone(), Self::new(id, events, emit, Box::new(())))
     }
 
     #[must_use]
     pub fn id(&self) -> SourceId {
         self.id
+    }
+
+    /// The registration, so a running source can be adjusted in place rather
+    /// than stopped and started again.
+    fn registration_mut(&mut self) -> &mut Registration {
+        &mut self.registration
+    }
+
+    /// Another handle on the sink this source's callbacks already write into.
+    fn emitter(&self) -> Emitter {
+        self.emit.clone()
     }
 
     /// Takes the next event if one is queued, without waiting.
@@ -235,6 +249,10 @@ pub enum Cause {
     /// A source that must be on the main thread was started elsewhere.
     #[error("this source has to be registered on the main thread")]
     NotMainThread,
+    /// A source was handed back a registration it did not produce, which can
+    /// only be the registry pairing them up wrongly.
+    #[error("the registration does not belong to this source")]
+    MismatchedRegistration,
 }
 
 /// A source that could not start, and which one.
@@ -268,12 +286,26 @@ pub trait Source: Send {
     /// bar that never mentions the volume should not be paying `CoreAudio` to
     /// watch it. Eager is for what the bar itself depends on — the displays it
     /// draws on, the config file it reloads from — where there is no
-    /// subscription to wait for because the daemon is the subscriber.
+    /// subscription to wait for because the daemon is the subscriber. An eager
+    /// source is asked for everything it provides.
     fn eager(&self) -> bool {
         false
     }
 
-    /// Registers observers that write into the emitter `cx` hands out.
+    /// Registers what it takes to produce `wanted`, and nothing more.
+    ///
+    /// `wanted` is a non-empty subset of [`provides`](Source::provides): the
+    /// events something is actually waiting for. Observing more than this is
+    /// not free — four `NSWorkspace` observers for an item that only asked
+    /// about the front application is three notifications nobody reads — so a
+    /// source registers against `wanted` rather than against everything it is
+    /// capable of. A source whose events all come off one facility is free to
+    /// install it whole; that is its business, not the registry's.
+    ///
+    /// Called again with a different set when demand changes, having dropped
+    /// the previous [`Registration`] first. That is how a reload that adds a
+    /// subscription gets the observer it needs: the registry does not ask a
+    /// running source for more, it re-registers it against the new set.
     ///
     /// Called on the main thread, with the app's run loop current. The returned
     /// [`Registration`] is dropped on that same thread, which is what
@@ -285,7 +317,36 @@ pub trait Source: Send {
     /// Returns [`StartError`] if the underlying framework refuses. A source
     /// that cannot start is not asked again: these fail for structural reasons,
     /// not transient ones.
-    fn register(&mut self, cx: &mut Registering<'_>) -> Result<Registration, StartError>;
+    fn register(
+        &mut self,
+        wanted: &BTreeSet<Kind>,
+        cx: &mut Registering<'_>,
+    ) -> Result<Registration, StartError>;
+
+    /// Adjusts a running registration to a new set of requests.
+    ///
+    /// Called instead of tearing the source down and building it again, so a
+    /// source holding one observer per event only touches the ones that came
+    /// or went — the four `NSWorkspace` observers do not all get deregistered
+    /// and reinstalled because a fifth item started asking about sleep.
+    ///
+    /// The default says it cannot, which is the honest answer for a source
+    /// whose events all come off one facility: there is nothing to adjust,
+    /// because every event it provides is already being produced. The registry
+    /// then leaves the registration exactly as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StartError`] if the change is refused, which stops the source.
+    fn update(
+        &mut self,
+        wanted: &BTreeSet<Kind>,
+        current: &mut Registration,
+        cx: &mut Registering<'_>,
+    ) -> Result<(), StartError> {
+        let _ = (wanted, current, cx);
+        Ok(())
+    }
 }
 
 /// What a source is handed when it registers.
@@ -468,21 +529,23 @@ impl<T: Payload> CallbackState<T> {
 /// Returns [`StartError`] if the framework refuses.
 fn start(
     source: &mut dyn Source,
+    wanted: &BTreeSet<Kind>,
     shared: &mut Shared,
     waker: &crate::runloop::Waker,
 ) -> Result<Feed, StartError> {
     let id = source.id();
     let (queue, events) = tokio::sync::mpsc::channel(QUEUE_DEPTH);
+    let emit = Emitter {
+        queue,
+        waker: waker.clone(),
+    };
     let mut cx = Registering {
         id,
-        emit: Emitter {
-            queue,
-            waker: waker.clone(),
-        },
+        emit: emit.clone(),
         shared,
     };
-    let registration = source.register(&mut cx)?;
-    Ok(Feed::new(id, events, registration))
+    let registration = source.register(wanted, &mut cx)?;
+    Ok(Feed::new(id, events, emit, registration))
 }
 
 /// Holds every source and starts them on demand.
@@ -501,12 +564,9 @@ pub struct Registry {
     /// per-item pointer events will come from sources indexed by the entity
     /// they watch — so this maps to a list rather than pretending otherwise.
     providers: HashMap<Kind, Vec<SourceId>>,
-    /// What each item is currently keeping alive.
-    ///
-    /// The reference count, held as the set it was derived from rather than a
-    /// number: replacing an item's subscriptions has to release exactly what it
-    /// used to want, which a count cannot tell you.
-    held: HashMap<Entity, HashSet<SourceId>>,
+    /// Which sources each item currently has a claim on, so releasing it
+    /// knows where to look. What it wants from them lives on the source.
+    held: HashMap<Entity, Vec<SourceId>>,
     /// Context the sources share, built on first ask.
     shared: Shared,
     /// Events with no framework behind them — a click, or `--trigger`.
@@ -521,15 +581,32 @@ pub struct Registry {
 struct Registered {
     source: Box<dyn Source>,
     feed: Option<Feed>,
-    /// The items keeping it alive. Emptying this stops the source.
-    users: HashSet<Entity>,
+    /// Everything this source can produce.
+    provides: BTreeSet<Kind>,
+    /// What each item wants from it. Emptying this stops the source, and
+    /// changing it re-registers against the new set — which is what lets a
+    /// reload ask for an event nobody wanted before.
+    wanted: HashMap<Entity, BTreeSet<Kind>>,
+    /// What it is serving right now, so a change of demand is detectable.
+    serving: BTreeSet<Kind>,
     /// Kept running regardless of who wants it: the bar's own geometry and its
-    /// config file are not anybody's subscription.
+    /// config file are not anybody's subscription. An eager source is asked
+    /// for everything it provides.
     pinned: bool,
     /// A source that refused to start is not asked again. These fail for
     /// structural reasons — a missing config file, a framework saying no — so a
     /// second attempt fails identically.
     failed: bool,
+}
+
+impl Registered {
+    /// Everything anything wants from this source.
+    fn demand(&self) -> BTreeSet<Kind> {
+        if self.pinned {
+            return self.provides.clone();
+        }
+        self.wanted.values().flatten().cloned().collect()
+    }
 }
 
 impl Registry {
@@ -549,16 +626,19 @@ impl Registry {
         let mut registered = HashMap::with_capacity(sources.len());
         for source in sources {
             let id = source.id();
-            for kind in source.provides() {
-                providers.entry(kind).or_default().push(id);
+            let provided: BTreeSet<Kind> = source.provides().into_iter().collect();
+            for kind in &provided {
+                providers.entry(kind.clone()).or_default().push(id);
             }
             registered.insert(
                 id,
                 Registered {
                     pinned: source.eager(),
+                    provides: provided,
                     source,
                     feed: None,
-                    users: HashSet::new(),
+                    wanted: HashMap::new(),
+                    serving: BTreeSet::new(),
                     failed: false,
                 },
             );
@@ -582,6 +662,18 @@ impl Registry {
         self.sources.get(&id).is_some_and(|e| e.feed.is_some())
     }
 
+    /// Exactly what a source is registered for right now.
+    ///
+    /// Empty when it is not running. This is what a subscription actually
+    /// bought, as opposed to what the source is capable of.
+    #[must_use]
+    pub fn registered_for(&self, id: SourceId) -> BTreeSet<Kind> {
+        self.sources
+            .get(&id)
+            .map(|e| e.serving.clone())
+            .unwrap_or_default()
+    }
+
     /// A sink for events this process observes outside any source.
     #[must_use]
     pub fn emitter(&self) -> Emitter {
@@ -600,7 +692,7 @@ impl Registry {
             .map(|(id, _)| *id)
             .collect();
         for id in eager {
-            self.reconcile(id, None);
+            self.reconcile(id);
         }
     }
 
@@ -611,34 +703,47 @@ impl Registry {
     /// item that drops `volume_changed` from its subscriptions stops the audio
     /// listener, and a config reload that removes the item entirely does too.
     pub fn holds(&mut self, who: Entity, kinds: impl IntoIterator<Item = Kind>) {
-        let mut wanted = HashSet::new();
-        let mut touched = Vec::new();
+        // Split by source, so each is told what *it* is being asked for rather
+        // than that somebody wants something it happens to provide.
+        let mut per_source: HashMap<SourceId, BTreeSet<Kind>> = HashMap::new();
         for kind in kinds {
-            if let Some(ids) = self.providers.get(&kind) {
-                wanted.extend(ids.iter().copied());
-                touched.push(kind);
-            } else {
+            let Some(ids) = self.providers.get(&kind) else {
                 tracing::debug!(%kind, "nothing provides this event");
+                continue;
+            };
+            for id in ids {
+                per_source.entry(*id).or_default().insert(kind.clone());
             }
         }
 
-        let previously = self.held.insert(who, wanted.clone()).unwrap_or_default();
-        for id in previously.difference(&wanted) {
-            if let Some(entry) = self.sources.get_mut(id) {
-                entry.users.remove(&who);
+        // Every source this item had a claim on, plus every source it has one
+        // on now: the ones it dropped have to be told too.
+        let previously = self.held.remove(&who).unwrap_or_default();
+        let touched: Vec<SourceId> = previously
+            .iter()
+            .copied()
+            .chain(per_source.keys().copied())
+            .collect();
+
+        for id in &touched {
+            let Some(entry) = self.sources.get_mut(id) else {
+                continue;
+            };
+            match per_source.get(id) {
+                Some(kinds) => {
+                    entry.wanted.insert(who, kinds.clone());
+                }
+                None => {
+                    entry.wanted.remove(&who);
+                }
             }
-        }
-        for id in &wanted {
-            if let Some(entry) = self.sources.get_mut(id) {
-                entry.users.insert(who);
-            }
-        }
-        if wanted.is_empty() {
-            self.held.remove(&who);
         }
 
-        for id in previously.union(&wanted).copied().collect::<Vec<_>>() {
-            self.reconcile(id, touched.first());
+        if !per_source.is_empty() {
+            self.held.insert(who, per_source.keys().copied().collect());
+        }
+        for id in touched {
+            self.reconcile(id);
         }
     }
 
@@ -649,14 +754,21 @@ impl Registry {
         };
         for id in held {
             if let Some(entry) = self.sources.get_mut(&id) {
-                entry.users.remove(&who);
+                entry.wanted.remove(&who);
             }
-            self.reconcile(id, None);
+            self.reconcile(id);
         }
     }
 
-    /// Brings one source into line with whether anything still wants it.
-    fn reconcile(&mut self, id: SourceId, because: Option<&Kind>) {
+    /// Brings one source into line with what is now wanted from it.
+    ///
+    /// Three outcomes: nothing wants it and it stops, the set it is registered
+    /// against is already right and it is left alone, or the set has changed
+    /// and it is registered again against the new one. That last case is the
+    /// point — it is how a reload that adds a subscription gets an observer
+    /// for it, rather than relying on the source having quietly installed one
+    /// nobody asked for.
+    fn reconcile(&mut self, id: SourceId) {
         let Self {
             sources,
             shared,
@@ -666,26 +778,64 @@ impl Registry {
         let Some(entry) = sources.get_mut(&id) else {
             return;
         };
-        let wanted = entry.pinned || !entry.users.is_empty();
+        let demand = entry.demand();
 
-        match (wanted, entry.feed.is_some()) {
-            (true, false) if !entry.failed => match start(entry.source.as_mut(), shared, waker) {
-                Ok(feed) => {
-                    tracing::debug!(source = %id, kind = ?because, "started event source");
-                    entry.feed = Some(feed);
+        if demand.is_empty() {
+            if entry.feed.is_some() {
+                // Dropping the feed drops the registration, which deregisters —
+                // on this thread, which is the one that registered.
+                tracing::debug!(source = %id, "stopped event source; nothing wants it");
+                entry.feed = None;
+                entry.serving.clear();
+            }
+            return;
+        }
+
+        if entry.feed.is_some() && entry.serving == demand {
+            return;
+        }
+        if entry.failed {
+            return;
+        }
+
+        // Already running, only the request set moved: hand it the new set and
+        // let it change what it needs to. Tearing it down would deregister
+        // observers that were already right, and lose whatever state they had.
+        if let Some(feed) = entry.feed.as_mut() {
+            let mut cx = Registering {
+                id,
+                emit: feed.emitter(),
+                shared,
+            };
+            match entry
+                .source
+                .update(&demand, feed.registration_mut(), &mut cx)
+            {
+                Ok(()) => {
+                    tracing::debug!(source = %id, wants = ?demand, "adjusted event source");
+                    entry.serving = demand;
                 }
                 Err(err) => {
                     entry.failed = true;
-                    tracing::warn!(%err, "event source unavailable");
+                    entry.feed = None;
+                    entry.serving.clear();
+                    tracing::warn!(%err, "event source refused a change");
                 }
-            },
-            // Dropping the feed drops the registration, which deregisters — on
-            // this thread, which is the one that registered.
-            (false, true) => {
-                tracing::debug!(source = %id, "stopped event source; nothing wants it");
-                entry.feed = None;
             }
-            _ => {}
+            return;
+        }
+
+        match start(entry.source.as_mut(), &demand, shared, waker) {
+            Ok(feed) => {
+                tracing::debug!(source = %id, wants = ?demand, "registered event source");
+                entry.feed = Some(feed);
+                entry.serving = demand;
+            }
+            Err(err) => {
+                entry.failed = true;
+                entry.serving.clear();
+                tracing::warn!(%err, "event source unavailable");
+            }
         }
     }
 

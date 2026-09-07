@@ -20,7 +20,7 @@ use crate::shaping::Cache;
 use crate::sources::Registry;
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::SystemState;
-use rsbar_protocol::{Event, ItemName, Request};
+use rsbar_protocol::{Event, ItemName, Kind, Request};
 
 /// A world with the item machinery and nothing platform-bound running.
 pub struct Harness {
@@ -104,6 +104,15 @@ impl Harness {
         self.sources.start_eager();
     }
 
+    /// What a source is registered for right now.
+    #[must_use]
+    pub fn registered_for(&self, id: &'static str) -> Vec<Kind> {
+        self.sources
+            .registered_for(crate::sources::SourceId(id))
+            .into_iter()
+            .collect()
+    }
+
     /// Convenience: add an item and set it in one go.
     pub fn add(&mut self, name: &str, position: rsbar_protocol::Position) -> ItemName {
         let name = ItemName::new(name).expect("valid name");
@@ -184,6 +193,86 @@ mod tests {
             events: vec![],
         });
         assert!(!bar.running(WORKSPACE));
+    }
+
+    #[test]
+    fn subscribing_registers_that_event_and_not_the_rest_of_the_source() {
+        // The workspace source can produce four events off four notifications.
+        // Asking for one used to install all four.
+        let mut bar = Harness::new();
+        let item = bar.add("front", Position::Left);
+        bar.apply(Request::Subscribe {
+            name: item,
+            events: vec![Kind::FrontAppSwitched],
+        });
+        assert_eq!(bar.registered_for(WORKSPACE), vec![Kind::FrontAppSwitched]);
+    }
+
+    #[test]
+    fn a_later_subscription_widens_a_running_source() {
+        // The question this design had no answer to: the source is already
+        // running, so nothing used to ask it for the event just added, and it
+        // only appeared to work because it had over-registered to begin with.
+        let mut bar = Harness::new();
+        let item = bar.add("front", Position::Left);
+        bar.apply(Request::Subscribe {
+            name: item.clone(),
+            events: vec![Kind::FrontAppSwitched],
+        });
+        bar.apply(Request::Subscribe {
+            name: item,
+            events: vec![Kind::FrontAppSwitched, Kind::SystemWoke],
+        });
+
+        let mut registered = bar.registered_for(WORKSPACE);
+        registered.sort();
+        let mut expected = vec![Kind::FrontAppSwitched, Kind::SystemWoke];
+        expected.sort();
+        assert_eq!(registered, expected, "the added event has an observer now");
+        assert!(bar.running(WORKSPACE));
+    }
+
+    #[test]
+    fn narrowing_a_subscription_drops_only_what_was_dropped() {
+        let mut bar = Harness::new();
+        let item = bar.add("front", Position::Left);
+        bar.apply(Request::Subscribe {
+            name: item.clone(),
+            events: vec![Kind::FrontAppSwitched, Kind::SystemWoke],
+        });
+        bar.apply(Request::Subscribe {
+            name: item,
+            events: vec![Kind::SystemWoke],
+        });
+        assert_eq!(bar.registered_for(WORKSPACE), vec![Kind::SystemWoke]);
+        assert!(bar.running(WORKSPACE), "something still wants it");
+    }
+
+    #[test]
+    fn two_items_wanting_different_events_of_one_source_both_get_them() {
+        let mut bar = Harness::new();
+        let first = bar.add("one", Position::Left);
+        let second = bar.add("two", Position::Left);
+        bar.apply(Request::Subscribe {
+            name: first.clone(),
+            events: vec![Kind::FrontAppSwitched],
+        });
+        bar.apply(Request::Subscribe {
+            name: second,
+            events: vec![Kind::SystemWoke],
+        });
+        let mut registered = bar.registered_for(WORKSPACE);
+        registered.sort();
+        let mut expected = vec![Kind::FrontAppSwitched, Kind::SystemWoke];
+        expected.sort();
+        assert_eq!(registered, expected);
+
+        // One losing interest must not take the other's event with it.
+        bar.apply(Request::Subscribe {
+            name: first,
+            events: vec![],
+        });
+        assert_eq!(bar.registered_for(WORKSPACE), vec![Kind::SystemWoke]);
     }
 
     #[test]

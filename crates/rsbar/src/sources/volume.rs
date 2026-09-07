@@ -159,6 +159,7 @@ mod ffi_safe {
 }
 
 use ffi_safe::{add_listener, get, remove_listener};
+use std::collections::BTreeSet;
 
 fn default_output_device() -> Option<AudioObjectId> {
     get(
@@ -399,7 +400,11 @@ impl Source for Volume {
         vec![Kind::VolumeChanged]
     }
 
-    fn register(&mut self, cx: &mut Registering<'_>) -> Result<Registration, StartError> {
+    fn register(
+        &mut self,
+        _wanted: &BTreeSet<Kind>,
+        cx: &mut Registering<'_>,
+    ) -> Result<Registration, StartError> {
         let emit = cx.emitter();
         if default_output_device().is_none() {
             return Err(StartError::new(self.id(), Cause::NoOutputDevice));

@@ -19,6 +19,7 @@ use objc2_core_graphics::{
 use objc2_foundation::{NSNotification, NSString};
 use rsbar_protocol::event::DisplayChange;
 use rsbar_protocol::{Event, Kind};
+use std::collections::BTreeSet;
 use std::ffi::c_void;
 
 fn display_changed(_: &NSNotification) -> Event {
@@ -72,7 +73,11 @@ impl Source for Displays {
         true
     }
 
-    fn register(&mut self, cx: &mut Registering<'_>) -> Result<Registration, StartError> {
+    fn register(
+        &mut self,
+        _wanted: &BTreeSet<Kind>,
+        cx: &mut Registering<'_>,
+    ) -> Result<Registration, StartError> {
         let emit = cx.emitter();
         let state = CallbackState::new(emit);
         let status = state.with_ptr(|context| {
@@ -88,7 +93,12 @@ impl Source for Displays {
         // same way SketchyBar reaches it.
         let focus_moved = NSString::from_str("NSWorkspaceActiveDisplayDidChangeNotification");
         let mut observers = Observers::new(NSWorkspace::sharedWorkspace().notificationCenter());
-        observers.observe(&focus_moved, state.get(), display_changed as ToEvent);
+        observers.observe(
+            Kind::DisplayChanged,
+            &focus_moved,
+            state.get(),
+            display_changed as ToEvent,
+        );
 
         Ok(Box::new((Deregister(state), observers)))
     }
