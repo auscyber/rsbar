@@ -223,6 +223,34 @@ struct Snapshot {
     time_to_full_minutes: Option<u32>,
 }
 
+impl Snapshot {
+    /// Whether this differs from `other` in a way an item would draw.
+    ///
+    /// The time estimates are deliberately not part of this. `IOKit` notifies
+    /// about once a minute whether or not anything happened, and the estimate
+    /// wobbles by a minute or two every time it does, so treating those as a
+    /// change means a script run per minute forever for a number nobody
+    /// watches tick. They still travel in the payload, so an item woken for
+    /// any other reason draws a current one.
+    fn differs_from(&self, other: &Self) -> bool {
+        self.power_source != other.power_source
+            || self.charge != other.charge
+            || self.charging != other.charging
+            || self.watts != other.watts
+    }
+
+    fn into_event(self) -> PowerChange {
+        PowerChange {
+            power_source: self.power_source,
+            watts: self.watts.into(),
+            charge: self.charge.into(),
+            charging: self.charging.into(),
+            time_to_empty_minutes: self.time_to_empty_minutes.into(),
+            time_to_full_minutes: self.time_to_full_minutes.into(),
+        }
+    }
+}
+
 /// One combined read: the `IOPSCopyPowerSourcesInfo` snapshot for the power
 /// source and the battery, plus the sibling `IOPSCopyExternalPowerAdapterDetails`
 /// call for wattage.
@@ -293,25 +321,17 @@ impl Watch {
             // type is kept consistent with every other source's rather than
             // reached for only because this one callback allows it.
             let mut last = state.last.blocking_lock();
-            if last.as_ref() == Some(&snapshot) {
-                return;
-            }
-            let source_changed = last
+            let worth_reporting = last
                 .as_ref()
-                .is_none_or(|prev| prev.power_source != snapshot.power_source);
+                .is_none_or(|prev| prev.differs_from(&snapshot));
             *last = Some(snapshot);
             drop(last);
 
-            // `charge`/`charging`/`watts`/time-remaining are not on the wire
-            // yet (task #16) — logged so the read and the dedup above are
-            // provably correct ahead of `PowerChange` growing the fields.
-            tracing::info!(?snapshot, "power snapshot changed");
-
-            if source_changed {
+            if worth_reporting {
                 // Dropping beats blocking: this is an `IOKit` callback.
-                state.emit.send(Event::PowerSourceChanged(PowerChange {
-                    power_source: snapshot.power_source,
-                }));
+                state
+                    .emit
+                    .send(Event::PowerSourceChanged(snapshot.into_event()));
             }
         }
 

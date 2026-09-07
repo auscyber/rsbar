@@ -109,6 +109,31 @@ impl fmt::Display for Modifiers {
     }
 }
 
+/// A field a payload may not have a value for, printed as the value or as
+/// nothing at all.
+///
+/// A script tests it with `[ -z "$RSBAR_CHARGE" ]` rather than against a
+/// sentinel, which is the shape a shell already has for "unset". A newtype
+/// because [`events!`] calls `to_string` on every field, and `Display` cannot
+/// be implemented for `Option<T>` from here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Maybe<T>(pub Option<T>);
+
+impl<T> From<Option<T>> for Maybe<T> {
+    fn from(value: Option<T>) -> Self {
+        Self(value)
+    }
+}
+
+impl<T: fmt::Display> fmt::Display for Maybe<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Some(value) => write!(f, "{value}"),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Declares the built-in events.
 ///
 /// `Variant = "name" => Payload { field: Type }` gives a payload struct, an
@@ -121,14 +146,14 @@ macro_rules! events {
     (
         $(
             $variant:ident = $name:literal => $data:ident {
-                $( $field:ident : $ty:ty ),* $(,)?
+                $( $(#[$field_meta:meta])* $field:ident : $ty:ty ),* $(,)?
             }
         ),* $(,)?
     ) => {
         $(
             #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
             pub struct $data {
-                $( pub $field: $ty, )*
+                $( $(#[$field_meta])* pub $field: $ty, )*
             }
 
             impl $data {
@@ -238,7 +263,19 @@ events! {
     SystemWillSleep = "system_will_sleep" => SystemWillSleep {},
     VolumeChanged = "volume_changed" => VolumeChange { volume: u8 },
     BrightnessChanged = "brightness_changed" => BrightnessChange { brightness: u8 },
-    PowerSourceChanged = "power_source_changed" => PowerChange { power_source: PowerSource },
+    PowerSourceChanged = "power_source_changed" => PowerChange {
+        power_source: PowerSource,
+        /// What the adapter reports it can supply. Empty on battery, and on
+        /// an adapter that does not say.
+        watts: Maybe<u32>,
+        /// 0-100. Empty on hardware with no battery at all.
+        charge: Maybe<u8>,
+        charging: Maybe<bool>,
+        /// Empty unless discharging with an estimate settled.
+        time_to_empty_minutes: Maybe<u32>,
+        /// Empty unless charging with an estimate settled.
+        time_to_full_minutes: Maybe<u32>,
+    },
     WifiChanged = "wifi_changed" => WifiChange { ssid: String },
     MediaChanged = "media_changed" => MediaChange { media: Json },
     SpaceWindowsChanged = "space_windows_changed" => SpaceWindowsChange { space: u64 },
