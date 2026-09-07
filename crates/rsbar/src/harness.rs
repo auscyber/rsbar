@@ -80,7 +80,8 @@ impl Harness {
         let read = state
             .get(&self.world)
             .expect("item params are always valid");
-        read.jobs_for(event)
+        let dependents = self.sources.dependents(event, &crate::sources::Target::All);
+        read.jobs_for(event, &dependents)
     }
 
     /// The items, as `--query items` would report them.

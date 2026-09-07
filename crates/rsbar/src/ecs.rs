@@ -38,7 +38,7 @@ use crate::layout::{self, ForceRepaint, Hit, Placements};
 use crate::requests::{Context, Items, ItemsRead};
 use crate::script::{Job, Runner};
 use crate::shaping::Cache;
-use crate::sources::Registry;
+use crate::sources::{Registry, Target};
 use bevy_app::{App, First, Last, PostUpdate, PreUpdate, Update};
 use bevy_ecs::prelude::*;
 use objc2_core_foundation::{CFRunLoop, CFRunLoopRunResult, kCFRunLoopDefaultMode};
@@ -277,18 +277,26 @@ fn apply_requests(
 
 fn dispatch_events(
     mut events: MessageReader<EventMessage>,
+    sources: NonSend<Sources>,
     read: ItemsRead,
     mut queue: ResMut<Queue>,
     mut reloading: ResMut<Reloading>,
+    // Kept between passes: the dependent list is rebuilt per event and would
+    // otherwise be an allocation each time.
+    mut dependents: Local<Vec<Entity>>,
 ) {
     for EventMessage(event) in events.read() {
         tracing::debug!(kind = %event.kind(), "event");
         if Kind::ConfigReloaded.matches(event) {
             reloading.0 = true;
         }
-        // Dispatched as well as acted on, so a config can subscribe to its own
-        // reload the same way it subscribes to anything else.
-        queue.0.extend(read.jobs_for(event));
+        // Pushed to whatever holds a claim on it, rather than matched against
+        // every item's subscriptions. Dispatched as well as acted on, so a
+        // config can subscribe to its own reload like anything else.
+        sources
+            .0
+            .dependents_into(event, &Target::All, &mut dependents);
+        read.push_jobs(event, &dependents, &mut queue.0);
     }
 }
 

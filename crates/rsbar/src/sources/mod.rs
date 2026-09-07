@@ -46,6 +46,7 @@ pub mod power;
 pub mod volume;
 pub mod workspace;
 
+use bevy_ecs::entity::Entity;
 use rsbar_protocol::{Event, Kind};
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
@@ -517,34 +518,99 @@ impl<T: Payload> CallbackState<T> {
     }
 }
 
-/// A live claim on one event.
+/// Where an event is delivered.
 ///
-/// The claim *is* the reference count. Every item wanting the same event holds
-/// a handle on one shared [`Claim`], and the registry keeps only a [`Weak`] to
-/// it — so the event is wanted for exactly as long as a handle exists, with no
-/// counter to keep in step with reality. A second demander clones rather than
-/// allocating a second claim, and the last handle to go frees it once.
+/// The claim's index. A click that landed on the clock is not the same event
+/// as a click on the bar, and an item watching its own clicks must not be
+/// handed everyone else's — so the target is part of what is claimed rather
+/// than something the receiver filters for afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Target {
+    /// Wherever it happened, to whoever is watching.
+    All,
+    /// One item, and only that item.
+    Item(rsbar_protocol::ItemName),
+}
+
+/// A claim on one event, held by whatever depends on it.
+///
+/// Holding it is what keeps the source registered for that event, and it is
+/// what puts the holder on the list an occurrence is delivered to — so wanting
+/// something and receiving it cannot get out of step, and letting go stops
+/// both.
+///
+/// Delivery is a push to exactly the holders, not something they poll for. The
+/// consumers here are items serviced in one pass of the schedule, so a queue
+/// each would be buffering nobody waits on, and finding the work would mean
+/// walking every item on every tick to discover that nothing happened.
+///
+/// The claim *is* the reference count. Every holder of the same event shares
+/// one [`Claim`], and the registry keeps only a [`Weak`](std::sync::Weak) to
+/// it, so the event is wanted for exactly as long as a handle exists with no
+/// counter to keep in step. A second holder clones — an atomic increment —
+/// rather than allocating a second claim, and the last handle to go frees it
+/// once.
 ///
 /// Dropping only records the release. Deregistering has to happen on the main
 /// thread with the run loop current, and a `Drop` can run anywhere, so the
-/// registry settles the change on its next pass.
-#[derive(Debug, Clone)]
-pub struct Watch(
-    /// Held for its destructor and nothing else. Never read: what it *is* is
-    /// the claim, and letting go of it is the whole interface.
-    #[allow(dead_code, reason = "the value is the reference, not something read")]
-    std::sync::Arc<Claim>,
-);
+/// registry settles it on the next pass.
+#[derive(Debug)]
+pub struct Watch {
+    kind: Kind,
+    owner: Entity,
+    claim: std::sync::Arc<Claim>,
+}
 
-/// The thing a [`Watch`] is a handle on: one event being wanted.
+impl Watch {
+    /// The event this is a claim on.
+    #[must_use]
+    pub fn kind(&self) -> &Kind {
+        &self.kind
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        self.claim.forget(self.owner);
+    }
+}
+
+/// The thing a [`Watch`] is a handle on: one event being wanted, and who
+/// wants it.
 ///
 /// Never held by the registry, only pointed at weakly. Its destructor running
 /// is what "nothing wants this any more" means.
 #[derive(Debug)]
 struct Claim {
-    /// Set when this dies, so the registry knows to look without walking every
-    /// source on every pass.
+    /// Who an occurrence goes to. A `std::sync::Mutex` because it is touched
+    /// from `Watch`'s destructor, which cannot await.
+    dependents: std::sync::Mutex<Vec<Entity>>,
+    /// Set when this changes, so the registry knows to look without walking
+    /// every source on every pass.
     moved: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Claim {
+    fn remember(&self, who: Entity) {
+        if let Ok(mut dependents) = self.dependents.lock()
+            && !dependents.contains(&who)
+        {
+            dependents.push(who);
+        }
+    }
+
+    fn forget(&self, who: Entity) {
+        if let Ok(mut dependents) = self.dependents.lock() {
+            dependents.retain(|held| *held != who);
+        }
+    }
+
+    /// Adds who depends on this to `into`, without allocating one to hand back.
+    fn append_dependents(&self, into: &mut Vec<Entity>) {
+        if let Ok(dependents) = self.dependents.lock() {
+            into.extend_from_slice(&dependents);
+        }
+    }
 }
 
 impl Drop for Claim {
@@ -553,26 +619,67 @@ impl Drop for Claim {
     }
 }
 
-/// The claims currently alive, by event.
+/// The claims currently alive, by event and target.
 #[derive(Debug, Default)]
 struct Claims {
-    live: HashMap<Kind, std::sync::Weak<Claim>>,
+    live: HashMap<(Kind, Target), std::sync::Weak<Claim>>,
     moved: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Claims {
-    /// A handle on `kind`, sharing the one claim if it is already alive.
-    fn take(&mut self, kind: &Kind) -> Watch {
-        if let Some(existing) = self.live.get(kind).and_then(std::sync::Weak::upgrade) {
-            return Watch(existing);
+    /// A handle on `kind` at `target` for `who`, sharing the one claim if it
+    /// is already alive.
+    fn take(&mut self, who: Entity, kind: &Kind, target: &Target) -> Watch {
+        let key = (kind.clone(), target.clone());
+        if let Some(existing) = self.live.get(&key).and_then(std::sync::Weak::upgrade) {
+            existing.remember(who);
+            return Watch {
+                kind: kind.clone(),
+                owner: who,
+                claim: existing,
+            };
         }
+
         let claim = std::sync::Arc::new(Claim {
+            dependents: std::sync::Mutex::new(vec![who]),
             moved: std::sync::Arc::clone(&self.moved),
         });
-        self.live
-            .insert(kind.clone(), std::sync::Arc::downgrade(&claim));
+        self.live.insert(key, std::sync::Arc::downgrade(&claim));
         self.mark();
-        Watch(claim)
+        Watch {
+            kind: kind.clone(),
+            owner: who,
+            claim,
+        }
+    }
+
+    /// Everything that depends on this occurrence.
+    ///
+    /// A targeted event also reaches the untargeted claim: an item watching
+    /// its own clicks and a config watching every click both want the same one.
+    fn dependents_into(&self, event: &Event, target: &Target, into: &mut Vec<Entity>) {
+        into.clear();
+        let kind = event.kind();
+        for key in std::iter::once((kind.clone(), target.clone()))
+            .chain((*target != Target::All).then_some((kind, Target::All)))
+        {
+            if let Some(claim) = self.live.get(&key).and_then(std::sync::Weak::upgrade) {
+                claim.append_dependents(into);
+            }
+        }
+        // Only when both a targeted and an untargeted claim contributed can
+        // the same item appear twice.
+        if into.len() > 1 {
+            into.sort_unstable();
+            into.dedup();
+        }
+    }
+
+    #[cfg(test)]
+    fn dependents(&self, event: &Event, target: &Target) -> Vec<Entity> {
+        let mut into = Vec::new();
+        self.dependents_into(event, target, &mut into);
+        into
     }
 
     fn mark(&self) {
@@ -585,9 +692,12 @@ impl Claims {
     }
 
     /// The events still claimed, forgetting the ones whose claim has died.
+    ///
+    /// Targets collapse here: a source produces an event or it does not, and
+    /// which item a click is for is not its business.
     fn wanted(&mut self) -> BTreeSet<Kind> {
         self.live.retain(|_, claim| claim.strong_count() > 0);
-        self.live.keys().cloned().collect()
+        self.live.keys().map(|(kind, _)| kind.clone()).collect()
     }
 }
 
@@ -777,16 +887,45 @@ impl Registry {
     /// and deregistering have to happen on the main thread while a `Drop` can
     /// run anywhere.
     #[must_use]
-    pub fn watch(&mut self, kind: &Kind) -> Watch {
+    pub fn watch(&mut self, who: Entity, kind: &Kind) -> Watch {
+        self.watch_at(who, kind, &Target::All)
+    }
+
+    /// Claims an event as it happens to one item, rather than at large.
+    ///
+    /// What a click on that item is: the same [`Kind`], indexed, so the item
+    /// is handed its own and nobody else's.
+    #[must_use]
+    pub fn watch_at(&mut self, who: Entity, kind: &Kind, target: &Target) -> Watch {
         if !self.providers.contains_key(kind) {
             tracing::debug!(%kind, "nothing provides this event");
         }
-        self.claims.take(kind)
+        self.claims.take(who, kind, target)
+    }
+
+    /// Everything that depends on this occurrence.
+    ///
+    /// The whole routing decision, and it costs nothing when nobody is
+    /// watching: the claim knows its holders, so there is no set of items to
+    /// walk and no queue to poll. A pass where nothing arrived does no work.
+    #[must_use]
+    pub fn dependents(&self, event: &Event, target: &Target) -> Vec<Entity> {
+        let mut into = Vec::new();
+        self.dependents_into(event, target, &mut into);
+        into
+    }
+
+    /// The same, into a buffer the caller keeps between events.
+    pub fn dependents_into(&self, event: &Event, target: &Target, into: &mut Vec<Entity>) {
+        self.claims.dependents_into(event, target, into);
     }
 
     /// Claims several events at once.
-    pub fn watch_all(&mut self, kinds: impl IntoIterator<Item = Kind>) -> Vec<Watch> {
-        kinds.into_iter().map(|kind| self.watch(&kind)).collect()
+    pub fn watch_all(&mut self, who: Entity, kinds: impl IntoIterator<Item = Kind>) -> Vec<Watch> {
+        kinds
+            .into_iter()
+            .map(|kind| self.watch(who, &kind))
+            .collect()
     }
 
     /// Brings every source into line with the claims currently out.
@@ -893,9 +1032,12 @@ impl Registry {
     /// Each emission is tagged with the source that produced it, so an event
     /// arriving from somewhere unexpected is traceable rather than anonymous.
     pub fn drain(&mut self) -> Vec<(SourceId, Event)> {
+        let Self {
+            sources, manual, ..
+        } = self;
         let mut drained = Vec::new();
-        let feeds = self.sources.values_mut().filter_map(|e| e.feed.as_mut());
-        for feed in feeds.chain(std::iter::once(&mut self.manual)) {
+        let feeds = sources.values_mut().filter_map(|e| e.feed.as_mut());
+        for feed in feeds.chain(std::iter::once(manual)) {
             let id = feed.id();
             while let Some(event) = feed.try_next() {
                 drained.push((id, event));
@@ -907,17 +1049,24 @@ impl Registry {
 
 #[cfg(test)]
 mod claim_tests {
-    use super::{Claims, Kind};
+    use super::{Claims, Kind, Target};
+    use bevy_ecs::entity::Entity;
+    use rsbar_protocol::Event;
+    use rsbar_protocol::event::SystemWoke;
     use std::collections::BTreeSet;
     use std::sync::Arc;
+
+    fn item(index: u32) -> Entity {
+        Entity::from_raw_u32(index).expect("a valid entity index")
+    }
 
     #[test]
     fn a_second_claim_on_one_event_is_a_handle_on_the_first() {
         let mut claims = Claims::default();
-        let first = claims.take(&Kind::SystemWoke);
-        let second = claims.take(&Kind::SystemWoke);
+        let first = claims.take(item(1), &Kind::SystemWoke, &Target::All);
+        let second = claims.take(item(2), &Kind::SystemWoke, &Target::All);
         assert!(
-            Arc::ptr_eq(&first.0, &second.0),
+            Arc::ptr_eq(&first.claim, &second.claim),
             "one claim, two handles — not two claims"
         );
     }
@@ -925,8 +1074,8 @@ mod claim_tests {
     #[test]
     fn an_event_stays_wanted_until_the_last_handle_goes() {
         let mut claims = Claims::default();
-        let first = claims.take(&Kind::SystemWoke);
-        let second = claims.take(&Kind::SystemWoke);
+        let first = claims.take(item(1), &Kind::SystemWoke, &Target::All);
+        let second = claims.take(item(2), &Kind::SystemWoke, &Target::All);
 
         drop(first);
         assert_eq!(claims.wanted(), BTreeSet::from([Kind::SystemWoke]));
@@ -938,18 +1087,67 @@ mod claim_tests {
     #[test]
     fn a_claim_taken_again_after_dying_is_a_fresh_one() {
         let mut claims = Claims::default();
-        drop(claims.take(&Kind::SystemWoke));
+        drop(claims.take(item(1), &Kind::SystemWoke, &Target::All));
         assert!(claims.wanted().is_empty());
 
-        let revived = claims.take(&Kind::SystemWoke);
+        let revived = claims.take(item(1), &Kind::SystemWoke, &Target::All);
         assert_eq!(claims.wanted(), BTreeSet::from([Kind::SystemWoke]));
         drop(revived);
     }
 
     #[test]
+    fn an_occurrence_goes_to_everything_that_depends_on_it() {
+        let mut claims = Claims::default();
+        let first = claims.take(item(1), &Kind::SystemWoke, &Target::All);
+        let second = claims.take(item(2), &Kind::SystemWoke, &Target::All);
+
+        // Order is not meaningful — dependents are a set, and `Entity` does
+        // not order by index anyway.
+        let woke = Event::SystemWoke(SystemWoke {});
+        let both = claims.dependents(&woke, &Target::All);
+        assert_eq!(both.len(), 2);
+        assert!(both.contains(&item(1)) && both.contains(&item(2)));
+
+        drop(first);
+        assert_eq!(claims.dependents(&woke, &Target::All), vec![item(2)]);
+        drop(second);
+        assert!(claims.dependents(&woke, &Target::All).is_empty());
+    }
+
+    #[test]
+    fn an_event_nobody_asked_for_reaches_nobody() {
+        // The idle case: no claim, no dependents, no work — without walking
+        // a single item to find that out.
+        let claims = Claims::default();
+        let woke = Event::SystemWoke(SystemWoke {});
+        assert!(claims.dependents(&woke, &Target::All).is_empty());
+    }
+
+    #[test]
+    fn a_targeted_occurrence_reaches_that_target_and_the_untargeted_watchers() {
+        let mut claims = Claims::default();
+        let clock = rsbar_protocol::ItemName::new("clock").expect("valid name");
+        let other = rsbar_protocol::ItemName::new("other").expect("valid name");
+
+        let _mine = claims.take(item(1), &Kind::MouseClicked, &Target::Item(clock.clone()));
+        let _theirs = claims.take(item(2), &Kind::MouseClicked, &Target::Item(other));
+        let _anyones = claims.take(item(3), &Kind::MouseClicked, &Target::All);
+
+        let pressed = Kind::MouseClicked.into_event();
+        let reached = claims.dependents(&pressed, &Target::Item(clock));
+
+        assert!(reached.contains(&item(1)), "the item it landed on");
+        assert!(!reached.contains(&item(2)), "not the item it did not");
+        assert!(
+            reached.contains(&item(3)),
+            "a config watching every click still hears it"
+        );
+    }
+
+    #[test]
     fn dropping_a_handle_tells_the_registry_to_look() {
         let mut claims = Claims::default();
-        let watch = claims.take(&Kind::SystemWoke);
+        let watch = claims.take(item(1), &Kind::SystemWoke, &Target::All);
         assert!(claims.moved(), "taking one is a change");
         assert!(!claims.moved(), "and asking clears it");
 

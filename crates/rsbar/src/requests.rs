@@ -12,7 +12,7 @@ use crate::components::{
 };
 use crate::script::Job;
 use crate::shaping::Cache;
-use crate::sources::Registry;
+use crate::sources::{Registry, Target};
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::SystemParam;
 use rsbar_protocol::style::{Color, FontSpec};
@@ -77,12 +77,16 @@ pub struct ItemsRead<'w, 's> {
 
 impl Items<'_, '_> {
     /// The scripts to run for `event`, read through the write query.
+    /// The jobs an event produces for the items that depend on it.
+    ///
+    /// `dependents` comes from the claims, so this never scans: an event goes
+    /// to what asked for it, and an event nothing asked for costs nothing.
     #[must_use]
-    pub fn jobs_for(&self, event: &Event) -> Vec<Job> {
-        self.write
+    pub fn jobs_for(&self, event: &Event, dependents: &[Entity]) -> Vec<Job> {
+        dependents
             .iter()
-            .filter(|row| row.9.0.iter().any(|kind| kind.matches(event)))
-            .filter_map(|row| {
+            .filter_map(|entity| {
+                let row = self.write.get(*entity).ok()?;
                 Some(Job {
                     item: row.0.0.clone(),
                     script: row.10?.0.clone(),
@@ -190,25 +194,42 @@ impl ItemsRead<'_, '_> {
         jobs
     }
 
-    /// The scripts to run for `event`. Items without a script are skipped:
+    /// The scripts to run for `event`, for the items that depend on it.
+    ///
+    /// `dependents` comes from the claims the items hold, so this never scans
+    /// for subscribers: an event goes to whatever asked for it, and one nobody
+    /// asked for costs nothing. Items without a script are skipped —
     /// subscribing a scriptless item is legal and simply does nothing.
     #[must_use]
-    pub fn jobs_for(&self, event: &Event) -> Vec<Job> {
-        self.read
-            .iter()
-            .filter(|row| row.7.0.iter().any(|kind| kind.matches(event)))
-            .filter_map(|row| {
-                Some(Job {
-                    item: row.1.0.clone(),
-                    // Indexed, not destructured with `..`. A `(_, name, ..,
-                    // script)` pattern silently followed the row when a column
-                    // was added, binding the click script instead — which broke
-                    // every subscription-driven script and raised no error.
-                    script: row.8?.0.clone(),
-                    event: event.clone(),
-                })
-            })
-            .collect()
+    pub fn jobs_for(&self, event: &Event, dependents: &[Entity]) -> Vec<Job> {
+        let mut into = Vec::new();
+        self.push_jobs(event, dependents, &mut into);
+        into
+    }
+
+    /// The same, appended to a queue the caller already has.
+    ///
+    /// Straight into the destination: an event with three dependents should
+    /// not build a three-element `Vec` for something else to copy out of.
+    pub fn push_jobs(&self, event: &Event, dependents: &[Entity], into: &mut Vec<Job>) {
+        into.reserve(dependents.len());
+        for entity in dependents {
+            let Ok(row) = self.read.get(*entity) else {
+                continue;
+            };
+            // Indexed, not destructured with `..`. A `(_, name, .., script)`
+            // pattern silently followed the row when a column was added,
+            // binding the click script instead — which broke every
+            // subscription-driven script and raised no error.
+            let Some(script) = row.8 else {
+                continue;
+            };
+            into.push(Job {
+                item: row.1.0.clone(),
+                script: script.0.clone(),
+                event: event.clone(),
+            });
+        }
     }
 
     /// Every item's script, regardless of frequency or subscription.
@@ -426,7 +447,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             // it swept up as stale.
             items.commands.entity(entity).remove::<Stale>();
             if let Some(subscribed) = subscribed {
-                let watches = sources.watch_all(needs(&subscribed, true));
+                let watches = sources.watch_all(entity, needs(&subscribed, true));
                 items.commands.entity(entity).insert(Watching(watches));
                 take_clicks(panels);
             }
@@ -460,7 +481,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
                 || subscribed.iter().any(is_pointer);
             // Inserting replaces whatever it held before, and dropping those
             // releases exactly what this item stopped wanting.
-            let watches = sources.watch_all(needs(&subscribed, clickable));
+            let watches = sources.watch_all(entity, needs(&subscribed, clickable));
             items.commands.entity(entity).insert(Watching(watches));
             if clickable {
                 take_clicks(panels);
@@ -471,8 +492,11 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
 
         Request::Trigger(event) => {
             tracing::debug!(kind = %event.kind(), "trigger");
+            // A triggered event is not aimed anywhere, so it reaches whoever
+            // claimed it — the same path a source's event takes.
+            let dependents = sources.dependents(&event, &Target::All);
             Outcome {
-                jobs: items.jobs_for(&event),
+                jobs: items.jobs_for(&event, &dependents),
                 ..Outcome::ok()
             }
         }
