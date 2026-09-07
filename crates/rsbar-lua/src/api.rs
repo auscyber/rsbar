@@ -21,7 +21,6 @@ use crate::convert::{
     pattern_from_name,
 };
 use crate::dispatch::Dispatcher;
-use crate::error::ApiError;
 use crate::events::Registry;
 
 /// One item, as handed back by `rsbar.add`. Cheap to hold: cloning just
@@ -194,16 +193,6 @@ async fn set_item(
     )
 }
 
-/// Every item's name, right now — the snapshot `rsbar.set` and bracket
-/// membership resolve a `/pattern/` against, since the protocol itself has no
-/// concept of matching several items by one name.
-async fn query_item_names(dispatcher: &Rc<dyn Dispatcher>) -> crate::error::Result<Vec<ItemName>> {
-    match dispatcher.call(Request::Query(Query::Items)).await? {
-        Response::Items(states) => Ok(states.into_iter().map(|state| state.name).collect()),
-        other => Err(ApiError::UnexpectedResponse(other)),
-    }
-}
-
 fn value_to_string(value: &Value, what: &str) -> mlua::Result<String> {
     match value {
         Value::String(s) => Ok(s.to_str()?.to_string()),
@@ -243,14 +232,11 @@ fn merged_opts(
     }
 }
 
-/// A bracket's members: literal item names, or `/pattern/`s expanded against
-/// [`query_item_names`] — resolved once per `add("bracket", ...)` call, not
-/// per member, so a bracket with several patterns costs one query rather than
-/// one per pattern.
-async fn resolve_members(
-    dispatcher: &Rc<dyn Dispatcher>,
-    members: &Value,
-) -> mlua::Result<Vec<ItemName>> {
+/// A bracket's members: literal item names, or `/pattern/`s — turned into
+/// [`rsbar_protocol::Selector`]s and sent as-is, since only the daemon has a
+/// live item list to resolve a pattern against without racing a config that
+/// is still adding items (see [`Selector`]'s own doc comment).
+fn members_from_value(members: &Value) -> mlua::Result<Vec<rsbar_protocol::Selector>> {
     let Value::Table(members) = members else {
         return Err(mlua::Error::RuntimeError(format!(
             "bracket members must be a table of item names, got {}",
@@ -258,31 +244,21 @@ async fn resolve_members(
         )));
     };
 
-    let mut names = Vec::new();
-    let mut every_name: Option<Vec<ItemName>> = None;
-    for entry in members.clone().sequence_values::<mlua::LuaString>() {
-        let raw = entry?.to_str()?.to_string();
-        match pattern_from_name(&raw)? {
-            Some(pattern) => {
-                if every_name.is_none() {
-                    every_name = Some(query_item_names(dispatcher).await?);
-                }
-                let matched = every_name
-                    .as_ref()
-                    .unwrap()
-                    .iter()
-                    .filter(|name| pattern.is_match(name.as_str()));
-                let before = names.len();
-                names.extend(matched.cloned());
-                if names.len() == before {
-                    tracing::warn!(pattern = %raw, "bracket member pattern matched no items");
-                }
-            }
-            None => names.push(item_name_from_str(&raw)?),
-        }
-    }
-    Ok(names)
+    members
+        .clone()
+        .sequence_values::<mlua::LuaString>()
+        .map(|entry| {
+            let raw = entry?.to_str()?.to_string();
+            raw.parse::<rsbar_protocol::Selector>()
+                .map_err(|err| mlua::Error::RuntimeError(err.to_string()))
+        })
+        .collect()
 }
+
+/// `SketchyBar` kinds `--add` accepts but nothing on the daemon side can draw
+/// yet ([`rsbar_protocol::ComponentKind`]) — real, not a typo, so `add_fn`
+/// logs them differently from a kind it has never heard of.
+const RECOGNISED_UNIMPLEMENTED_KINDS: &[&str] = &["space", "graph", "slider"];
 
 /// `rsbar.add(kind, name, ...)` — `SketchyBar`'s own calling convention, kept
 /// deliberately close to it rather than to a different shape rsbar might
@@ -299,9 +275,13 @@ async fn resolve_members(
 /// * `"event"` — `add("event", name)`. Declares nothing server-side (there is
 ///   no request that could); only checks `name` is a name `subscribe`/
 ///   `trigger` will accept later. Returns `nil`.
-/// * anything else — logged by name and treated as a plain item, since a kind
-///   rsbar does not model (`"slider"`, so far) still deserves *something* to
-///   `:set`/`:subscribe` against rather than aborting the whole config.
+/// * `"space"`, `"graph"`, `"slider"` — `SketchyBar` kinds rsbar recognises
+///   ([`rsbar_protocol::ComponentKind`]) but cannot draw yet; logged as such
+///   and, like any other unmodelled kind, given a plain item instead of
+///   nothing so `:set`/`:subscribe` on the handle still works.
+/// * anything else — a config's typo, most likely; logged by name and
+///   treated as a plain item all the same, rather than aborting the config
+///   over one bad `add`.
 fn add_fn(
     lua: &Lua,
     dispatcher: &Rc<dyn Dispatcher>,
@@ -346,10 +326,17 @@ fn add_fn(
                         }
                     } else {
                         if kind != "item" && kind != "alias" {
-                            tracing::error!(
-                                kind = %kind,
-                                "unknown add kind; treating it as a plain item"
-                            );
+                            if RECOGNISED_UNIMPLEMENTED_KINDS.contains(&kind.as_str()) {
+                                tracing::error!(
+                                    kind = %kind,
+                                    "recognised, but rsbar cannot draw a {kind} yet; adding a plain item instead"
+                                );
+                            } else {
+                                tracing::error!(
+                                    kind = %kind,
+                                    "unknown add kind; treating it as a plain item"
+                                );
+                            }
                         }
                         let name = value_to_string(&arg2, "item name")?;
                         // A kind rsbar does not model may carry its options
@@ -386,7 +373,7 @@ fn add_fn(
                     patch.alias = Some(name_str.clone());
                 }
                 if let Some(members_value) = members_value {
-                    patch.members = Some(resolve_members(&dispatcher, &members_value).await?);
+                    patch.members = Some(members_from_value(&members_value)?);
                 }
                 set_item(&dispatcher, item_name.clone(), patch).await?;
 
@@ -411,20 +398,14 @@ fn set_fn(lua: &Lua, dispatcher: &Rc<dyn Dispatcher>) -> mlua::Result<Function> 
         async move {
             let patch = item_patch_from_table(&patch)?;
             match pattern_from_name(&name)? {
-                Some(pattern) => {
-                    let targets = query_item_names(&dispatcher).await?;
-                    let matched: Vec<_> = targets
-                        .into_iter()
-                        .filter(|target| pattern.is_match(target.as_str()))
-                        .collect();
-                    if matched.is_empty() {
-                        tracing::warn!(pattern = %name, "rsbar.set matched no items");
-                    }
-                    for target in matched {
-                        set_item(&dispatcher, target, patch.clone()).await?;
-                    }
-                    Ok(())
-                }
+                Some(pattern) => expect_ok(
+                    dispatcher
+                        .call(Request::SetMatching {
+                            pattern,
+                            patch: Box::new(patch),
+                        })
+                        .await,
+                ),
                 None => set_item(&dispatcher, item_name_from_str(&name)?, patch).await,
             }
         }
@@ -496,8 +477,14 @@ fn remove_fn(lua: &Lua, dispatcher: &Rc<dyn Dispatcher>) -> mlua::Result<Functio
     lua.create_async_function(move |_, name: String| {
         let dispatcher = Rc::clone(&dispatcher);
         async move {
-            let name = item_name_from_str(&name)?;
-            expect_ok(dispatcher.call(Request::RemoveItem(name)).await)
+            match pattern_from_name(&name)? {
+                Some(pattern) => expect_ok(dispatcher.call(Request::RemoveMatching(pattern)).await),
+                None => expect_ok(
+                    dispatcher
+                        .call(Request::RemoveItem(item_name_from_str(&name)?))
+                        .await,
+                ),
+            }
         }
     })
 }

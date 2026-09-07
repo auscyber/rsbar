@@ -8,10 +8,12 @@
 
 use std::str::FromStr;
 
-use mlua::{IntoLua, Lua, Table, Value};
-use rsbar_protocol::style::Color;
+use mlua::{IntoLua, Lua, LuaSerdeExt, Table, Value};
+use serde::Serialize;
+
 use rsbar_protocol::{
-    BarPatch, BarState, Edge, Event, ItemName, ItemPatch, ItemState, Kind, Position,
+    BarPatch, BarState, Color, Edge, Event, FontSpec, InvalidName, ItemName, ItemPatch, ItemState,
+    Kind, Position, Selector,
 };
 
 use crate::error::{ApiError, Result};
@@ -86,20 +88,24 @@ pub fn kinds_from_value(value: &Value) -> mlua::Result<Vec<Kind>> {
 }
 
 /// `SketchyBar`'s own convention for matching several items by name at once:
-/// `/menu\..*/` rather than one literal name. Only `rsbar.set` and bracket
-/// membership understand this — it is resolved entirely on this side, against
-/// a snapshot of every item's name, since the protocol has no such concept.
+/// `/menu\..*/` rather than one literal name. Only the *shape* is checked
+/// here — the regex source itself (returned without its `/.../` delimiters)
+/// is compiled and matched daemon-side, against its own live item list,
+/// since only it has one without racing a config that is still adding items.
+/// Compiling it here too, and discarding the result, is only to give a
+/// malformed pattern a named error at the call site rather than a daemon
+/// rejection three requests later.
 ///
 /// # Errors
 ///
 /// Returns [`ApiError::InvalidPattern`] if `name` looks like a pattern (is
 /// wrapped in `/.../`) but its interior is not a valid regex.
-pub fn pattern_from_name(name: &str) -> Result<Option<regex::Regex>> {
+pub fn pattern_from_name(name: &str) -> Result<Option<String>> {
     let Some(inner) = name.strip_prefix('/').and_then(|s| s.strip_suffix('/')) else {
         return Ok(None);
     };
     regex::Regex::new(inner)
-        .map(Some)
+        .map(|_| Some(inner.to_string()))
         .map_err(|e| ApiError::InvalidPattern(name.to_string(), e.to_string()))
 }
 
@@ -137,10 +143,26 @@ fn opt<T: mlua::FromLua>(table: &Table, key: &str) -> mlua::Result<Option<T>> {
     table.get::<Option<T>>(key)
 }
 
-fn opt_color(table: &Table, key: &str) -> mlua::Result<Option<u32>> {
+fn opt_color(table: &Table, key: &str) -> mlua::Result<Option<Color>> {
     match table.get::<Value>(key)? {
         Value::Nil => Ok(None),
-        value => Ok(Some(color_from_value(&value)?)),
+        value => Ok(Some(Color(color_from_value(&value)?))),
+    }
+}
+
+/// `display = "main"` / `display = "1,2"` / `display = 1`, the way a real
+/// config writes either a name or a 1-based index — flattened to the string
+/// the protocol carries either way.
+fn opt_display(table: &Table, key: &str) -> mlua::Result<Option<String>> {
+    match table.get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::String(s) => Ok(Some(s.to_str()?.to_string())),
+        Value::Integer(i) => Ok(Some(i.to_string())),
+        Value::Number(n) => Ok(Some(n.to_string())),
+        other => Err(mlua::Error::RuntimeError(format!(
+            "`{key}` must be a string or a number, got {}",
+            other.type_name()
+        ))),
     }
 }
 
@@ -168,8 +190,8 @@ pub fn item_position_from_table(table: &Table) -> mlua::Result<Position> {
 #[derive(Default)]
 struct IconOrLabel {
     text: Option<String>,
-    color: Option<u32>,
-    font: Option<String>,
+    color: Option<Color>,
+    font: Option<FontSpec>,
     drawing: Option<bool>,
     padding_left: Option<f64>,
     padding_right: Option<f64>,
@@ -194,6 +216,7 @@ impl IconOrLabel {
 /// The nested `background = { ... }` table.
 fn background_patch(table: &Table) -> mlua::Result<Option<rsbar_protocol::BackgroundPatch>> {
     const KNOWN: &[&str] = &[
+        "drawing",
         "color",
         "corner_radius",
         "height",
@@ -205,9 +228,9 @@ fn background_patch(table: &Table) -> mlua::Result<Option<rsbar_protocol::Backgr
     let Some(sub) = opt::<Table>(table, "background")? else {
         return Ok(None);
     };
-    warn_unknown_with(&sub, "background", KNOWN, BACKGROUND_UNSUPPORTED);
+    warn_unknown(&sub, "background", KNOWN);
     Ok(Some(rsbar_protocol::BackgroundPatch {
-        drawing: None,
+        drawing: opt(&sub, "drawing")?,
         color: opt_color(&sub, "color")?,
         corner_radius: opt(&sub, "corner_radius")?,
         height: opt(&sub, "height")?,
@@ -273,46 +296,10 @@ fn warn_unknown_with(table: &Table, what: &str, known: &[&str], unsupported: &[(
 /// `SketchyBar` item properties rsbar has no `ItemPatch` field for yet. Each
 /// needs a protocol change; noted here so a config that uses one is loud about
 /// it instead of silently dropping it.
-const ITEM_UNSUPPORTED: &[(&str, &str)] = &[
-    (
-        "updates",
-        "toggling routine/forced updates independently of `drawing`; needs an `ItemPatch` field",
-    ),
-    (
-        "width",
-        "a fixed-width spacer item; needs an `ItemPatch::width`",
-    ),
-    (
-        "display",
-        "targeting one display; needs an `ItemPatch::display` (tracked separately)",
-    ),
-    (
-        "popup",
-        "a popup attached to this item; needs popup support (tracked separately)",
-    ),
-];
-
-/// As above, for the nested `background = { ... }` table.
-const BACKGROUND_UNSUPPORTED: &[(&str, &str)] = &[(
-    "drawing",
-    "toggling the background independently of the item; needs a `BackgroundPatch::drawing`",
+const ITEM_UNSUPPORTED: &[(&str, &str)] = &[(
+    "popup",
+    "a popup attached to this item; needs popup support (tracked separately)",
 )];
-
-/// As above, for `rsbar.bar({...})`.
-const BAR_UNSUPPORTED: &[(&str, &str)] = &[
-    (
-        "display",
-        "the bar always spans every display; needs a `BarPatch::display`",
-    ),
-    (
-        "padding_left",
-        "space before the first/after the last item, distinct from `margin`; needs `BarPatch::padding_left`",
-    ),
-    (
-        "padding_right",
-        "space before the first/after the last item, distinct from `margin`; needs `BarPatch::padding_right`",
-    ),
-];
 
 /// The known key closest to `key`, when one is close enough to be worth
 /// suggesting — a prefix, a suffix, or a one-character slip.
@@ -391,11 +378,11 @@ impl IconOrLabel {
 /// style) only makes sense combined with `rsbar.default`'s own `font` table —
 /// see `api::merged_opts` — since rsbar has nothing to read a running item's
 /// current font back from to merge against otherwise.
-fn font_from_value(value: Value) -> mlua::Result<Option<String>> {
+fn font_from_value(value: Value) -> mlua::Result<Option<FontSpec>> {
     const KNOWN: &[&str] = &["family", "style", "size"];
     match value {
         Value::Nil => Ok(None),
-        Value::String(s) => Ok(Some(s.to_str()?.to_string())),
+        Value::String(s) => Ok(Some(FontSpec::parse(&s.to_str()?))),
         Value::Table(sub) => {
             warn_unknown(&sub, "font", KNOWN);
             let family = opt::<String>(&sub, "family")?.unwrap_or_default();
@@ -411,7 +398,7 @@ fn font_from_value(value: Value) -> mlua::Result<Option<String>> {
                     )));
                 }
             };
-            Ok(Some(format!("{family}:{style}:{size}")))
+            Ok(Some(FontSpec::parse(&format!("{family}:{style}:{size}"))))
         }
         other => Err(mlua::Error::RuntimeError(format!(
             "`font` must be a string or a table, got {}",
@@ -441,6 +428,9 @@ const BAR_KEYS: &[&str] = &[
     "blur_radius",
     "hidden",
     "topmost",
+    "padding_left",
+    "padding_right",
+    "display",
 ];
 
 fn edge_from_str(key: &str, s: &str) -> mlua::Result<Edge> {
@@ -460,7 +450,7 @@ fn edge_from_str(key: &str, s: &str) -> mlua::Result<Edge> {
 /// no bucket. An unrecognised *key* is logged rather than raised: a config
 /// that is right apart from one setting should still come up.
 pub fn bar_patch_from_table(table: &Table) -> mlua::Result<BarPatch> {
-    warn_unknown_with(table, "bar", BAR_KEYS, BAR_UNSUPPORTED);
+    warn_unknown(table, "bar", BAR_KEYS);
     // `position` is what a real config actually writes; `edge` predates it
     // here and stays accepted too. `position` wins if a table somehow sets
     // both.
@@ -472,9 +462,9 @@ pub fn bar_patch_from_table(table: &Table) -> mlua::Result<BarPatch> {
             .transpose()?,
     };
     Ok(BarPatch {
-        padding_left: None,
-        padding_right: None,
-        display: None,
+        padding_left: opt(table, "padding_left")?,
+        padding_right: opt(table, "padding_right")?,
+        display: opt_display(table, "display")?,
         height: opt(table, "height")?,
         edge,
         color: opt_color(table, "color")?,
@@ -508,17 +498,49 @@ const ITEM_KEYS: &[&str] = &[
     "alias",
     "members",
     "update_freq",
+    "updates",
+    "width",
+    "display",
 ];
 
-/// The items a bracket draws across, named in a list.
-fn opt_members(table: &Table) -> mlua::Result<Option<Vec<rsbar_protocol::ItemName>>> {
+/// `SketchyBar` accepts an `alias` table (`{ color = ... }`, to tint the
+/// mirrored menu bar icon) as well as the plain "Owner,Name" string this
+/// crate's `ItemPatch::alias` actually carries. Rather than raising on the
+/// table form, this drops it back to `None` — `add_fn` already fills that in
+/// from the item's own name for a `kind == "alias"` add — and logs what got
+/// dropped, same as any other recognised-but-unimplemented key.
+const ALIAS_UNSUPPORTED: &[(&str, &str)] = &[(
+    "color",
+    "tinting the mirrored menu bar icon; needs an `ItemPatch::alias` colour, not just a name",
+)];
+
+fn alias_from_table(table: &Table) -> mlua::Result<Option<String>> {
+    match table.get::<Value>("alias")? {
+        Value::Nil => Ok(None),
+        Value::String(s) => Ok(Some(s.to_str()?.to_string())),
+        Value::Table(sub) => {
+            warn_unknown_with(&sub, "alias", &[], ALIAS_UNSUPPORTED);
+            Ok(None)
+        }
+        other => Err(mlua::Error::RuntimeError(format!(
+            "`alias` must be a string or a table, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// The items a bracket draws across, named in a list — each an exact name or
+/// a `/pattern/`, resolved server-side against the daemon's own live item
+/// list (see [`Selector`]) rather than here, so a config still adding items
+/// never races a client-side snapshot of what exists so far.
+fn opt_members(table: &Table) -> mlua::Result<Option<Vec<Selector>>> {
     let Some(list) = opt::<Vec<String>>(table, "members")? else {
         return Ok(None);
     };
     list.into_iter()
         .map(|name| {
-            rsbar_protocol::ItemName::new(name)
-                .map_err(|err| mlua::Error::RuntimeError(err.to_string()))
+            name.parse()
+                .map_err(|err: InvalidName| mlua::Error::RuntimeError(err.to_string()))
         })
         .collect::<mlua::Result<Vec<_>>>()
         .map(Some)
@@ -536,9 +558,9 @@ pub fn item_patch_from_table(table: &Table) -> mlua::Result<ItemPatch> {
     let label = IconOrLabel::read(table, "label")?;
 
     Ok(ItemPatch {
-        updates: None,
-        width: None,
-        display: None,
+        updates: opt(table, "updates")?,
+        width: opt(table, "width")?,
+        display: opt_display(table, "display")?,
         // `IconOrLabel::read` already covers both the bare-string and the
         // `{ text = ... }` spellings of `icon`/`label` — there is no separate
         // flat key left to fall back to, and `icon`/`label` themselves are
@@ -553,10 +575,32 @@ pub fn item_patch_from_table(table: &Table) -> mlua::Result<ItemPatch> {
         drawing: opt(table, "drawing")?,
         script: opt(table, "script")?,
         click_script: opt(table, "click_script")?,
-        alias: opt(table, "alias")?,
+        alias: alias_from_table(table)?,
         members: opt_members(table)?,
         update_freq: opt(table, "update_freq")?,
     })
+}
+
+/// A `Serialize` value as the `Table` a query result hands back to a config,
+/// via `mlua`'s `serde` support rather than a hand-written mirror of the same
+/// field list: [`ItemState`]/[`BarState`] and everything they nest already
+/// serialize in exactly the shape a config should see — `Color` as `"0x..."`,
+/// `Position`/`Edge` `snake_case`, `FontSpec` as `Family:Style:Size` — so
+/// building the table by hand here would just be a second copy of that same
+/// shape, free to drift from it.
+///
+/// # Errors
+///
+/// Returns a Lua error if `value` does not serialize as a table at all — it
+/// always should for every type this is called with.
+fn serde_table<T: Serialize>(lua: &Lua, value: &T) -> mlua::Result<Table> {
+    match lua.to_value(value)? {
+        Value::Table(table) => Ok(table),
+        other => Err(mlua::Error::RuntimeError(format!(
+            "expected a table, serialized as {}",
+            other.type_name()
+        ))),
+    }
 }
 
 /// # Errors
@@ -565,14 +609,20 @@ pub fn item_patch_from_table(table: &Table) -> mlua::Result<ItemPatch> {
 pub fn item_state_to_table(lua: &Lua, state: &ItemState) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     table.set("name", state.name.as_str())?;
-    table.set("position", format!("{:?}", state.position).to_lowercase())?;
-    table.set("icon", state.icon.clone())?;
-    table.set("label", state.label.clone())?;
-    table.set("drawing", state.drawing)?;
-    table.set("script", state.script.clone())?;
-    table.set("click_script", state.click_script.clone())?;
-    table.set("update_freq", state.update_freq)?;
+    // Nested the same way `SketchyBar`'s own `--query` is (`bar_item.c`), so
+    // a config's own `geometry.drawing`/`geometry.position` field paths work
+    // unchanged — see `ItemState`'s doc comment. `Geometry` already nests
+    // `background`, so one serialize covers both levels.
+    table.set("geometry", serde_table(lua, &state.geometry)?)?;
+    table.set("icon", serde_table(lua, &state.icon)?)?;
+    table.set("label", serde_table(lua, &state.label)?)?;
+    table.set("scripting", serde_table(lua, &state.scripting)?)?;
     table.set("alias", state.alias.clone())?;
+    table.set("members", serde_table(lua, &state.members)?)?;
+
+    // `Kind` derives a plain `Serialize` (its variant's Rust name, not the
+    // snake_case string a config actually writes/reads), so this is the one
+    // field `serde_table` would get wrong — built from `Kind::name` instead.
     let events = lua.create_table()?;
     for (index, kind) in state.events.iter().enumerate() {
         events.set(index + 1, kind.name())?;
@@ -585,25 +635,7 @@ pub fn item_state_to_table(lua: &Lua, state: &ItemState) -> mlua::Result<Table> 
 ///
 /// Returns a Lua error only if table creation itself fails.
 pub fn bar_state_to_table(lua: &Lua, state: &BarState) -> mlua::Result<Table> {
-    let table = lua.create_table()?;
-    table.set("height", state.height)?;
-    table.set(
-        "edge",
-        if state.edge == Edge::Top {
-            "top"
-        } else {
-            "bottom"
-        },
-    )?;
-    table.set("color", state.color)?;
-    table.set("margin", state.margin)?;
-    table.set("y_offset", state.y_offset)?;
-    table.set("corner_radius", state.corner_radius)?;
-    table.set("blur_radius", state.blur_radius)?;
-    table.set("topmost", state.topmost)?;
-    table.set("hidden", state.hidden)?;
-    table.set("displays", state.displays)?;
-    Ok(table)
+    serde_table(lua, state)
 }
 
 /// A field value as a script should see it: numbers stay numbers, everything
@@ -645,10 +677,9 @@ mod tests {
     }
 
     #[test]
-    fn a_slash_wrapped_name_compiles_as_a_regex() {
+    fn a_slash_wrapped_name_yields_its_regex_source() {
         let pattern = pattern_from_name("/menu\\..*/").unwrap().unwrap();
-        assert!(pattern.is_match("menu.1"));
-        assert!(!pattern.is_match("front_app"));
+        assert_eq!(pattern, "menu\\..*");
     }
 
     #[test]
@@ -714,7 +745,10 @@ mod tests {
             .eval()
             .unwrap();
         let patch = item_patch_from_table(&table).unwrap();
-        assert_eq!(patch.label.unwrap().font.as_deref(), Some("Hack:Bold:14"));
+        assert_eq!(
+            patch.label.unwrap().font.unwrap().to_string(),
+            "Hack:Bold:14"
+        );
     }
 
     #[test]
@@ -725,7 +759,10 @@ mod tests {
             .eval()
             .unwrap();
         let patch = item_patch_from_table(&table).unwrap();
-        assert_eq!(patch.icon.unwrap().font.as_deref(), Some("Hack:Bold:14"));
+        assert_eq!(
+            patch.icon.unwrap().font.unwrap().to_string(),
+            "Hack:Bold:14"
+        );
     }
 
     #[test]
@@ -754,7 +791,7 @@ mod tests {
             .unwrap();
         let patch = item_patch_from_table(&table).unwrap();
         let background = patch.background.unwrap();
-        assert_eq!(background.color, Some(0xffff_0000));
+        assert_eq!(background.color, Some(Color(0xffff_0000)));
         assert_eq!(background.height, None);
         assert_eq!(background.corner_radius, None);
     }

@@ -11,6 +11,47 @@ use bevy_ecs::prelude::*;
 use rsbar_protocol::style::{Color, FontSpec};
 use rsbar_protocol::{ItemName, Kind, Position};
 use std::collections::{BTreeSet, HashMap};
+use std::num::NonZeroU32;
+
+/// Which display something is restricted to: every one, or a single 1-based
+/// index into [`crate::display::active`]'s order — the same order
+/// [`crate::bar::Panels`] builds its panels in, so an item's `display` and a
+/// panel's ordinal are always talking about the same numbering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisplayTarget {
+    #[default]
+    All,
+    Index(NonZeroU32),
+}
+
+impl DisplayTarget {
+    /// Parses the wire form: `"all"`, case-insensitively, or a positive
+    /// decimal index. Anything else falls back to `All` — a config typo
+    /// should not make an item vanish, only fail to restrict it.
+    #[must_use]
+    pub fn parse(spec: &str) -> Self {
+        if spec.eq_ignore_ascii_case("all") {
+            return Self::All;
+        }
+        if let Some(index) = spec.parse::<u32>().ok().and_then(NonZeroU32::new) {
+            return Self::Index(index);
+        }
+        tracing::warn!(
+            spec,
+            "not a display: expected `all` or a 1-based index; showing on all"
+        );
+        Self::All
+    }
+
+    /// Whether this target includes the display at `ordinal`, 1-based.
+    #[must_use]
+    pub fn matches(self, ordinal: u32) -> bool {
+        match self {
+            Self::All => true,
+            Self::Index(index) => index.get() == ordinal,
+        }
+    }
+}
 
 /// Marks an entity as a bar item.
 #[derive(Component)]
@@ -60,8 +101,8 @@ impl From<&Run> for rsbar_protocol::Run {
     fn from(run: &Run) -> Self {
         Self {
             text: run.string.clone(),
-            color: run.color.0,
-            font: run.font.to_string(),
+            color: run.color,
+            font: run.font.clone(),
             drawing: run.drawing,
             padding_left: run.padding_left,
             padding_right: run.padding_right,
@@ -73,8 +114,8 @@ impl From<&rsbar_protocol::Run> for Run {
     fn from(run: &rsbar_protocol::Run) -> Self {
         Self {
             string: run.text.clone(),
-            color: Color(run.color),
-            font: FontSpec::parse(&run.font),
+            color: run.color,
+            font: run.font.clone(),
             drawing: run.drawing,
             padding_left: run.padding_left,
             padding_right: run.padding_right,
@@ -86,12 +127,12 @@ impl From<&Background> for rsbar_protocol::Background {
     fn from(background: &Background) -> Self {
         Self {
             drawing: background.drawing,
-            color: background.color.0,
+            color: background.color,
             corner_radius: background.corner_radius,
             height: background.height,
             padding_left: background.padding_left,
             padding_right: background.padding_right,
-            border_color: background.border_color.0,
+            border_color: background.border_color,
             border_width: background.border_width,
         }
     }
@@ -101,12 +142,12 @@ impl From<&rsbar_protocol::Background> for Background {
     fn from(background: &rsbar_protocol::Background) -> Self {
         Self {
             drawing: background.drawing,
-            color: Color(background.color),
+            color: background.color,
             corner_radius: background.corner_radius,
             height: background.height,
             padding_left: background.padding_left,
             padding_right: background.padding_right,
-            border_color: Color(background.border_color),
+            border_color: background.border_color,
             border_width: background.border_width,
         }
     }
@@ -174,6 +215,29 @@ pub struct Placement(pub Position);
 /// subscriptions; it simply takes no space.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Drawing(pub bool);
+
+/// Whether the item runs its script and receives events at all.
+///
+/// Distinct from [`Drawing`], which only stops it being drawn: a hidden item
+/// that still updates costs work nobody can see, and an item that is drawn
+/// from a value someone else sets wants the opposite. Turning this off does
+/// not touch [`Subscriptions`] — they are what a config would otherwise have
+/// to redo, and the whole point is that turning updates back on resumes
+/// without re-subscribing.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Updates(pub bool);
+
+/// A fixed width, overriding what the item's contents come to.
+///
+/// `None` leaves it measured. Distinct from [`Padding`], which only insets
+/// content that is still sized by it — a spacer with no icon or label wants
+/// an exact width, not a wider gap around nothing.
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+pub struct Width(pub Option<f64>);
+
+/// Which display this item appears on.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemDisplay(pub DisplayTarget);
 
 #[derive(Component, Debug, Clone, PartialEq, Eq)]
 pub struct Script(pub std::sync::Arc<str>);
@@ -332,6 +396,9 @@ pub fn bundle(name: ItemName, position: Position) -> impl Bundle {
         Offset(0.0),
         Placement(position),
         Drawing(true),
+        Updates(true),
+        Width(None),
+        ItemDisplay(DisplayTarget::All),
         Routine {
             every: 0,
             elapsed: 0,
@@ -403,5 +470,35 @@ mod tests {
     fn an_empty_run_contributes_no_width() {
         let run = Run::new("Menlo:Bold:15", Color::WHITE);
         assert!(run.is_empty(), "a fresh run has no text");
+    }
+
+    #[test]
+    fn display_targets_parse_the_spellings_a_config_uses() {
+        assert_eq!(DisplayTarget::parse("all"), DisplayTarget::All);
+        assert_eq!(DisplayTarget::parse("ALL"), DisplayTarget::All);
+        assert_eq!(
+            DisplayTarget::parse("1"),
+            DisplayTarget::Index(NonZeroU32::new(1).unwrap())
+        );
+        assert_eq!(
+            DisplayTarget::parse("2"),
+            DisplayTarget::Index(NonZeroU32::new(2).unwrap())
+        );
+    }
+
+    #[test]
+    fn an_unparsable_display_falls_back_to_all_rather_than_hiding_the_item() {
+        assert_eq!(DisplayTarget::parse("0"), DisplayTarget::All);
+        assert_eq!(DisplayTarget::parse("second"), DisplayTarget::All);
+        assert_eq!(DisplayTarget::parse(""), DisplayTarget::All);
+    }
+
+    #[test]
+    fn display_target_matching() {
+        let two = DisplayTarget::Index(NonZeroU32::new(2).unwrap());
+        assert!(DisplayTarget::All.matches(1));
+        assert!(DisplayTarget::All.matches(2));
+        assert!(!two.matches(1));
+        assert!(two.matches(2));
     }
 }

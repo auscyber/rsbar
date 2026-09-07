@@ -5,7 +5,7 @@
 //! the part that concurrency could still buy something on — if it is slow.
 
 use rsbar::components::Run;
-use rsbar::layout::{Placed, arrange};
+use rsbar::layout::{BarPadding, Placed, arrange};
 use rsbar::shaping::Shaped;
 use rsbar_protocol::Position;
 use rsbar_protocol::style::{Color, FontSpec};
@@ -55,7 +55,7 @@ fn main() {
                 width: s.label_metrics().width,
             })
             .collect();
-        let placed = arrange(&measured, 3840.0);
+        let placed = arrange(&measured, 3840.0, BarPadding::default());
         let layout = started.elapsed();
 
         let n = u32::try_from(count).unwrap_or(1);

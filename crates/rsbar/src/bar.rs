@@ -3,6 +3,7 @@
 //! Split deliberately: [`Settings`] is plain data and a `Resource`, so change
 //! detection covers it; [`Panels`] owns window server handles and is `NonSend`.
 
+use crate::components::DisplayTarget;
 use crate::display::{self, Display};
 use bevy_ecs::prelude::Resource;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -29,6 +30,13 @@ pub struct Settings {
     /// Above, the bar covers them with no way to get at them, which is
     /// `SketchyBar`'s look and wants the system menu bar set to hide itself.
     pub topmost: bool,
+    /// Space before the first item and after the last, which is not the
+    /// same as [`Self::margin`]: margin insets the bar from the screen
+    /// edge, this insets the items from the bar.
+    pub padding_left: f64,
+    pub padding_right: f64,
+    /// Which displays the bar appears on at all.
+    pub display: DisplayTarget,
 }
 
 impl Default for Settings {
@@ -43,6 +51,9 @@ impl Default for Settings {
             blur_radius: 0,
             hidden: false,
             topmost: false,
+            padding_left: 0.0,
+            padding_right: 0.0,
+            display: DisplayTarget::All,
         }
     }
 }
@@ -69,7 +80,7 @@ impl Settings {
             changes.insert(Changes::GEOMETRY);
         }
         if let Some(c) = patch.color {
-            self.color = Color(c);
+            self.color = c;
         }
         if let Some(r) = patch.corner_radius {
             self.corner_radius = r;
@@ -85,6 +96,23 @@ impl Settings {
         if let Some(topmost) = patch.topmost {
             self.topmost = topmost;
             changes.insert(Changes::LEVEL);
+        }
+        if let Some(p) = patch.padding_left {
+            self.padding_left = p;
+        }
+        if let Some(p) = patch.padding_right {
+            self.padding_right = p;
+        }
+        if let Some(spec) = &patch.display {
+            // Guarded, unlike every other field here: rebuilding every panel
+            // — tearing down and recreating window server windows — is real
+            // work, and a `SetBar` that only touched an unrelated field would
+            // otherwise pay for it on every request.
+            let target = DisplayTarget::parse(spec);
+            if target != self.display {
+                self.display = target;
+                changes.insert(Changes::DISPLAYS);
+            }
         }
         changes
     }
@@ -108,7 +136,7 @@ impl Settings {
         BarState {
             height: self.height,
             edge: self.edge,
-            color: self.color.0,
+            color: self.color,
             margin: self.margin,
             y_offset: self.y_offset,
             corner_radius: self.corner_radius,
@@ -130,6 +158,9 @@ bitflags::bitflags! {
         const VISIBILITY = 1 << 2;
         /// Above or below the system menu bar.
         const LEVEL = 1 << 3;
+        /// Which displays have a panel at all, as opposed to [`Self::GEOMETRY`]
+        /// which only moves panels that already exist.
+        const DISPLAYS = 1 << 4;
     }
 }
 
@@ -138,6 +169,9 @@ pub struct Panel {
     pub display: Display,
     pub window: Window,
     pub frame: CGRect,
+    /// This panel's 1-based position in [`display::active`]'s order — what
+    /// an item's or the bar's own `display` property is written against.
+    pub ordinal: u32,
 }
 
 /// One panel per display.
@@ -170,7 +204,8 @@ impl Panels {
     /// Rebuilds against the displays that exist now, reusing the window of a
     /// display that is still present so a resolution change does not flicker
     /// the bar away. Windows of departed displays are dropped, which releases
-    /// them.
+    /// them — which is also what happens to one `settings.display` no longer
+    /// selects: it is simply left out of the rebuilt set.
     ///
     /// # Errors
     ///
@@ -178,7 +213,11 @@ impl Panels {
     /// configured.
     pub fn rebuild(&mut self, settings: &Settings) -> skylight::Result<()> {
         let mut panels = Vec::new();
-        for display in display::active() {
+        for (index, display) in display::active().into_iter().enumerate() {
+            let ordinal = u32::try_from(index + 1).unwrap_or(u32::MAX);
+            if !settings.display.matches(ordinal) {
+                continue;
+            }
             let frame = settings.frame_for(&display);
             let panel = match self.panels.iter().position(|p| p.display.id == display.id) {
                 Some(index) => {
@@ -189,18 +228,21 @@ impl Panels {
                     }
                     panel.display = display;
                     panel.frame = frame;
+                    panel.ordinal = ordinal;
                     panel
                 }
                 None => Panel {
                     window: new_window(frame, &display, settings, self.clickable)?,
                     display,
                     frame,
+                    ordinal,
                 },
             };
             tracing::debug!(
                 display = panel.display.id,
                 scale = panel.display.scale,
                 frame = ?panel.frame,
+                ordinal = panel.ordinal,
                 "panel"
             );
             panels.push(panel);

@@ -7,9 +7,9 @@
 
 use crate::bar::{Changes, Panels, Settings};
 use crate::components::{
-    AliasContent, AliasSpec, Background, ClickScript, Drawing, Icon, Index, ItemHandle, Label,
-    Members, Name, Offset, Padding, Placement, Routine, Run, Script, Stale, Subscriptions,
-    Watching, bundle,
+    AliasContent, AliasSpec, Background, ClickScript, DisplayTarget, Drawing, Icon, Index,
+    ItemDisplay, ItemHandle, Label, Members, Name, Offset, Padding, Placement, Routine, Run,
+    Script, Stale, Subscriptions, Updates, Watching, Width, bundle,
 };
 use crate::script::Job;
 use crate::shaping::Cache;
@@ -20,7 +20,7 @@ use bevy_ecs::query::QueryData;
 use bevy_ecs::system::SystemParam;
 use rsbar_protocol::{
     BackgroundPatch, Event, ItemName, ItemPatch, ItemState, Kind, Patch, Query as ProtocolQuery,
-    Request, Response, RunPatch,
+    Request, Response, RunPatch, Selector,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -44,6 +44,9 @@ pub struct ItemWrite {
     pub offset: &'static mut Offset,
     pub placement: &'static mut Placement,
     pub drawing: &'static mut Drawing,
+    pub updates: &'static mut Updates,
+    pub width: &'static mut Width,
+    pub display: &'static mut ItemDisplay,
     pub routine: &'static mut Routine,
     pub subscriptions: &'static mut Subscriptions,
     pub script: Option<&'static Script>,
@@ -59,8 +62,16 @@ pub struct ItemRead {
     pub name: &'static Name,
     pub icon: &'static Icon,
     pub label: &'static Label,
+    pub background: &'static Background,
+    pub padding: &'static Padding,
+    pub offset: &'static Offset,
     pub placement: &'static Placement,
     pub drawing: &'static Drawing,
+    /// Gates whether this item's script runs for a subscribed event at all —
+    /// not whether it *would* match — so an item that turned updates off
+    /// keeps its subscriptions inert rather than dropping them.
+    pub updates: &'static Updates,
+    pub width: &'static Width,
     pub routine: &'static Routine,
     pub subscriptions: &'static Subscriptions,
     pub script: Option<&'static Script>,
@@ -108,6 +119,9 @@ impl Items<'_, '_> {
             .iter()
             .filter_map(|entity| {
                 let row = self.write.get(*entity).ok()?;
+                if !row.updates.0 {
+                    return None;
+                }
                 Some(Job {
                     item: ItemHandle::new(row.entity, row.name.0.clone()),
                     script: Arc::clone(&row.script?.0),
@@ -117,7 +131,10 @@ impl Items<'_, '_> {
             .collect()
     }
 
-    /// Every item's script, regardless of frequency or subscription.
+    /// Every item's script, regardless of frequency, subscription, or
+    /// `updates` — this is the forced update `UpdateAll` asks for, and a
+    /// forced update runs even an item that has turned its own updates off,
+    /// same as re-running its update frequency early would.
     #[must_use]
     pub fn all_jobs(&self) -> Vec<Job> {
         self.write
@@ -151,13 +168,23 @@ impl Items<'_, '_> {
 fn write_state(row: &ItemWriteReadOnlyItem<'_, '_>) -> ItemState {
     ItemState {
         name: row.name.0.clone(),
-        position: row.placement.0,
-        icon: row.icon.0.string.clone(),
-        label: row.label.0.string.clone(),
-        drawing: row.drawing.0,
-        script: row.script.map(|s| s.0.to_string()),
-        click_script: row.click.map(|s| s.0.to_string()),
-        update_freq: row.routine.every,
+        geometry: rsbar_protocol::Geometry {
+            drawing: row.drawing.0,
+            position: row.placement.0,
+            y_offset: row.offset.0,
+            padding_left: row.padding.left,
+            padding_right: row.padding.right,
+            width: row.width.0,
+            background: row.background.into(),
+        },
+        icon: (&row.icon.0).into(),
+        label: (&row.label.0).into(),
+        scripting: rsbar_protocol::Scripting {
+            script: row.script.map(|s| s.0.to_string()),
+            click_script: row.click.map(|s| s.0.to_string()),
+            update_freq: row.routine.every,
+            updates: row.updates.0,
+        },
         events: row.subscriptions.0.iter().cloned().collect(),
         alias: row.alias.map(|alias| alias.0.clone()),
         members: row.members.map(|m| m.0.clone()).unwrap_or_default(),
@@ -188,7 +215,12 @@ impl ItemsRead<'_, '_> {
                 event: Arc::clone(event),
             });
         }
-        if subscriptions.0.iter().any(|kind| kind.matches(event))
+        // The click script above is unconditional — a click is a direct user
+        // action, not something `updates` is about — but a subscription
+        // match is exactly the "woken by a subscribed event" `updates` turns
+        // off.
+        if row.updates.0
+            && subscriptions.0.iter().any(|kind| kind.matches(event))
             && let Some(script) = script
         {
             jobs.push(Job {
@@ -223,6 +255,9 @@ impl ItemsRead<'_, '_> {
             let Ok(row) = self.read.get(*entity) else {
                 continue;
             };
+            if !row.updates.0 {
+                continue;
+            }
             // Indexed, not destructured with `..`. A `(_, name, .., script)`
             // pattern silently followed the row when a column was added,
             // binding the click script instead — which broke every
@@ -238,7 +273,8 @@ impl ItemsRead<'_, '_> {
         }
     }
 
-    /// Every item's script, regardless of frequency or subscription.
+    /// Every item's script, regardless of frequency, subscription, or
+    /// `updates` — see [`Items::all_jobs`].
     #[must_use]
     pub fn all_jobs(&self) -> Vec<Job> {
         self.read
@@ -270,13 +306,23 @@ impl ItemsRead<'_, '_> {
 fn state_of(row: &ItemReadItem<'_, '_>) -> ItemState {
     ItemState {
         name: row.name.0.clone(),
-        position: row.placement.0,
-        icon: row.icon.0.string.clone(),
-        label: row.label.0.string.clone(),
-        drawing: row.drawing.0,
-        script: row.script.map(|s| s.0.to_string()),
-        click_script: row.click.map(|s| s.0.to_string()),
-        update_freq: row.routine.every,
+        geometry: rsbar_protocol::Geometry {
+            drawing: row.drawing.0,
+            position: row.placement.0,
+            y_offset: row.offset.0,
+            padding_left: row.padding.left,
+            padding_right: row.padding.right,
+            width: row.width.0,
+            background: row.background.into(),
+        },
+        icon: (&row.icon.0).into(),
+        label: (&row.label.0).into(),
+        scripting: rsbar_protocol::Scripting {
+            script: row.script.map(|s| s.0.to_string()),
+            click_script: row.click.map(|s| s.0.to_string()),
+            update_freq: row.routine.every,
+            updates: row.updates.0,
+        },
         events: row.subscriptions.0.iter().cloned().collect(),
         alias: row.alias.map(|alias| alias.0.clone()),
         members: row.members.map(|m| m.0.clone()).unwrap_or_default(),
@@ -402,7 +448,11 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             tracing::debug!(?patch, "set bar");
             let changes = settings.apply(&patch);
             let result = (|| -> skylight::Result<()> {
-                if changes.contains(Changes::GEOMETRY) {
+                if changes.contains(Changes::DISPLAYS) {
+                    // A superset of `reframe`: it also creates and destroys
+                    // panels, so a plain reframe afterwards would be redundant.
+                    panels.rebuild(settings)?;
+                } else if changes.contains(Changes::GEOMETRY) {
                     panels.reframe(settings)?;
                 }
                 if changes.contains(Changes::BLUR) {
@@ -440,6 +490,16 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             Outcome::ok()
         }
 
+        // `ComponentKind` is modelled in the protocol precisely so a config
+        // using one gets a named error here rather than a plain item it
+        // never asked for, or never reaching the daemon at all — see the
+        // doc on `Request::AddComponent`. Drawing a slider or graph is a
+        // different feature from the properties this pass covers; nothing
+        // here draws one yet.
+        Request::AddComponent { name, kind, .. } => Outcome::error(format!(
+            "`{name}`: `{kind:?}` items are not implemented yet"
+        )),
+
         Request::SetItem { name, patch } => {
             tracing::trace!(%name, ?patch, "set item");
             let Some(entity) = items.index.get(&name) else {
@@ -476,6 +536,30 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             items.commands.entity(entity).despawn();
             Outcome::ok()
         }
+
+        // Resolving a `/pattern/` against the live item list needs a regex
+        // engine this crate does not yet depend on — see `Selector` in the
+        // protocol crate, which already anticipates it. Erroring rather than
+        // matching nothing keeps a config from silently doing less than it
+        // asked for.
+        Request::SetMatching { pattern, .. } | Request::RemoveMatching(pattern) => Outcome::error(
+            format!("selecting items by `/{pattern}/` is not implemented yet"),
+        ),
+
+        // `--default` needs a resource the item world consults on every
+        // `AddItem`, which has to be registered where the `App` is built —
+        // outside the files this pass touches. See the final report.
+        Request::SetDefault(_) => Outcome::error("`--default` is not implemented yet".to_owned()),
+
+        // Reordering an item within its bucket needs an explicit sort key
+        // `arrange` does not have yet — a bigger change to layout than this
+        // pass's properties, and one with real repaint-damage implications
+        // of its own that deserve their own pass rather than a rushed one
+        // here.
+        Request::Move { name, .. } => {
+            Outcome::error(format!("`{name}`: moving items is not implemented yet"))
+        }
+        Request::Reorder(_) => Outcome::error("reordering items is not implemented yet".to_owned()),
 
         Request::Subscribe { name, events } => {
             tracing::debug!(%name, ?events, "subscribe");
@@ -551,6 +635,13 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             )),
             Err(err) => Outcome::error(err.to_string()),
         },
+
+        // `SetDefault` is not implemented (see its own arm above), so there
+        // is never anything stashed to report — an empty patch is the
+        // honest answer, not a guess.
+        Request::Query(ProtocolQuery::Defaults) => {
+            Outcome::answer(Response::Defaults(Box::default()))
+        }
 
         Request::PressAppMenu(index) => match crate::menus::press(index) {
             Ok(()) => Outcome::ok(),
@@ -678,6 +769,19 @@ fn set_item(
     if let Some(d) = patch.drawing {
         drawing.0 = d;
     }
+    // `Width` and `ItemDisplay` affect layout, so — unlike the plain
+    // assignments above — they go through `set_if_neq`: a script re-setting
+    // the display or width it already has must not repaint the bar.
+    if let Some(u) = patch.updates {
+        row.updates.set_if_neq(Updates(u));
+    }
+    if let Some(w) = patch.width {
+        row.width.set_if_neq(Width(Some(w)));
+    }
+    if let Some(spec) = &patch.display {
+        row.display
+            .set_if_neq(ItemDisplay(DisplayTarget::parse(spec)));
+    }
     if let Some(freq) = patch.update_freq {
         routine.every = freq;
         // A changed frequency restarts the clock, so setting it twice does not
@@ -703,10 +807,27 @@ fn set_item(
         }
     }
     if let Some(members) = &patch.members {
-        if members.is_empty() {
+        // A member named by pattern would have to be re-resolved against the
+        // live item list on every change to it, not just when the bracket
+        // itself is set — nothing here does that yet, so a pattern is
+        // reported and dropped rather than silently matching nothing forever.
+        let names: Vec<ItemName> = members
+            .iter()
+            .filter_map(|selector| match selector {
+                Selector::Name(name) => Some(name.clone()),
+                Selector::Pattern(pattern) => {
+                    tracing::warn!(
+                        pattern,
+                        "bracket membership by pattern is not implemented yet; ignoring"
+                    );
+                    None
+                }
+            })
+            .collect();
+        if names.is_empty() {
             commands.entity(entity).remove::<Members>();
         } else {
-            commands.entity(entity).insert(Members(members.clone()));
+            commands.entity(entity).insert(Members(names));
         }
     }
     if let Some(alias) = &patch.alias {
@@ -802,12 +923,12 @@ mod patch_tests {
         let current = background();
         let patch = BackgroundPatch {
             drawing: Some(current.drawing),
-            color: Some(current.color.0),
+            color: Some(current.color),
             corner_radius: Some(current.corner_radius),
             height: Some(current.height),
             padding_left: Some(current.padding_left),
             padding_right: Some(current.padding_right),
-            border_color: Some(current.border_color.0),
+            border_color: Some(current.border_color),
             border_width: Some(current.border_width),
         };
         assert_eq!(patched_background(&current, Some(&patch)), None);

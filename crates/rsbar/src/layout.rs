@@ -8,7 +8,8 @@
 use crate::alias::Captures;
 use crate::bar::{Panels, Settings, fill_rounded_rect, stroke_rounded_rect};
 use crate::components::{
-    AliasContent, Background, Drawing, Icon, Label, Members, Name, Offset, Padding, Placement,
+    AliasContent, Background, Drawing, Icon, ItemDisplay, Label, Members, Name, Offset, Padding,
+    Placement, Width,
 };
 use crate::shaping::Cache;
 use bevy_ecs::prelude::*;
@@ -33,6 +34,8 @@ pub struct Drawn {
     pub offset: &'static Offset,
     pub placement: &'static Placement,
     pub drawing: &'static Drawing,
+    pub width: &'static Width,
+    pub display: &'static ItemDisplay,
     pub name: &'static Name,
     /// Set only on a bracket: the items it draws across.
     pub members: Option<&'static Members>,
@@ -104,6 +107,16 @@ pub struct Placed<T> {
     pub width: f64,
 }
 
+/// Space inside the bar before the first item and after the last.
+///
+/// Not the same as the bar's own `margin`, which insets the whole window from
+/// the screen edge: this insets the items from the window.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct BarPadding {
+    pub left: f64,
+    pub right: f64,
+}
+
 /// Assigns every item an x offset within a bar of `width`.
 ///
 /// The buckets differ on purpose. Left runs left to right. Right and
@@ -111,19 +124,27 @@ pub struct Placed<T> {
 /// resizes. The centre group is measured whole before placing, so it stays
 /// centred rather than growing from its left edge, and the two centre-adjacent
 /// buckets hang off its edges rather than being re-centred with it.
-pub fn arrange<T: Copy>(items: &[Placed<T>], width: f64) -> Vec<(T, f64, f64)> {
+///
+/// `padding` insets the left and right buckets from the bar's own edges. The
+/// centre group is deliberately left out of that — it is centred on the whole
+/// bar width regardless, matching `SketchyBar`'s own arithmetic.
+pub fn arrange<T: Copy>(
+    items: &[Placed<T>],
+    width: f64,
+    padding: BarPadding,
+) -> Vec<(T, f64, f64)> {
     let in_bucket = |bucket: Position| items.iter().filter(move |i| i.position == bucket);
     let group_width = |bucket: Position| in_bucket(bucket).map(|i| i.width).sum::<f64>();
 
     let mut placed = Vec::with_capacity(items.len());
 
-    let mut x = 0.0;
+    let mut x = padding.left;
     for item in in_bucket(Position::Left) {
         placed.push((item.id, x, item.width));
         x += item.width;
     }
 
-    let mut x = width;
+    let mut x = width - padding.right;
     for item in in_bucket(Position::Right)
         .collect::<Vec<_>>()
         .into_iter()
@@ -161,29 +182,38 @@ pub fn arrange<T: Copy>(items: &[Placed<T>], width: f64) -> Vec<(T, f64, f64)> {
 }
 
 /// Gathers the drawn items and hands them to [`arrange`].
+///
+/// `ordinal` is this panel's 1-based position among the active displays —
+/// what an item's or the bar's own `display` property is checked against, so
+/// an item restricted to another display is simply left out of this panel's
+/// list, the same way an undrawn one is.
 fn place(
     items: &ItemQuery,
     cache: &Cache,
     captures: &Captures,
     size: CGSize,
+    padding: BarPadding,
+    ordinal: u32,
 ) -> Vec<(Entity, CGRect)> {
     let measured: Vec<Placed<Entity>> = items
         .iter()
         // A bracket takes no space of its own — it is drawn across the items
         // it names, so laying it out alongside them would push them apart by
         // its own width.
-        .filter(|row| row.drawing.0 && row.members.is_none())
+        .filter(|row| row.drawing.0 && row.members.is_none() && row.display.0.matches(ordinal))
         .map(|row| Placed {
             id: row.entity,
             position: row.placement.0,
-            // An alias is as wide as what it mirrors; its own text, if it has
-            // any, is not drawn.
-            width: alias_width(captures, row.entity, row.padding)
-                .unwrap_or_else(|| width(cache, row.entity, row.icon, row.label, row.padding)),
+            // A fixed width overrides everything else a content measures to,
+            // alias included — that is the whole point of a spacer.
+            width: row.width.0.unwrap_or_else(|| {
+                alias_width(captures, row.entity, row.padding)
+                    .unwrap_or_else(|| width(cache, row.entity, row.icon, row.label, row.padding))
+            }),
         })
         .collect();
 
-    let mut placed: Vec<(Entity, CGRect)> = arrange(&measured, size.width)
+    let mut placed: Vec<(Entity, CGRect)> = arrange(&measured, size.width, padding)
         .into_iter()
         .map(|(entity, x, w)| {
             (
@@ -194,7 +224,7 @@ fn place(
         .collect();
 
     // Brackets go first, so their background lands under the items they span.
-    let mut brackets = brackets_over(items, &placed, size);
+    let mut brackets = brackets_over(items, &placed, size, ordinal);
     brackets.append(&mut placed);
     brackets
 }
@@ -209,13 +239,14 @@ fn brackets_over(
     items: &ItemQuery,
     placed: &[(Entity, CGRect)],
     size: CGSize,
+    ordinal: u32,
 ) -> Vec<(Entity, CGRect)> {
     let mut out = Vec::new();
     for bracket in items.iter() {
         let Some(members) = bracket.members else {
             continue;
         };
-        if !bracket.drawing.0 {
+        if !bracket.drawing.0 || !bracket.display.0.matches(ordinal) {
             continue;
         }
         let mut span: Option<(f64, f64)> = None;
@@ -584,8 +615,13 @@ fn paint_panels(
 ) {
     for panel in panels.iter() {
         let size = panel.frame.size;
-        // Layout depends on the panel's width, so it is per display.
-        let placed = place(items, cache, captures, size);
+        let padding = BarPadding {
+            left: settings.padding_left,
+            right: settings.padding_right,
+        };
+        // Layout depends on the panel's width and which display it is, so
+        // both are per-panel rather than computed once for the whole bar.
+        let placed = place(items, cache, captures, size, padding, panel.ordinal);
         let torn = damage(pass, panel.display.id, panel.frame, &placed);
 
         // Nothing on this display looks different — the common case on a
@@ -654,6 +690,8 @@ type AnythingVisibleChanged<'w, 's> = Query<
         Changed<Offset>,
         Changed<Placement>,
         Changed<Drawing>,
+        Changed<Width>,
+        Changed<ItemDisplay>,
         // The digest of what an alias mirrors. Without this the capture
         // refreshes and the component changes, but nothing asks for a
         // repaint — a mirrored clock sits at the minute it was first drawn.
@@ -676,6 +714,8 @@ pub type DirtyItems<'w, 's> = Query<
         Changed<Offset>,
         Changed<Placement>,
         Changed<Drawing>,
+        Changed<Width>,
+        Changed<ItemDisplay>,
         // The digest of what an alias mirrors. Without this the capture
         // refreshes and the component changes, but nothing asks for a
         // repaint — a mirrored clock sits at the minute it was first drawn.
@@ -711,7 +751,7 @@ pub fn clear_force_repaint(mut repaint: ResMut<ForceRepaint>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Placed, arrange};
+    use super::{BarPadding, Placed, arrange};
     use rsbar_protocol::Position;
 
     fn item(id: u8, position: Position, width: f64) -> Placed<u8> {
@@ -720,6 +760,10 @@ mod tests {
             position,
             width,
         }
+    }
+
+    fn no_padding() -> BarPadding {
+        BarPadding::default()
     }
 
     /// x offset of one id, for readable assertions.
@@ -736,6 +780,7 @@ mod tests {
         let placed = arrange(
             &[item(1, Position::Left, 30.0), item(2, Position::Left, 20.0)],
             200.0,
+            no_padding(),
         );
         assert!((x_of(&placed, 1) - 0.0).abs() < 1e-9);
         assert!((x_of(&placed, 2) - 30.0).abs() < 1e-9);
@@ -749,6 +794,7 @@ mod tests {
                 item(2, Position::Right, 20.0),
             ],
             200.0,
+            no_padding(),
         );
         // Last added sits hard against the right edge; the first sits left of it.
         assert!((x_of(&placed, 2) - 180.0).abs() < 1e-9);
@@ -757,8 +803,8 @@ mod tests {
 
     #[test]
     fn right_stays_pinned_when_content_grows() {
-        let narrow = arrange(&[item(1, Position::Right, 20.0)], 200.0);
-        let wide = arrange(&[item(1, Position::Right, 60.0)], 200.0);
+        let narrow = arrange(&[item(1, Position::Right, 20.0)], 200.0, no_padding());
+        let wide = arrange(&[item(1, Position::Right, 60.0)], 200.0, no_padding());
         // The trailing edge is what must not move, not the origin.
         assert!((x_of(&narrow, 1) + 20.0 - 200.0).abs() < 1e-9);
         assert!((x_of(&wide, 1) + 60.0 - 200.0).abs() < 1e-9);
@@ -772,6 +818,7 @@ mod tests {
                 item(2, Position::Center, 60.0),
             ],
             200.0,
+            no_padding(),
         );
         // Group is 100 wide, so it starts at 50 and ends at 150.
         assert!((x_of(&placed, 1) - 50.0).abs() < 1e-9);
@@ -787,6 +834,7 @@ mod tests {
                 item(3, Position::CenterRight, 10.0),
             ],
             200.0,
+            no_padding(),
         );
         // Centre spans 80..120, so its neighbours abut it without re-centring.
         assert!((x_of(&placed, 1) - 80.0).abs() < 1e-9);
@@ -803,6 +851,7 @@ mod tests {
                 item(3, Position::Right, 25.0),
             ],
             200.0,
+            no_padding(),
         );
         assert!((x_of(&placed, 1) - 0.0).abs() < 1e-9);
         assert!((x_of(&placed, 2) - 75.0).abs() < 1e-9);
@@ -811,7 +860,45 @@ mod tests {
 
     #[test]
     fn an_empty_bar_places_nothing() {
-        assert!(arrange::<u8>(&[], 200.0).is_empty());
+        assert!(arrange::<u8>(&[], 200.0, no_padding()).is_empty());
+    }
+
+    #[test]
+    fn bar_padding_insets_left_and_right_from_the_bar_edges() {
+        let padding = BarPadding {
+            left: 10.0,
+            right: 20.0,
+        };
+        let placed = arrange(
+            &[
+                item(1, Position::Left, 30.0),
+                item(2, Position::Right, 25.0),
+            ],
+            200.0,
+            padding,
+        );
+        assert!((x_of(&placed, 1) - 10.0).abs() < 1e-9, "left starts inset");
+        assert!(
+            (x_of(&placed, 2) - (200.0 - 20.0 - 25.0)).abs() < 1e-9,
+            "right ends inset"
+        );
+    }
+
+    #[test]
+    fn bar_padding_does_not_move_the_centre_group() {
+        let with_padding = arrange(
+            &[item(1, Position::Center, 40.0)],
+            200.0,
+            BarPadding {
+                left: 50.0,
+                right: 50.0,
+            },
+        );
+        let without = arrange(&[item(1, Position::Center, 40.0)], 200.0, no_padding());
+        assert!(
+            (x_of(&with_padding, 1) - x_of(&without, 1)).abs() < 1e-9,
+            "the centre group is centred on the whole bar, not the padded area"
+        );
     }
 }
 
@@ -883,6 +970,84 @@ mod width_tests {
             (same - base).abs() < 1e-9,
             "an empty label takes no space no matter its own padding"
         );
+    }
+}
+
+#[cfg(test)]
+mod place_tests {
+    use super::{BarPadding, ItemQuery, place};
+    use crate::alias::Captures;
+    use crate::components::{DisplayTarget, ItemDisplay, Width, bundle};
+    use crate::shaping::Cache;
+    use bevy_ecs::system::SystemState;
+    use bevy_ecs::world::World;
+    use objc2_core_foundation::CGSize;
+    use rsbar_protocol::{ItemName, Position};
+    use std::num::NonZeroU32;
+
+    fn size() -> CGSize {
+        CGSize::new(500.0, 32.0)
+    }
+
+    #[test]
+    fn a_fixed_width_overrides_what_the_item_would_otherwise_measure_to() {
+        let mut world = World::new();
+        let entity = world
+            .spawn(bundle(ItemName::new("spacer").unwrap(), Position::Left))
+            .id();
+        world.entity_mut(entity).insert(Width(Some(5.0)));
+
+        let mut state: SystemState<ItemQuery> = SystemState::new(&mut world);
+        let query = state.get(&world).expect("query param is valid");
+        let placed = place(
+            &query,
+            &Cache::default(),
+            &Captures::default(),
+            size(),
+            BarPadding::default(),
+            1,
+        );
+
+        assert_eq!(placed.len(), 1);
+        assert!(
+            (placed[0].1.size.width - 5.0).abs() < 1e-9,
+            "the fixed width wins over the measured (empty) contents"
+        );
+    }
+
+    #[test]
+    fn an_item_restricted_to_another_display_is_left_off_this_panel() {
+        let mut world = World::new();
+        let entity = world
+            .spawn(bundle(ItemName::new("only-two").unwrap(), Position::Left))
+            .id();
+        world
+            .entity_mut(entity)
+            .insert(ItemDisplay(DisplayTarget::Index(
+                NonZeroU32::new(2).unwrap(),
+            )));
+
+        let mut state: SystemState<ItemQuery> = SystemState::new(&mut world);
+        let query = state.get(&world).expect("query param is valid");
+        let on_one = place(
+            &query,
+            &Cache::default(),
+            &Captures::default(),
+            size(),
+            BarPadding::default(),
+            1,
+        );
+        let on_two = place(
+            &query,
+            &Cache::default(),
+            &Captures::default(),
+            size(),
+            BarPadding::default(),
+            2,
+        );
+
+        assert!(on_one.is_empty(), "not this panel's display");
+        assert_eq!(on_two.len(), 1, "this one is");
     }
 }
 

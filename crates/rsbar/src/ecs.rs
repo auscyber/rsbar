@@ -34,7 +34,7 @@
 use crate::bar::{Panels, Settings};
 use crate::components::{
     AliasContent, AliasSpec, ClickScript, Icon, Index, Item, ItemHandle, Label, Name, Routine,
-    Script, Stale,
+    Script, Stale, Updates,
 };
 use crate::config::Shared as SharedConfig;
 use crate::layout::{self, ForceRepaint, Hit, Placements};
@@ -556,7 +556,7 @@ fn pointer_location(event: &Event) -> Option<(f64, f64)> {
 fn tick(
     time: Res<bevy_time::Time<bevy_time::Real>>,
     mut since: Local<Duration>,
-    mut items: Query<(Entity, &Name, &mut Routine, Option<&Script>)>,
+    mut items: Query<(Entity, &Name, &mut Routine, Option<&Script>, Option<&Updates>)>,
     mut subscribers: NonSendMut<crate::subscribers::Subscribers>,
     mut queue: ResMut<Queue>,
 ) {
@@ -568,10 +568,15 @@ fn tick(
     *since -= TICK;
 
     let routine = std::sync::Arc::new(Event::Routine(rsbar_protocol::event::Routine {}));
-    for (entity, name, mut clock, script) in &mut items {
+    for (entity, name, mut clock, script, updates) in &mut items {
         // `bypass_change_detection`, because a routine clock ticking is not a
         // reason to repaint — only what the script then sets is.
         if !clock.bypass_change_detection().tick() {
+            continue;
+        }
+        // The clock still advances while updates are off, so turning them back
+        // on resumes the item's own rhythm rather than restarting it.
+        if updates.is_some_and(|updates| !updates.0) {
             continue;
         }
         // A client holding a port takes the tick itself. Checked before the

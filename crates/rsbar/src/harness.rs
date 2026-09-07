@@ -422,7 +422,7 @@ mod tests {
         });
         let items = bar.items();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "09:41");
+        assert_eq!(items[0].label.text, "09:41");
 
         bar.apply(Request::RemoveItem(clock));
         assert!(bar.items().is_empty());
@@ -459,7 +459,7 @@ mod tests {
 
         let items = bar.items();
         assert_eq!(items.len(), 1, "the same name is the same item");
-        assert_eq!(items[0].position, Position::Left, "and it moved");
+        assert_eq!(items[0].geometry.position, Position::Left, "and it moved");
     }
 
     #[test]
@@ -543,8 +543,8 @@ mod tests {
         );
 
         let state = &bar.items()[0];
-        assert_eq!(state.script.as_deref(), Some("updated"));
-        assert_eq!(state.click_script.as_deref(), Some("clicked"));
+        assert_eq!(state.scripting.script.as_deref(), Some("updated"));
+        assert_eq!(state.scripting.click_script.as_deref(), Some("clicked"));
     }
 
     #[test]
@@ -657,7 +657,7 @@ mod tests {
         let mut bar = Harness::new();
         bar.apply(Request::SetBar(rsbar_protocol::BarPatch {
             height: Some(40.0),
-            color: Some(0xff00_0000),
+            color: Some(rsbar_protocol::Color(0xff00_0000)),
             ..rsbar_protocol::BarPatch::default()
         }));
         assert!((bar.settings().height - 40.0).abs() < f64::EPSILON);

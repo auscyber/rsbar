@@ -50,7 +50,11 @@ module = ["mlua/module"]
 
 [dependencies]
 # `async`: every verb in `api.rs` awaits the dispatcher instead of blocking.
-mlua = { version = "0.12", default-features = false, features = ["async"] }
+# `serde`: a query result (`ItemState`, `BarState`) is already
+# `Serialize` in exactly the shape a config should see, `Color`/`FontSpec`
+# included — `lua.to_value` builds the Lua table from that directly instead
+# of a second, hand-maintained copy of the same field list.
+mlua = { version = "0.12", default-features = false, features = ["async", "serde"] }
 rsbar-protocol = { workspace = true }
 async-mach-ports = { workspace = true }
 futures-lite = { workspace = true }
@@ -63,10 +67,15 @@ tokio = { workspace = true, features = ["rt", "process"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
-# `rsbar.set`/bracket membership accept SketchyBar's `/pattern/` item-name
-# regexes; there is no protocol concept of these, so they are resolved here,
-# against a `Query::Items` snapshot, entirely client-side.
+# `rsbar.set`/bracket membership accept `SketchyBar`'s `/pattern/` item-name
+# regexes; the daemon is what actually resolves one against its own live item
+# list (`Selector::Pattern`), but compiling it here too, and discarding the
+# result, is what turns a malformed pattern into a named error at the call
+# site instead of a daemon rejection three requests later.
 regex = "1"
+# `ItemState`/`BarState` are already `Serialize` in exactly the shape a query
+# result should hand back to a config — see `convert::serde_table`.
+serde = { workspace = true }
 
 [lints]
 workspace = true
