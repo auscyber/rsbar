@@ -10,7 +10,7 @@ use crate::sources::observers::{Observers, ToEvent};
 use crate::sources::{Cause, Emitter, Registering, Registration, Source, SourceId, StartError};
 use objc2_app_kit::{NSRunningApplication, NSWorkspace};
 use objc2_foundation::{NSNotification, NSString};
-use rsbar_protocol::event::{FrontApp, SpaceChange, SystemWillSleep, SystemWoke};
+use rsbar_protocol::event::{FrontApp, SystemWillSleep, SystemWoke};
 use rsbar_protocol::{Event, Kind};
 use std::collections::BTreeSet;
 
@@ -33,12 +33,6 @@ fn front_app(note: &NSNotification) -> Event {
     Event::FrontAppSwitched(FrontApp { app })
 }
 
-fn space_changed(_: &NSNotification) -> Event {
-    // The notification says only that it happened; which space is a separate
-    // question the window server answers.
-    Event::SpaceChanged(SpaceChange::default())
-}
-
 fn will_sleep(_: &NSNotification) -> Event {
     Event::SystemWillSleep(SystemWillSleep {})
 }
@@ -57,7 +51,6 @@ impl Source for Workspace {
     fn provides(&self) -> Vec<Kind> {
         vec![
             Kind::FrontAppSwitched,
-            Kind::SpaceChanged,
             Kind::SystemWoke,
             Kind::SystemWillSleep,
         ]
@@ -102,11 +95,6 @@ fn install(observers: &mut Observers, wanted: &BTreeSet<Kind>, emit: &Emitter) {
             Kind::FrontAppSwitched,
             unsafe { objc2_app_kit::NSWorkspaceDidActivateApplicationNotification },
             front_app as ToEvent,
-        ),
-        (
-            Kind::SpaceChanged,
-            unsafe { objc2_app_kit::NSWorkspaceActiveSpaceDidChangeNotification },
-            space_changed as ToEvent,
         ),
         (
             Kind::SystemWillSleep,

@@ -38,12 +38,16 @@
 //! config never mentions `volume_changed` should not pay it, so the registry
 //! starts a source the first time an item subscribes to something it provides.
 
+pub mod brightness;
 pub mod config;
 pub mod displays;
+pub mod media;
 pub mod mouse;
 pub mod observers;
 pub mod power;
+pub mod spaces;
 pub mod volume;
+pub mod wifi;
 pub mod workspace;
 
 use bevy_ecs::entity::Entity;
@@ -277,6 +281,18 @@ pub enum Cause {
     /// only be the registry pairing them up wrongly.
     #[error("the registration does not belong to this source")]
     MismatchedRegistration,
+    /// `DisplayServicesCanChangeBrightness` says the display has no
+    /// brightness control to observe.
+    #[error("this display has no brightness control")]
+    NoBrightnessControl,
+    /// `SCDynamicStore` refused to create the store, set its notification
+    /// keys, or hand back a run loop source.
+    #[error("SCDynamicStore refused the registration")]
+    DynamicStore,
+    /// `MediaRemote`'s now-playing calls are entitlement-gated as of macOS
+    /// 15.3 and silently produce nothing for a process without one.
+    #[error("MediaRemote is entitlement-blocked on this OS")]
+    MediaRemoteBlocked,
 }
 
 /// A source that could not start, and which one.
@@ -837,6 +853,10 @@ impl Registry {
             Box::new(power::Power),
             Box::new(mouse::Mouse),
             Box::new(volume::Volume),
+            Box::new(brightness::Brightness),
+            Box::new(wifi::Wifi),
+            Box::new(spaces::Spaces),
+            Box::new(media::Media),
         ];
 
         let mut providers: HashMap<Kind, Vec<SourceId>> = HashMap::new();

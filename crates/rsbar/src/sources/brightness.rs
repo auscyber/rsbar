@@ -1,9 +1,12 @@
 //! Display brightness changes, from `DisplayServices`.
 //!
-//! Verified against the real hardware: a spike binary registered exactly this
-//! way, a synthetic `NX_KEYTYPE_BRIGHTNESS_*` key event was posted through
-//! `CGEventPost` (what the F1/F2 keys actually send), and the callback fired
-//! with the display's new value both times.
+//! Verified against the real hardware: `examples/source_probe.rs` registers
+//! exactly this way, calls `DisplayServicesSetBrightness` on the main display
+//! (the sibling of the getter and the notification this observes) to nudge it
+//! up and back down, and the callback fired both times with the display's
+//! real new value. Also verified through a stop/start cycle — drop the only
+//! claim, take a fresh one, trigger again — which is what caught the sink
+//! going stale; see the module-level note on why the cell is repointed.
 //!
 //! # The passthrough is not a context pointer
 //!
@@ -15,14 +18,28 @@
 //! `SketchyBar` does, and what this does too, is pass the display id itself as
 //! the passthrough, so the callback already has the one thing it needs to
 //! look up the brightness. The [`Emitter`] then has nowhere to travel through
-//! the callback's arguments, so it lives in a process-wide cell instead —
-//! sound here only because this source is registered once for the process's
-//! one main display, never per-instance.
+//! the callback's arguments, so it lives in a process-wide cell instead.
+//!
+//! That cell has to be *repointed*, not just set once: the registry starts and
+//! stops this source lazily as items subscribe and unsubscribe, and
+//! `DisplayServicesUnregisterForBrightnessChangeNotifications` genuinely
+//! deregisters (unlike `SkyLight`'s notify procs), so a later `register()` is
+//! a real re-registration, not a formality. A `OnceCell` set only on the first
+//! call would leave every later registration's callback writing into a sink
+//! whose receiver had already been dropped — the exact "registers, reports
+//! success, and never fires" failure this crate watches for. A lock that can
+//! be overwritten is what makes each registration's sink the one the callback
+//! actually uses.
+//!
+//! `tokio::sync::Mutex` rather than `std::sync::Mutex`: the crate's rule is
+//! `tokio::sync` for locks, and `blocking_lock` is the documented way to use
+//! one outside an async context, which a `DisplayServices` callback always is.
 
 use crate::sources::{Cause, Emitter, Registering, Registration, Source, SourceId, StartError};
 use objc2_core_graphics::{CGDirectDisplayID, CGError, CGMainDisplayID};
 use rsbar_protocol::event::BrightnessChange;
 use rsbar_protocol::{Event, Kind};
+use std::collections::BTreeSet;
 use std::ffi::c_void;
 
 #[link(name = "DisplayServices", kind = "framework")]
@@ -56,8 +73,9 @@ type Callback = extern "C-unwind" fn(
     info: *mut c_void,
 );
 
-/// Nowhere else for the sink to live; see the module docs.
-static EMITTER: tokio::sync::OnceCell<Emitter> = tokio::sync::OnceCell::const_new();
+/// Nowhere else for the sink to live; see the module docs. Repointed on every
+/// registration, not just the first.
+static EMITTER: tokio::sync::Mutex<Option<Emitter>> = tokio::sync::Mutex::const_new(None);
 
 /// A 0.0-1.0 scalar as a whole percentage, following `volume`'s reading of one.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -79,7 +97,9 @@ extern "C-unwind" fn changed(
     _sender: *const c_void,
     _info: *mut c_void,
 ) {
-    let Some(emit) = EMITTER.get() else {
+    // Called from `DisplayServices`, never from async code — a blocking lock
+    // is the right tool, and the only one available.
+    let Some(emit) = EMITTER.blocking_lock().clone() else {
         return;
     };
     let Some(brightness) = current_brightness(display) else {
@@ -99,6 +119,10 @@ impl Drop for Watch {
         unsafe {
             DisplayServicesUnregisterForBrightnessChangeNotifications(self.display, self.display);
         }
+        // Not strictly required — the callback is unregistered above — but
+        // leaves nothing for a stray late callback to send into a channel
+        // whose receiver is gone.
+        *EMITTER.blocking_lock() = None;
     }
 }
 
@@ -113,7 +137,11 @@ impl Source for Brightness {
         vec![Kind::BrightnessChanged]
     }
 
-    fn register(&mut self, cx: &mut Registering<'_>) -> Result<Registration, StartError> {
+    fn register(
+        &mut self,
+        _wanted: &BTreeSet<Kind>,
+        cx: &mut Registering<'_>,
+    ) -> Result<Registration, StartError> {
         let emit = cx.emitter();
         let display = CGMainDisplayID();
 
@@ -122,9 +150,9 @@ impl Source for Brightness {
             return Err(StartError::new(self.id(), Cause::NoBrightnessControl));
         }
 
-        // Only ever set once: this source registers on one display for the
-        // life of the process. See the module docs.
-        let _ = EMITTER.set(emit);
+        // Repointed on every registration — see the module docs for why a
+        // one-shot `OnceCell` would go stale across a stop/start cycle.
+        *EMITTER.blocking_lock() = Some(emit);
 
         // SAFETY: `display` is passed back as the passthrough, which is what
         // the callback's `display` parameter recovers it from.
