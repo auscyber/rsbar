@@ -235,10 +235,27 @@ pub fn repaint(
         return;
     }
 
+    // One window server update for every panel, not one per panel. Each
+    // `draw` publishes its window as it finishes, so without this a second
+    // display shows the previous frame until its own turn comes round — and
+    // every panel erases to the background before its items go back down,
+    // which is a flash of empty bar if that lands on screen by itself.
+    skylight::batched(|| {
+        paint_panels(&items, &cache, &panels, &settings, &mut placements);
+    });
+}
+
+fn paint_panels(
+    items: &ItemQuery,
+    cache: &Cache,
+    panels: &Panels,
+    settings: &Settings,
+    placements: &mut Placements,
+) {
     for panel in panels.iter() {
         let size = panel.frame.size;
         // Layout depends on the panel's width, so it is per display.
-        let placed = place(&items, &cache, size);
+        let placed = place(items, cache, size);
         placements.0.push(PanelPlacements {
             display: panel.display.id,
             frame: panel.frame,
