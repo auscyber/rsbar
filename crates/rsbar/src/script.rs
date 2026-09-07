@@ -16,7 +16,7 @@
 //! the pipes produced is the truth, and a lost reap is logged at debug rather
 //! than reported as a failure.
 
-use rsbar_protocol::{Event, ItemName};
+use rsbar_protocol::{Event, Info, ItemName};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -27,7 +27,7 @@ pub struct Job {
     pub item: ItemName,
     pub script: String,
     pub sender: Event,
-    pub info: Option<String>,
+    pub info: Info,
 }
 
 /// A fixed pool of workers.
@@ -114,7 +114,7 @@ fn run(job: &Job) {
     let mut child = match command
         .env("RSBAR_NAME", job.item.as_str())
         .env("RSBAR_SENDER", job.sender.name())
-        .env("RSBAR_INFO", job.info.as_deref().unwrap_or(""))
+        .envs(job.info.env())
         .env("RSBAR_SERVICE", rsbar_protocol::service_name())
         .stdin(Stdio::null())
         .stdout(Stdio::null())

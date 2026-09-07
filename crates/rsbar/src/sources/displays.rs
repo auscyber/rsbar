@@ -4,24 +4,15 @@
 //! *active* display changes, not when the set of them does. Plugging in a
 //! monitor arrives only here, and it invalidates every panel's geometry.
 
-use crate::sources::{Emission, Emitter, Registration, Source, SourceId, StartError};
+use crate::sources::{
+    CallbackState, Cause, Emission, Emitter, Registration, Source, SourceId, StartError,
+};
 use objc2_core_graphics::{
     CGDirectDisplayID, CGDisplayChangeSummaryFlags, CGDisplayRegisterReconfigurationCallback,
     CGDisplayRemoveReconfigurationCallback,
 };
 use rsbar_protocol::Event;
 use std::ffi::c_void;
-
-/// Recovers the emitter a registration was made with.
-///
-/// # Safety
-///
-/// `context` must be the pointer `install` passed, on an emitter that is still
-/// alive — which is why the one this module makes is leaked.
-unsafe fn emitter_from(context: *mut c_void) -> Option<&'static Emitter> {
-    // SAFETY: the caller guarantees provenance and liveness.
-    unsafe { context.cast::<Emitter>().as_ref() }
-}
 
 extern "C-unwind" fn reconfigured(
     _display: CGDirectDisplayID,
@@ -36,21 +27,22 @@ extern "C-unwind" fn reconfigured(
     if flags.contains(CGDisplayChangeSummaryFlags::BeginConfigurationFlag) {
         return;
     }
-    // SAFETY: the registration passes the leaked emitter.
-    if let Some(emit) = unsafe { emitter_from(context) } {
+    // SAFETY: the registration passed a `CallbackState<Emitter>` pointer.
+    if let Some(emit) = unsafe { CallbackState::<Emitter>::recover(context) } {
         // Dropping beats blocking: this is a `CoreGraphics` callback.
-        emit.send(Emission::new(Event::DisplayChanged, None));
+        emit.send(Emission::bare(Event::DisplayChanged));
     }
 }
 
 /// Deregisters on drop.
-struct Deregister(&'static Emitter);
+struct Deregister(CallbackState<Emitter>);
 
 impl Drop for Deregister {
     fn drop(&mut self) {
-        let context = std::ptr::from_ref(self.0).cast_mut().cast::<c_void>();
-        // SAFETY: the same callback and context `install` registered.
-        unsafe { CGDisplayRemoveReconfigurationCallback(Some(reconfigured), context) };
+        self.0.with_ptr(|context| {
+            // SAFETY: the same callback and context `register` passed.
+            unsafe { CGDisplayRemoveReconfigurationCallback(Some(reconfigured), context) };
+        });
     }
 }
 
@@ -66,19 +58,14 @@ impl Source for Displays {
     }
 
     fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {
-        // Leaked, as in the other sources: the callback dereferences it and
-        // nothing waits for one in flight. A source starts once per process.
-        let emit: &'static Emitter = Box::leak(Box::new(emit));
-        let context = std::ptr::from_ref(emit).cast_mut().cast::<c_void>();
-        // SAFETY: `emit` is leaked, so the context outlives the registration.
-        let status =
-            unsafe { CGDisplayRegisterReconfigurationCallback(Some(reconfigured), context) };
+        let state = CallbackState::new(emit);
+        let status = state.with_ptr(|context| {
+            // SAFETY: the state outlives the registration; see `CallbackState`.
+            unsafe { CGDisplayRegisterReconfigurationCallback(Some(reconfigured), context) }
+        });
         if status != objc2_core_graphics::CGError::Success {
-            return Err(StartError {
-                name: "displays",
-                reason: format!("CoreGraphics refused the callback ({status:?})"),
-            });
+            return Err(StartError::new(self.id(), Cause::CoreGraphics(status)));
         }
-        Ok(Box::new(Deregister(emit)))
+        Ok(Box::new(Deregister(state)))
     }
 }

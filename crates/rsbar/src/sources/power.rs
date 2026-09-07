@@ -1,8 +1,10 @@
 //! Power source changes, from `IOKit`.
 
-use crate::sources::{Emission, Emitter, Registration, Source, SourceId, StartError};
+use crate::sources::{
+    CallbackState, Cause, Emission, Emitter, Registration, Source, SourceId, StartError,
+};
 use objc2_core_foundation::{CFRetained, CFRunLoop, CFRunLoopSource, CFString, CFType};
-use rsbar_protocol::Event;
+use rsbar_protocol::{Event, Info, PowerSource};
 use std::ffi::c_void;
 
 #[link(name = "IOKit", kind = "framework")]
@@ -19,26 +21,23 @@ unsafe extern "C" {
 }
 
 /// Whether the machine is on mains or on battery right now.
-///
-/// Reported to scripts as `RSBAR_INFO`, so the spelling is part of the
-/// interface: `AC` or `BATTERY`.
 #[must_use]
-pub fn providing_source() -> String {
+pub fn providing_source() -> PowerSource {
     // SAFETY: the snapshot is a +1 `CoreFoundation` object released below, and
     // the type string it hands back is borrowed from it.
     unsafe {
         let snapshot = IOPSCopyPowerSourcesInfo();
         if snapshot.is_null() {
-            return "UNKNOWN".to_owned();
+            return PowerSource::Unknown;
         }
         let kind = IOPSGetProvidingPowerSourceType(snapshot);
         let name = if kind.is_null() {
-            "UNKNOWN".to_owned()
+            PowerSource::Unknown
         } else {
             match (*kind).to_string().as_str() {
-                "AC Power" => "AC".to_owned(),
-                "Battery Power" => "BATTERY".to_owned(),
-                other => other.to_owned(),
+                "AC Power" => PowerSource::Ac,
+                "Battery Power" => PowerSource::Battery,
+                _ => PowerSource::Unknown,
             }
         };
         skylight::ffi::CFRelease(snapshot);
@@ -52,38 +51,30 @@ struct Watch {
     run_loop: CFRetained<CFRunLoop>,
 }
 
-/// Recovers the emitter a notification was registered with.
-///
-/// # Safety
-///
-/// `context` must be the pointer `install` passed, on an emitter that is still
-/// alive — which is why the one this module makes is leaked.
-unsafe fn emitter_from(context: *mut c_void) -> Option<&'static Emitter> {
-    // SAFETY: the caller guarantees provenance and liveness.
-    unsafe { context.cast::<Emitter>().as_ref() }
-}
-
 impl Watch {
     /// Starts reporting power source changes on the current run loop.
-    fn install(emit: &'static Emitter) -> Result<Self, StartError> {
+    fn install(state: &CallbackState<Emitter>) -> Result<Self, StartError> {
         extern "C-unwind" fn changed(context: *mut c_void) {
-            // SAFETY: the registration passes the leaked emitter.
-            let Some(emit) = (unsafe { emitter_from(context) }) else {
+            // SAFETY: the registration passed a `CallbackState<Emitter>` pointer.
+            let Some(emit) = (unsafe { CallbackState::<Emitter>::recover(context) }) else {
                 return;
             };
-            let emission = Emission::new(Event::PowerSourceChanged, Some(providing_source()));
+            let emission = Emission::new(
+                Event::PowerSourceChanged,
+                Info::Power {
+                    source: providing_source(),
+                },
+            );
             // Dropping beats blocking: this is an `IOKit` callback.
             emit.send(emission);
         }
 
-        // SAFETY: `emit` is leaked, so the context outlives the registration.
-        let context = std::ptr::from_ref(emit).cast_mut().cast::<c_void>();
-        let source = unsafe { IOPSNotificationCreateRunLoopSource(changed, context) };
+        let source = state.with_ptr(|context| {
+            // SAFETY: the state outlives the registration; see `CallbackState`.
+            unsafe { IOPSNotificationCreateRunLoopSource(changed, context) }
+        });
         let Some(source) = std::ptr::NonNull::new(source) else {
-            return Err(StartError {
-                name: "power",
-                reason: "IOKit refused a notification source".to_owned(),
-            });
+            return Err(StartError::new(SourceId("power"), Cause::IoKit));
         };
         // SAFETY: the call returns a +1 reference we now own.
         let source = unsafe { CFRetained::from_raw(source) };
@@ -108,11 +99,8 @@ impl Source for Power {
     }
 
     fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {
-        // Leaked for the same reason the volume source leaks its state: the
-        // callback dereferences this, and there is no call that waits for one
-        // in flight to finish. A source starts at most once per process.
-        let emit: &'static Emitter = Box::leak(Box::new(emit));
-        Ok(Box::new(Watch::install(emit)?))
+        let state = CallbackState::new(emit);
+        Ok(Box::new(Watch::install(&state)?))
     }
 }
 

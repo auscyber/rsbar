@@ -4,7 +4,8 @@ use async_mach_ports::{SendPort, Sender};
 use clap::{Args, Parser, Subcommand};
 use rsbar_protocol::style::Color;
 use rsbar_protocol::{
-    BarPatch, Edge, Event, ItemName, ItemPatch, Position, Query, Request, Response, service_name,
+    BarPatch, Edge, Event, Info, ItemName, ItemPatch, Json, Position, Query, Request, Response,
+    service_name,
 };
 use std::process::ExitCode;
 
@@ -15,6 +16,9 @@ struct Cli {
     command: Command,
 }
 
+// Doc comments here are clap's `--help` text, not rustdoc, so backticks would
+// show up verbatim in the terminal.
+#[allow(clippy::doc_markdown)]
 #[derive(Subcommand)]
 enum Command {
     /// Change the bar itself.
@@ -36,7 +40,8 @@ enum Command {
     Trigger {
         #[arg(value_parser = parse_event)]
         event: Event,
-        /// Passed to scripts as `RSBAR_INFO`.
+        /// Passed to scripts as RSBAR_INFO. JSON if it parses as JSON,
+        /// otherwise a plain string.
         #[arg(long)]
         info: Option<String>,
     },
@@ -224,7 +229,14 @@ fn main() -> ExitCode {
             QueryWhat::Items => Query::Items,
             QueryWhat::Item { name } => Query::Item(name),
         }),
-        Command::Trigger { event, info } => Request::Trigger { event, info },
+        // A triggered event carries free text: the daemon cannot know what a
+        // config invented, only what it said.
+        Command::Trigger { event, info } => Request::Trigger {
+            event,
+            info: info.map_or(Info::None, |text| {
+                Info::Custom(Json::parse_or_string(&text))
+            }),
+        },
         Command::Update => Request::UpdateAll,
         Command::Reload => Request::Reload,
         Command::Shutdown => Request::Shutdown,

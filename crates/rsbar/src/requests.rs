@@ -17,7 +17,7 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::system::SystemParam;
 use rsbar_protocol::style::{Color, FontSpec};
 use rsbar_protocol::{
-    Event, ItemName, ItemPatch, ItemState, Query as ProtocolQuery, Request, Response,
+    Event, Info, ItemName, ItemPatch, ItemState, Query as ProtocolQuery, Request, Response,
 };
 
 /// Every component a request can write.
@@ -75,7 +75,7 @@ pub struct ItemsRead<'w, 's> {
 impl Items<'_, '_> {
     /// The scripts to run for `event`, read through the write query.
     #[must_use]
-    pub fn jobs_for(&self, event: &Event, info: Option<&str>) -> Vec<Job> {
+    pub fn jobs_for(&self, event: &Event, info: &Info) -> Vec<Job> {
         self.write
             .iter()
             .filter(|row| row.9.0.contains(event))
@@ -84,7 +84,7 @@ impl Items<'_, '_> {
                     item: row.0.0.clone(),
                     script: row.10?.0.clone(),
                     sender: event.clone(),
-                    info: info.map(ToOwned::to_owned),
+                    info: info.clone(),
                 })
             })
             .collect()
@@ -100,7 +100,7 @@ impl Items<'_, '_> {
                     item: row.0.0.clone(),
                     script: row.10?.0.clone(),
                     sender: Event::Forced,
-                    info: None,
+                    info: Info::None,
                 })
             })
             .collect()
@@ -155,7 +155,7 @@ impl ItemsRead<'_, '_> {
     /// The scripts to run for `event`. Items without a script are skipped:
     /// subscribing a scriptless item is legal and simply does nothing.
     #[must_use]
-    pub fn jobs_for(&self, event: &Event, info: Option<&str>) -> Vec<Job> {
+    pub fn jobs_for(&self, event: &Event, info: &Info) -> Vec<Job> {
         self.read
             .iter()
             .filter(|(.., subscriptions, _)| subscriptions.0.contains(event))
@@ -164,7 +164,7 @@ impl ItemsRead<'_, '_> {
                     item: name.0.clone(),
                     script: script?.0.clone(),
                     sender: event.clone(),
-                    info: info.map(ToOwned::to_owned),
+                    info: info.clone(),
                 })
             })
             .collect()
@@ -180,7 +180,7 @@ impl ItemsRead<'_, '_> {
                     item: name.0.clone(),
                     script: script?.0.clone(),
                     sender: Event::Forced,
-                    info: None,
+                    info: Info::None,
                 })
             })
             .collect()
@@ -368,7 +368,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
         Request::Trigger { event, info } => {
             tracing::debug!(%event, ?info, "trigger");
             Outcome {
-                jobs: items.jobs_for(&event, info.as_deref()),
+                jobs: items.jobs_for(&event, &info),
                 ..Outcome::ok()
             }
         }

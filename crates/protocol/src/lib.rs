@@ -6,9 +6,13 @@
 #![cfg(target_os = "macos")]
 
 pub mod event;
+pub mod info;
+pub mod json;
 pub mod style;
 
 pub use event::Event;
+pub use info::{Info, PowerSource};
+pub use json::Json;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -185,7 +189,7 @@ pub enum Request {
     /// Fires an event now, as if a source had produced it.
     Trigger {
         event: Event,
-        info: Option<String>,
+        info: Info,
     },
     /// Runs every item's script immediately, ignoring update frequency.
     UpdateAll,

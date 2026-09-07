@@ -4,7 +4,7 @@
 //! stream everything else does.
 
 use crate::config::{self, Debounce, Shared};
-use crate::sources::{Emission, Emitter, Registration, Source, SourceId, StartError};
+use crate::sources::{Cause, Emission, Emitter, Registration, Source, SourceId, StartError};
 use notify::{RecursiveMode, Watcher as _};
 use rsbar_protocol::Event;
 use std::time::Duration;
@@ -27,10 +27,7 @@ impl Source for Watcher {
 
     fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {
         let Some(path) = self.config.blocking_read().path.clone() else {
-            return Err(StartError {
-                name: "config",
-                reason: "there is no config file".to_owned(),
-            });
+            return Err(StartError::new(self.id(), Cause::NoConfigFile));
         };
 
         // Watch the directory, not the file. Editors save by writing a
@@ -39,10 +36,7 @@ impl Source for Watcher {
         // again.
         let directory = path
             .parent()
-            .ok_or_else(|| StartError {
-                name: "config",
-                reason: format!("{} has no parent directory", path.display()),
-            })?
+            .ok_or_else(|| StartError::new(self.id(), Cause::NoParentDirectory(path.clone())))?
             .to_path_buf();
 
         let watched = path.clone();
@@ -56,19 +50,13 @@ impl Source for Watcher {
                 if !debounce.admit() {
                     return;
                 }
-                emit.send(Emission::new(Event::ConfigReloaded, None));
+                emit.send(Emission::bare(Event::ConfigReloaded));
             })
-            .map_err(|err| StartError {
-                name: "config",
-                reason: err.to_string(),
-            })?;
+            .map_err(|err| StartError::new(SourceId("config"), Cause::from(err)))?;
 
         observer
             .watch(&directory, RecursiveMode::NonRecursive)
-            .map_err(|err| StartError {
-                name: "config",
-                reason: err.to_string(),
-            })?;
+            .map_err(|err| StartError::new(SourceId("config"), Cause::from(err)))?;
 
         tracing::info!(path = %path.display(), "watching config");
         Ok(Box::new(observer))

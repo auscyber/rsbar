@@ -32,6 +32,7 @@ objc2-core-text = { version = "0.3", default-features = false }
 objc2-foundation = { version = "0.3", default-features = false }
 objc2-quartz-core = { version = "0.3", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 # The `sync` feature alone: channels and locks work with no runtime, which
 # matters because this daemon deliberately has none — its executor is the
 # CFRunLoop-driven Bevy runner.

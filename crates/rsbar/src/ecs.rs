@@ -272,7 +272,7 @@ fn dispatch_events(
         // reload the same way it subscribes to anything else.
         queue
             .0
-            .extend(read.jobs_for(&emission.event, emission.info.as_deref()));
+            .extend(read.jobs_for(&emission.event, &emission.info));
     }
 }
 
@@ -378,7 +378,7 @@ fn tick(
                 item: name.0.clone(),
                 script: script.0.clone(),
                 sender: rsbar_protocol::Event::Routine,
-                info: None,
+                info: rsbar_protocol::Info::None,
             });
         }
     }

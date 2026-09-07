@@ -6,11 +6,11 @@ use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2_app_kit::{NSRunningApplication, NSWorkspace};
 use objc2_foundation::{NSNotification, NSNotificationCenter, NSNotificationName, NSString};
-use rsbar_protocol::Event;
+use rsbar_protocol::{Event, Info};
 
 /// What a notification contributes to `RSBAR_INFO`, beyond the bare fact that
 /// it happened.
-type ExtractInfo = fn(&NSNotification) -> Option<String>;
+type ExtractInfo = fn(&NSNotification) -> Info;
 
 /// Keeps observers registered. Dropping it deregisters them, on the thread that
 /// registered them.
@@ -66,22 +66,28 @@ impl Drop for Observers {
 }
 
 /// Notifications that carry nothing worth passing on.
-fn no_info(_: &NSNotification) -> Option<String> {
-    None
+fn no_info(_: &NSNotification) -> Info {
+    Info::None
 }
 
 /// The localized name of the application a workspace notification is about.
-fn app_name(note: &NSNotification) -> Option<String> {
-    let info = note.userInfo()?;
+fn app_name(note: &NSNotification) -> Info {
+    let Some(info) = note.userInfo() else {
+        return Info::None;
+    };
     let key = NSString::from_str("NSWorkspaceApplicationKey");
     // A checked downcast rather than a transmute: the key is documented to hold
     // an NSRunningApplication, but this dictionary comes from another process's
     // notification, so it is worth actually verifying.
-    let app = info
-        .objectForKey(&key)?
-        .downcast::<NSRunningApplication>()
-        .ok()?;
-    app.localizedName().map(|name| name.to_string())
+    let Some(app) = info
+        .objectForKey(&key)
+        .and_then(|value| value.downcast::<NSRunningApplication>().ok())
+    else {
+        return Info::None;
+    };
+    app.localizedName().map_or(Info::None, |name| Info::App {
+        name: name.to_string(),
+    })
 }
 
 pub struct Workspace;
