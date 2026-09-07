@@ -20,7 +20,8 @@ use bevy_ecs::query::QueryData;
 use bevy_ecs::system::SystemParam;
 use rsbar_protocol::style::{Color, FontSpec};
 use rsbar_protocol::{
-    Event, ItemName, ItemPatch, ItemState, Kind, Query as ProtocolQuery, Request, Response,
+    BackgroundPatch, Event, ItemName, ItemPatch, ItemState, Kind, Query as ProtocolQuery, Request,
+    Response, RunPatch,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -615,29 +616,16 @@ fn set_item(
     // `SetItem`, including ones that only set an update frequency. That fed
     // straight into `reshape` and `needs_repaint`, so a script re-setting an
     // unchanged value repainted the bar for as long as it kept running.
-    if let Some(next) = patched_run(
-        &icon.0,
-        patch.icon.as_deref(),
-        patch.icon_font.as_deref(),
-        patch.icon_color,
-    ) {
+    if let Some(next) = patched_run(&icon.0, patch.icon.as_ref()) {
         icon.0 = next;
     }
-    if let Some(next) = patched_run(
-        &label.0,
-        patch.label.as_deref(),
-        patch.label_font.as_deref(),
-        patch.label_color,
-    ) {
+    if let Some(next) = patched_run(&label.0, patch.label.as_ref()) {
         label.0 = next;
     }
+    if let Some(next) = patched_background(background, patch.background.as_ref()) {
+        **background = next;
+    }
 
-    if let Some(c) = patch.background_color {
-        background.color = Color(c);
-    }
-    if let Some(r) = patch.corner_radius {
-        background.corner_radius = r;
-    }
     if let Some(p) = patch.padding_left {
         padding.left = p;
     }
@@ -705,31 +693,56 @@ fn set_item(
 /// reaches for the `Mut`. `Mut::as_mut` is a `deref_mut`: touching a component
 /// at all marks it changed, and a component marked changed reshapes its text
 /// and repaints its rect whether or not a pixel moved.
-fn patched_run(
-    current: &Run,
-    string: Option<&str>,
-    font: Option<&str>,
-    color: Option<u32>,
-) -> Option<Run> {
-    let font = font.map(FontSpec::parse);
-    let differs = string.is_some_and(|s| s != current.string)
-        || font.as_ref().is_some_and(|f| *f != current.font)
-        || color.is_some_and(|c| Color(c) != current.color);
-    if !differs {
-        return None;
-    }
-
+fn patched_run(current: &Run, patch: Option<&RunPatch>) -> Option<Run> {
+    let patch = patch?;
     let mut next = current.clone();
-    if let Some(s) = string {
+    if let Some(s) = &patch.text {
         s.clone_into(&mut next.string);
     }
-    if let Some(f) = font {
-        next.font = f;
+    if let Some(f) = &patch.font {
+        next.font = FontSpec::parse(f);
     }
-    if let Some(c) = color {
+    if let Some(c) = patch.color {
         next.color = Color(c);
     }
-    Some(next)
+    if let Some(d) = patch.drawing {
+        next.drawing = d;
+    }
+    if let Some(p) = patch.padding_left {
+        next.padding_left = p;
+    }
+    if let Some(p) = patch.padding_right {
+        next.padding_right = p;
+    }
+    (next != *current).then_some(next)
+}
+
+/// The same for the surface behind an item.
+fn patched_background(current: &Background, patch: Option<&BackgroundPatch>) -> Option<Background> {
+    let patch = patch?;
+    let mut next = *current;
+    if let Some(c) = patch.color {
+        next.color = Color(c);
+    }
+    if let Some(r) = patch.corner_radius {
+        next.corner_radius = r;
+    }
+    if let Some(h) = patch.height {
+        next.height = h;
+    }
+    if let Some(p) = patch.padding_left {
+        next.padding_left = p;
+    }
+    if let Some(p) = patch.padding_right {
+        next.padding_right = p;
+    }
+    if let Some(c) = patch.border_color {
+        next.border_color = Color(c);
+    }
+    if let Some(w) = patch.border_width {
+        next.border_width = w;
+    }
+    (next != *current).then_some(next)
 }
 
 const _: fn(&Run) = |_| {};

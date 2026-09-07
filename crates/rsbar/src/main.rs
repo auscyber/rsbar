@@ -32,6 +32,18 @@ const REQUEST_QUEUE: usize = 1024;
 fn main() -> std::process::ExitCode {
     init_tracing();
 
+    // One binary, two modes, the way `sketchybar` works: bare, it is the
+    // daemon; with a command, it talks to a running one. They are the same
+    // program on purpose — a separate client is a second copy of the wire
+    // format, and the two drifted the first time a field was added to a
+    // request, with every message failing to decode until both were rebuilt.
+    let mut args = std::env::args();
+    let _binary = args.next();
+    let args: Vec<String> = args.collect();
+    if !args.is_empty() {
+        return rsbar::cli::run(args.into_iter());
+    }
+
     let service = service_name();
     let receiver = match Receiver::<Request>::bind(&service) {
         Ok(receiver) => receiver,

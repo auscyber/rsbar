@@ -105,30 +105,151 @@ fn opt_position(table: &Table, key: &str) -> mlua::Result<Option<Position>> {
 
 /// `icon = "text"` or `icon = { text = "...", color = 0x..., font = "Family:Style:Size" }`.
 /// Expands into the flat `text`/`color`/`font` fields a patch carries.
+#[derive(Default)]
 struct IconOrLabel {
     text: Option<String>,
     color: Option<u32>,
     font: Option<String>,
+    drawing: Option<bool>,
+    padding_left: Option<f64>,
+    padding_right: Option<f64>,
 }
 
 impl IconOrLabel {
+    /// `None` when the table said nothing at all, so an untouched half is left
+    /// alone rather than patched with a set of `None`s.
+    fn into_patch(self) -> Option<rsbar_protocol::RunPatch> {
+        let patch = rsbar_protocol::RunPatch {
+            text: self.text,
+            color: self.color,
+            font: self.font,
+            drawing: self.drawing,
+            padding_left: self.padding_left,
+            padding_right: self.padding_right,
+        };
+        (patch != rsbar_protocol::RunPatch::default()).then_some(patch)
+    }
+}
+
+/// The nested `background = { ... }` table.
+fn background_patch(table: &Table) -> mlua::Result<Option<rsbar_protocol::BackgroundPatch>> {
+    const KNOWN: &[&str] = &[
+        "color",
+        "corner_radius",
+        "height",
+        "padding_left",
+        "padding_right",
+        "border_color",
+        "border_width",
+    ];
+    let Some(sub) = opt::<Table>(table, "background")? else {
+        return Ok(None);
+    };
+    warn_unknown(&sub, "background", KNOWN);
+    Ok(Some(rsbar_protocol::BackgroundPatch {
+        color: opt_color(&sub, "color")?,
+        corner_radius: opt(&sub, "corner_radius")?,
+        height: opt(&sub, "height")?,
+        padding_left: opt(&sub, "padding_left")?,
+        padding_right: opt(&sub, "padding_right")?,
+        border_color: opt_color(&sub, "border_color")?,
+        border_width: opt(&sub, "border_width")?,
+    }))
+}
+
+/// Reports every key in `table` the caller does not know about.
+///
+/// Silence here is the failure this exists to stop: a converter reads the keys
+/// it recognises and ignores the rest, so a typo — or a property `SketchyBar` has
+/// and rsbar does not — configures nothing and says nothing. `label.drawing`
+/// and `icon.drawing` were both written during a config port, both dropped,
+/// and only found by reading this file.
+///
+/// Logged rather than rejected. A config that is right apart from one key
+/// should still come up, with the key named loudly enough to fix.
+fn warn_unknown(table: &Table, what: &str, known: &[&str]) {
+    for pair in table.clone().pairs::<Value, Value>().flatten() {
+        let Value::String(key) = pair.0 else { continue };
+        let Ok(key) = key.to_str() else { continue };
+        if known.contains(&&*key) {
+            continue;
+        }
+        // A key that is real but in the wrong place is the likelier mistake,
+        // and the more annoying one to find: `label = { drawing = false }`
+        // reads perfectly and does nothing, because `drawing` belongs to the
+        // item rather than to its label.
+        if known.as_ptr() != ITEM_KEYS.as_ptr()
+            && ITEM_KEYS.contains(&&*key)
+            && !known.contains(&&*key)
+        {
+            tracing::error!(
+                %what,
+                key = %key,
+                "unknown setting here; `{key}` belongs to the item, not to its `{what}`"
+            );
+            continue;
+        }
+        if let Some(guess) = nearest(&key, known) {
+            tracing::error!(%what, key = %key, "unknown setting; did you mean `{guess}`?");
+        } else {
+            tracing::error!(%what, key = %key, "unknown setting; it does nothing");
+        }
+    }
+}
+
+/// The known key closest to `key`, when one is close enough to be worth
+/// suggesting — a prefix, a suffix, or a one-character slip.
+fn nearest<'a>(key: &str, known: &[&'a str]) -> Option<&'a str> {
+    known
+        .iter()
+        .copied()
+        .find(|candidate| {
+            candidate.starts_with(key)
+                || candidate.ends_with(key)
+                || key.starts_with(*candidate)
+                || key.ends_with(candidate)
+        })
+        .or_else(|| {
+            known.iter().copied().find(|candidate| {
+                candidate.len().abs_diff(key.len()) <= 1
+                    && candidate
+                        .chars()
+                        .zip(key.chars())
+                        .filter(|(a, b)| a != b)
+                        .count()
+                        <= 1
+            })
+        })
+}
+
+impl IconOrLabel {
+    const KNOWN: &'static [&'static str] = &[
+        "text",
+        "color",
+        "font",
+        "drawing",
+        "padding_left",
+        "padding_right",
+    ];
+
     fn read(table: &Table, key: &str) -> mlua::Result<Self> {
         match table.get::<Value>(key)? {
-            Value::Nil => Ok(Self {
-                text: None,
-                color: None,
-                font: None,
-            }),
+            Value::Nil => Ok(Self::default()),
             Value::String(s) => Ok(Self {
                 text: Some(s.to_str()?.to_string()),
-                color: None,
-                font: None,
+                ..Self::default()
             }),
-            Value::Table(sub) => Ok(Self {
-                text: opt::<String>(&sub, "text")?,
-                color: opt_color(&sub, "color")?,
-                font: opt::<String>(&sub, "font")?,
-            }),
+            Value::Table(sub) => {
+                warn_unknown(&sub, key, Self::KNOWN);
+                Ok(Self {
+                    text: opt::<String>(&sub, "text")?,
+                    color: opt_color(&sub, "color")?,
+                    font: opt::<String>(&sub, "font")?,
+                    drawing: opt(&sub, "drawing")?,
+                    padding_left: opt(&sub, "padding_left")?,
+                    padding_right: opt(&sub, "padding_right")?,
+                })
+            }
             other => Err(mlua::Error::RuntimeError(format!(
                 "`{key}` must be a string or a table, got {}",
                 other.type_name()
@@ -142,7 +263,27 @@ impl IconOrLabel {
 /// # Errors
 ///
 /// Returns a Lua error if any field has the wrong type or an invalid value.
+/// Every key a bar table may carry.
+const BAR_KEYS: &[&str] = &[
+    "height",
+    "edge",
+    "color",
+    "margin",
+    "y_offset",
+    "corner_radius",
+    "blur_radius",
+    "hidden",
+    "topmost",
+];
+
+/// # Errors
+///
+/// Returns a Lua error if a value has the wrong type or cannot be parsed —
+/// a colour that is neither a number nor `#rrggbb`, or a position that names
+/// no bucket. An unrecognised *key* is logged rather than raised: a config
+/// that is right apart from one setting should still come up.
 pub fn bar_patch_from_table(table: &Table) -> mlua::Result<BarPatch> {
+    warn_unknown(table, "bar", BAR_KEYS);
     Ok(BarPatch {
         height: opt(table, "height")?,
         edge: opt::<String>(table, "edge")?
@@ -169,7 +310,46 @@ pub fn bar_patch_from_table(table: &Table) -> mlua::Result<BarPatch> {
 /// # Errors
 ///
 /// Returns a Lua error if any field has the wrong type or an invalid value.
+/// Every key an item table may carry. `icon` and `label` also accept the
+/// nested sugar table, whose own keys are checked separately.
+const ITEM_KEYS: &[&str] = &[
+    "icon",
+    "label",
+    "background",
+    "padding_left",
+    "padding_right",
+    "y_offset",
+    "position",
+    "drawing",
+    "script",
+    "click_script",
+    "alias",
+    "members",
+    "update_freq",
+];
+
+/// The items a bracket draws across, named in a list.
+fn opt_members(table: &Table) -> mlua::Result<Option<Vec<rsbar_protocol::ItemName>>> {
+    let Some(list) = opt::<Vec<String>>(table, "members")? else {
+        return Ok(None);
+    };
+    list.into_iter()
+        .map(|name| {
+            rsbar_protocol::ItemName::new(name)
+                .map_err(|err| mlua::Error::RuntimeError(err.to_string()))
+        })
+        .collect::<mlua::Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// # Errors
+///
+/// Returns a Lua error if a value has the wrong type or cannot be parsed —
+/// a colour that is neither a number nor `#rrggbb`, or a position that names
+/// no bucket. An unrecognised *key* is logged rather than raised: a config
+/// that is right apart from one setting should still come up.
 pub fn item_patch_from_table(table: &Table) -> mlua::Result<ItemPatch> {
+    warn_unknown(table, "item", ITEM_KEYS);
     let icon = IconOrLabel::read(table, "icon")?;
     let label = IconOrLabel::read(table, "label")?;
 
@@ -178,14 +358,9 @@ pub fn item_patch_from_table(table: &Table) -> mlua::Result<ItemPatch> {
         // `{ text = ... }` spellings of `icon`/`label` — there is no separate
         // flat key left to fall back to, and `icon`/`label` themselves are
         // not strings once they are a sugar table.
-        icon: icon.text,
-        label: label.text,
-        icon_font: icon.font.or(opt(table, "icon_font")?),
-        label_font: label.font.or(opt(table, "label_font")?),
-        icon_color: icon.color.or(opt_color(table, "icon_color")?),
-        label_color: label.color.or(opt_color(table, "label_color")?),
-        background_color: opt_color(table, "background_color")?,
-        corner_radius: opt(table, "corner_radius")?,
+        icon: icon.into_patch(),
+        label: label.into_patch(),
+        background: background_patch(table)?,
         padding_left: opt(table, "padding_left")?,
         padding_right: opt(table, "padding_right")?,
         y_offset: opt(table, "y_offset")?,
@@ -194,6 +369,7 @@ pub fn item_patch_from_table(table: &Table) -> mlua::Result<ItemPatch> {
         script: opt(table, "script")?,
         click_script: opt(table, "click_script")?,
         alias: opt(table, "alias")?,
+        members: opt_members(table)?,
         update_freq: opt(table, "update_freq")?,
     })
 }

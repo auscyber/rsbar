@@ -16,6 +16,9 @@ fn run(text: &str) -> Run {
         string: text.to_owned(),
         font: FontSpec::default(),
         color: Color(0xffff_ffff),
+        drawing: true,
+        padding_left: 0.0,
+        padding_right: 0.0,
     }
 }
 

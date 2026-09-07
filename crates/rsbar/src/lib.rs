@@ -4,6 +4,7 @@
 pub mod alias;
 mod alias_watch;
 pub mod bar;
+pub mod cli;
 pub mod components;
 pub mod config;
 pub mod display;

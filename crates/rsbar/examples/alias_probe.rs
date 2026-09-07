@@ -1,15 +1,10 @@
 //! Spike: prove alias capture actually works on this machine.
-//!
-//! Not wired into the crate (`alias.rs` isn't declared as a module in
-//! `lib.rs` yet), so this pulls the same source file in directly to exercise
-//! the real code rather than a copy of it.
 #![allow(clippy::too_many_lines)]
-#[path = "../src/alias.rs"]
-mod alias;
 
-use alias::{Alias, MenuBarItem, RawMenuBarWindow};
 use objc2_core_foundation::{CFRetained, CFString, CFType, CFURLPathStyle};
 use objc2_core_graphics::CGImage;
+use rsbar::alias;
+use rsbar::alias::{Alias, MenuBarItem, RawMenuBarWindow};
 use std::ffi::c_void;
 use std::process::Command;
 

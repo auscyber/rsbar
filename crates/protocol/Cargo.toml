@@ -11,6 +11,7 @@ repository.workspace = true
 bitflags = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+struct-patch = "0.14.1"
 thiserror = { workspace = true }
 
 [dev-dependencies]

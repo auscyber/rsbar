@@ -144,14 +144,12 @@ pub struct BarPatch {
 /// A partial update to one item.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ItemPatch {
-    pub icon: Option<String>,
-    pub label: Option<String>,
-    pub icon_font: Option<String>,
-    pub label_font: Option<String>,
-    pub icon_color: Option<u32>,
-    pub label_color: Option<u32>,
-    pub background_color: Option<u32>,
-    pub corner_radius: Option<f64>,
+    /// The glyph half of the item.
+    pub icon: Option<RunPatch>,
+    /// The text half of the item.
+    pub label: Option<RunPatch>,
+    /// The surface drawn behind the item.
+    pub background: Option<BackgroundPatch>,
     pub padding_left: Option<f64>,
     pub padding_right: Option<f64>,
     pub y_offset: Option<f64>,
@@ -168,15 +166,83 @@ pub struct ItemPatch {
     pub alias: Option<String>,
     /// The items this one draws behind, as one surface. An empty list stops
     /// it being a bracket.
-    ///
-    /// A bracket has no content of its own: it takes its frame from the items
-    /// it names and draws its background across them, which is how a group of
-    /// items gets one shared shape rather than several abutting ones.
     pub members: Option<Vec<ItemName>>,
     /// Seconds between routine updates. Zero means "only on subscribed
-    /// events", which is the right default for anything event-driven.
+    /// events".
     pub update_freq: Option<u32>,
 }
+
+// `struct_patch::Patch` compares each field to decide what a patch changed.
+// For floats clippy calls that suspicious; here the values are config literals
+// — a corner radius someone typed — not the result of arithmetic, so exact
+// comparison is exactly right. The allow sits here because the lint fires
+// inside the derive's own expansion, where an item-level allow does not reach.
+#[allow(clippy::float_cmp)]
+mod parts {
+    use super::{Deserialize, Serialize};
+
+    /// One half of an item's text: its glyph, or its label.
+    ///
+    /// A config writes this nested — `label.color`, or `{ label = { color = ... }
+    /// }` — because it is one thing on the other side too. [`RunPatch`] is
+    /// derived from it, so a new property is one line in one place and the two
+    /// cannot drift.
+    #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, struct_patch::Patch)]
+    #[patch(
+        name = "RunPatch",
+        attribute(derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize))
+    )]
+    pub struct Run {
+        pub text: String,
+        /// ARGB, the form the CLI parses `#rrggbb` into.
+        pub color: u32,
+        /// `Family:Style:Size`.
+        pub font: String,
+        /// Whether this half is drawn, independently of the item's own `drawing`
+        /// — an item that shows its glyph but not its text.
+        pub drawing: bool,
+        /// Space either side of this half alone, on top of the item's own.
+        pub padding_left: f64,
+        pub padding_right: f64,
+    }
+
+    /// A bare string is sugar for the text, which is how every config writes the
+    /// common case — `label = "12:00"` rather than `label = { text = "12:00" }`.
+    impl<S: Into<String>> From<S> for RunPatch {
+        fn from(text: S) -> Self {
+            Self {
+                text: Some(text.into()),
+                ..Self::default()
+            }
+        }
+    }
+
+    /// The surface drawn behind an item.
+    #[derive(
+        Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, struct_patch::Patch,
+    )]
+    #[patch(
+        name = "BackgroundPatch",
+        attribute(derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize))
+    )]
+    pub struct Background {
+        /// ARGB.
+        pub color: u32,
+        pub corner_radius: f64,
+        /// A fixed height, or zero for the bar's own. A shorter surface is how a
+        /// pill sits inside the bar with a margin above and below.
+        pub height: f64,
+        /// Inset from the item's own edges, so the surface can be tighter or
+        /// wider than what it sits behind.
+        pub padding_left: f64,
+        pub padding_right: f64,
+        /// ARGB.
+        pub border_color: u32,
+        pub border_width: f64,
+    }
+}
+
+pub use parts::{Background, BackgroundPatch, Run, RunPatch};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -306,8 +372,11 @@ mod tests {
         let request = Request::SetItem {
             name: ItemName::new("clock").unwrap(),
             patch: Box::new(ItemPatch {
-                label: Some("09:41".into()),
-                label_color: Some(0xffff_ffff),
+                label: Some(RunPatch {
+                    text: Some("09:41".into()),
+                    color: Some(0xffff_ffff),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
         };

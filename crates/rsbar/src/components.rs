@@ -41,6 +41,16 @@ pub struct Run {
     pub string: String,
     pub font: FontSpec,
     pub color: Color,
+    /// Space either side of this half alone, on top of the item's own.
+    pub padding_left: f64,
+    pub padding_right: f64,
+    /// Whether this half of the item is shown.
+    ///
+    /// Separate from the item's own `Drawing` so an icon can be shown without
+    /// its label, or the other way round — an item that reveals its text on
+    /// hover, or one that is only ever a glyph. Hiding a run takes its width
+    /// out of the layout as well as its ink off the screen.
+    pub drawing: bool,
 }
 
 impl Run {
@@ -50,14 +60,17 @@ impl Run {
             string: String::new(),
             font: FontSpec::parse(font),
             color,
+            drawing: true,
+            padding_left: 0.0,
+            padding_right: 0.0,
         }
     }
 
-    /// Empty text takes no space, so an icon-only item has no phantom gap
-    /// where its label would be.
+    /// Empty or hidden text takes no space, so an icon-only item has no
+    /// phantom gap where its label would be.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.string.is_empty()
+        self.string.is_empty() || !self.drawing
     }
 }
 
@@ -65,6 +78,17 @@ impl Run {
 pub struct Background {
     pub color: Color,
     pub corner_radius: f64,
+    /// A fixed height, or zero for the bar's own.
+    ///
+    /// A shorter surface than the bar is how a pill sits inside it with a
+    /// margin above and below, which is what most bars actually look like.
+    pub height: f64,
+    /// Inset from the item's own edges, so the surface can be tighter or
+    /// wider than the text it sits behind.
+    pub padding_left: f64,
+    pub padding_right: f64,
+    pub border_color: Color,
+    pub border_width: f64,
 }
 
 #[derive(Component, Debug, Clone, Copy, PartialEq)]
@@ -228,6 +252,11 @@ pub fn bundle(name: ItemName, position: Position) -> impl Bundle {
         Background {
             color: Color::TRANSPARENT,
             corner_radius: 0.0,
+            height: 0.0,
+            padding_left: 0.0,
+            padding_right: 0.0,
+            border_color: Color::TRANSPARENT,
+            border_width: 0.0,
         },
         Padding {
             left: 8.0,
