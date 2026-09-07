@@ -144,6 +144,7 @@ pub fn build(
         .init_resource::<ReloadWatch>()
         .init_resource::<ForceRepaint>()
         .init_resource::<Placements>()
+        .init_resource::<crate::requests::Defaults>()
         // Starts true, so the first tick runs the config. The bar comes up
         // empty and fills in a moment later, which is what a config run is.
         .insert_resource(Reloading(config_exists))
@@ -154,7 +155,10 @@ pub fn build(
     // Explicit ordering rather than DAG tie-breaks, which reorder silently when
     // a system is added.
     app.add_systems(First, drain_events)
-        .add_systems(PreUpdate, apply_requests)
+        .add_systems(
+            PreUpdate,
+            (apply_requests, crate::requests::apply_defaults).chain(),
+        )
         .add_systems(
             Update,
             (
@@ -332,6 +336,7 @@ fn apply_requests(
     mut subscribers: NonSendMut<crate::subscribers::Subscribers>,
     mut queue: ResMut<Queue>,
     mut reloading: ResMut<Reloading>,
+    mut defaults: ResMut<crate::requests::Defaults>,
     mut exit: MessageWriter<bevy_app::AppExit>,
 ) {
     while let Ok(IpcRequest {
@@ -359,6 +364,7 @@ fn apply_requests(
             sources: &mut sources.0,
             subscribers: &mut subscribers,
             subscriber,
+            defaults: &mut defaults,
         };
         let outcome = crate::requests::apply(*request, &mut items, &mut ctx);
         queue.0.extend(outcome.jobs);
@@ -553,10 +559,21 @@ fn pointer_location(event: &Event) -> Option<(f64, f64)> {
 /// clamps delta to 250 ms so a stalled frame cannot make a game jump, which
 /// here would quietly stretch a one-second update frequency to four. Wall clock
 /// is what an item asking for `--update-freq 10` means.
+/// What advancing a second needs to know about one item.
+#[derive(bevy_ecs::query::QueryData)]
+#[query_data(mutable)]
+struct Ticking {
+    entity: Entity,
+    name: &'static Name,
+    clock: &'static mut Routine,
+    script: Option<&'static Script>,
+    updates: Option<&'static Updates>,
+}
+
 fn tick(
     time: Res<bevy_time::Time<bevy_time::Real>>,
     mut since: Local<Duration>,
-    mut items: Query<(Entity, &Name, &mut Routine, Option<&Script>, Option<&Updates>)>,
+    mut items: Query<Ticking>,
     mut subscribers: NonSendMut<crate::subscribers::Subscribers>,
     mut queue: ResMut<Queue>,
 ) {
@@ -568,27 +585,27 @@ fn tick(
     *since -= TICK;
 
     let routine = std::sync::Arc::new(Event::Routine(rsbar_protocol::event::Routine {}));
-    for (entity, name, mut clock, script, updates) in &mut items {
+    for mut row in &mut items {
         // `bypass_change_detection`, because a routine clock ticking is not a
         // reason to repaint — only what the script then sets is.
-        if !clock.bypass_change_detection().tick() {
+        if !row.clock.bypass_change_detection().tick() {
             continue;
         }
         // The clock still advances while updates are off, so turning them back
         // on resumes the item's own rhythm rather than restarting it.
-        if updates.is_some_and(|updates| !updates.0) {
+        if row.updates.is_some_and(|updates| !updates.0) {
             continue;
         }
         // A client holding a port takes the tick itself. Checked before the
         // script, and before asking whether there *is* one: an item that only
         // exists to be updated by a Lua callback has no script at all, and
         // gating on one meant its tick went nowhere.
-        if subscribers.push(entity, &routine) {
+        if subscribers.push(row.entity, &routine) {
             continue;
         }
-        if let Some(script) = script {
+        if let Some(script) = row.script {
             queue.0.push(Job {
-                item: ItemHandle::new(entity, name.0.clone()),
+                item: ItemHandle::new(row.entity, row.name.0.clone()),
                 script: std::sync::Arc::clone(&script.0),
                 event: std::sync::Arc::clone(&routine),
             });

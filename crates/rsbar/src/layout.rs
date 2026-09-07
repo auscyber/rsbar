@@ -8,8 +8,8 @@
 use crate::alias::Captures;
 use crate::bar::{Panels, Settings, fill_rounded_rect, stroke_rounded_rect};
 use crate::components::{
-    AliasContent, Background, Drawing, Icon, ItemDisplay, Label, Members, Name, Offset, Padding,
-    Placement, Width,
+    AliasContent, Background, Drawing, Icon, ItemDisplay, Label, Members, Name, Offset, Order,
+    Padding, Placement, Width,
 };
 use crate::shaping::Cache;
 use bevy_ecs::prelude::*;
@@ -33,6 +33,7 @@ pub struct Drawn {
     pub padding: &'static Padding,
     pub offset: &'static Offset,
     pub placement: &'static Placement,
+    pub order: &'static Order,
     pub drawing: &'static Drawing,
     pub width: &'static Width,
     pub display: &'static ItemDisplay,
@@ -195,8 +196,13 @@ fn place(
     padding: BarPadding,
     ordinal: u32,
 ) -> Vec<(Entity, CGRect)> {
-    let measured: Vec<Placed<Entity>> = items
-        .iter()
+    // Sorted, because a query yields archetype order, which is not the order
+    // a config added things in and can change when a component is added.
+    let mut ordered: Vec<_> = items.iter().collect();
+    ordered.sort_unstable_by_key(|row| *row.order);
+
+    let measured: Vec<Placed<Entity>> = ordered
+        .into_iter()
         // A bracket takes no space of its own — it is drawn across the items
         // it names, so laying it out alongside them would push them apart by
         // its own width.
@@ -689,6 +695,7 @@ type AnythingVisibleChanged<'w, 's> = Query<
         Changed<Padding>,
         Changed<Offset>,
         Changed<Placement>,
+        Changed<Order>,
         Changed<Drawing>,
         Changed<Width>,
         Changed<ItemDisplay>,
@@ -713,6 +720,7 @@ pub type DirtyItems<'w, 's> = Query<
         Changed<Padding>,
         Changed<Offset>,
         Changed<Placement>,
+        Changed<Order>,
         Changed<Drawing>,
         Changed<Width>,
         Changed<ItemDisplay>,
@@ -977,7 +985,7 @@ mod width_tests {
 mod place_tests {
     use super::{BarPadding, ItemQuery, place};
     use crate::alias::Captures;
-    use crate::components::{DisplayTarget, ItemDisplay, Width, bundle};
+    use crate::components::{DisplayTarget, ItemDisplay, Order, Width, bundle};
     use crate::shaping::Cache;
     use bevy_ecs::system::SystemState;
     use bevy_ecs::world::World;
@@ -993,7 +1001,11 @@ mod place_tests {
     fn a_fixed_width_overrides_what_the_item_would_otherwise_measure_to() {
         let mut world = World::new();
         let entity = world
-            .spawn(bundle(ItemName::new("spacer").unwrap(), Position::Left))
+            .spawn(bundle(
+                ItemName::new("spacer").unwrap(),
+                Position::Left,
+                Order(0),
+            ))
             .id();
         world.entity_mut(entity).insert(Width(Some(5.0)));
 
@@ -1019,7 +1031,11 @@ mod place_tests {
     fn an_item_restricted_to_another_display_is_left_off_this_panel() {
         let mut world = World::new();
         let entity = world
-            .spawn(bundle(ItemName::new("only-two").unwrap(), Position::Left))
+            .spawn(bundle(
+                ItemName::new("only-two").unwrap(),
+                Position::Left,
+                Order(0),
+            ))
             .id();
         world
             .entity_mut(entity)

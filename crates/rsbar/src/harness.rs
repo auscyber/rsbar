@@ -19,6 +19,7 @@ use crate::script::Job;
 use crate::shaping::Cache;
 use crate::sources::Registry;
 use bevy_ecs::prelude::*;
+use bevy_ecs::system::RunSystemOnce as _;
 use bevy_ecs::system::SystemState;
 use rsbar_protocol::{Event, ItemName, Kind, Request};
 
@@ -56,6 +57,13 @@ impl Harness {
 
     /// Applies one request through the daemon's own code path.
     pub fn apply(&mut self, request: Request) -> Outcome {
+        // Lifted out and put back rather than held beside the world: the
+        // daemon keeps this as a resource, and `apply_defaults` below reads it
+        // from there, so a copy on the side would drift from what runs.
+        let mut defaults = self
+            .world
+            .remove_resource::<crate::requests::Defaults>()
+            .unwrap_or_default();
         let mut state: SystemState<Items> = SystemState::new(&mut self.world);
         let outcome = {
             let mut items = state
@@ -69,12 +77,19 @@ impl Harness {
                 sources: &mut self.sources,
                 subscribers: &mut self.subscribers,
                 subscriber: None,
+                defaults: &mut defaults,
             };
             crate::requests::apply(request, &mut items, &mut ctx)
         };
         // Spawns and despawns are queued as commands; nothing is visible to the
         // next query until they are applied.
         state.apply(&mut self.world);
+        self.world.insert_resource(defaults);
+        // What the daemon runs straight after `apply_requests`, so a
+        // `--default` set here reaches an item added here.
+        self.world
+            .run_system_once(crate::requests::apply_defaults)
+            .expect("applying defaults is always valid");
         // What the daemon does in `Last`: claims taken and dropped by the
         // request are only counts until something registers against them.
         self.sources.settle();
@@ -98,6 +113,14 @@ impl Harness {
             .get_mut(&mut self.world)
             .expect("item params are always valid");
         items.states()
+    }
+
+    /// Every item's name, left to right.
+    pub fn order(&mut self) -> Vec<String> {
+        self.items()
+            .into_iter()
+            .map(|item| item.name.to_string())
+            .collect()
     }
 
     #[must_use]
@@ -145,7 +168,7 @@ impl Default for Harness {
 mod tests {
     use super::Harness;
     use rsbar_protocol::event::{Forced, FrontApp, VolumeChange};
-    use rsbar_protocol::{Event, ItemName, ItemPatch, Kind, Position, Request, Response};
+    use rsbar_protocol::{Event, ItemName, ItemPatch, Kind, Position, Relative, Request, Response};
 
     /// The workspace source, which `front_app_switched` is the lazy way in to.
     const WORKSPACE: &str = "workspace";
@@ -460,6 +483,115 @@ mod tests {
         let items = bar.items();
         assert_eq!(items.len(), 1, "the same name is the same item");
         assert_eq!(items[0].geometry.position, Position::Left, "and it moved");
+    }
+
+    #[test]
+    fn a_pattern_selects_by_name_and_leaves_everything_else_alone() {
+        // What the real config does constantly: sbar.set("/menu\\..*/", ...).
+        // Resolved against the daemon's own live list, because a client
+        // resolving it would race a config still adding the items.
+        let mut bar = Harness::new();
+        for name in ["menu.1", "menu.2", "clock"] {
+            bar.add(name, Position::Left);
+        }
+
+        bar.apply(Request::SetMatching {
+            pattern: r"menu\..*".into(),
+            patch: Box::new(ItemPatch {
+                drawing: Some(false),
+                ..Default::default()
+            }),
+        });
+
+        for item in bar.items() {
+            let hidden = !item.geometry.drawing;
+            assert_eq!(
+                hidden,
+                item.name.as_str().starts_with("menu."),
+                "{}",
+                item.name
+            );
+        }
+    }
+
+    #[test]
+    fn removing_by_pattern_removes_only_what_it_names() {
+        let mut bar = Harness::new();
+        for name in ["space.1", "space.2", "clock"] {
+            bar.add(name, Position::Left);
+        }
+
+        bar.apply(Request::RemoveMatching(r"space\..*".into()));
+
+        let left: Vec<_> = bar.items().into_iter().map(|item| item.name).collect();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].as_str(), "clock");
+    }
+
+    #[test]
+    fn a_default_reaches_an_item_added_after_it_and_not_one_before() {
+        // SketchyBar's own --default: properties copied onto every item added
+        // from then on, never retroactively.
+        let mut bar = Harness::new();
+        bar.add("before", Position::Left);
+
+        bar.apply(Request::SetDefault(Box::new(ItemPatch {
+            label: Some("filled in".into()),
+            ..Default::default()
+        })));
+        bar.add("after", Position::Left);
+
+        let items = bar.items();
+        let labelled = |name: &str| {
+            items
+                .iter()
+                .find(|item| item.name.as_str() == name)
+                .map(|item| item.label.text.clone())
+                .unwrap()
+        };
+        assert_eq!(labelled("after"), "filled in");
+        assert_eq!(labelled("before"), "", "defaults are not retroactive");
+    }
+
+    #[test]
+    fn moving_an_item_puts_it_where_it_was_asked_for() {
+        // What items/left.lua does on every app switch:
+        // `sketchybar --move chevron after <last space>`.
+        let mut bar = Harness::new();
+        for name in ["space.1", "space.2", "chevron", "front_app"] {
+            bar.add(name, Position::Left);
+        }
+
+        bar.apply(Request::Move {
+            name: ItemName::new("chevron").unwrap(),
+            relative: Relative::After,
+            reference: ItemName::new("space.1").unwrap(),
+        });
+        assert_eq!(bar.order(), ["space.1", "chevron", "space.2", "front_app"]);
+
+        bar.apply(Request::Move {
+            name: ItemName::new("front_app").unwrap(),
+            relative: Relative::Before,
+            reference: ItemName::new("space.1").unwrap(),
+        });
+        assert_eq!(bar.order(), ["front_app", "space.1", "chevron", "space.2"]);
+    }
+
+    #[test]
+    fn reordering_keeps_whatever_it_did_not_name() {
+        let mut bar = Harness::new();
+        for name in ["a", "b", "c"] {
+            bar.add(name, Position::Left);
+        }
+
+        bar.apply(Request::Reorder(vec![
+            ItemName::new("c").unwrap(),
+            ItemName::new("a").unwrap(),
+        ]));
+
+        // `b` was not named, so it keeps its place after the ones that were
+        // rather than landing somewhere arbitrary.
+        assert_eq!(bar.order(), ["c", "a", "b"]);
     }
 
     #[test]

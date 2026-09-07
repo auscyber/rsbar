@@ -41,5 +41,9 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lexopt = "0.3.2"
 
+# Resolving SketchyBar's `/pattern/` item selectors, which only the daemon
+# can do: it is the one with a live item list.
+regex = "1"
+
 [lints]
 workspace = true

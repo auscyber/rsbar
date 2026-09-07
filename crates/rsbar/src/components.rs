@@ -211,6 +211,14 @@ pub struct Offset(pub f64);
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placement(pub Position);
 
+/// Where the item sits among the others in its bucket, left to right.
+///
+/// Explicit rather than implied by iteration order, which in an ECS is
+/// archetype order: adding a component to one item could otherwise silently
+/// reshuffle the bar. `--move` and `--reorder` rewrite these.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Order(pub u32);
+
 /// Whether the item is drawn at all. An undrawn item keeps its state and its
 /// subscriptions; it simply takes no space.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,27 +360,39 @@ pub struct Watching(pub Vec<crate::sources::Watch>);
 ///
 /// Kept in step by the systems that spawn and despawn; nothing else writes it.
 #[derive(Resource, Default)]
-pub struct Index(HashMap<ItemName, Entity>);
+pub struct Index {
+    names: HashMap<ItemName, Entity>,
+    /// Handed out on every add and never reused, so a later item always sorts
+    /// after an earlier one until something moves it.
+    next_order: u32,
+}
 
 impl Index {
     #[must_use]
     pub fn get(&self, name: &ItemName) -> Option<Entity> {
-        self.0.get(name).copied()
+        self.names.get(name).copied()
     }
 
     pub fn insert(&mut self, name: ItemName, entity: Entity) {
-        self.0.insert(name, entity);
+        self.names.insert(name, entity);
     }
 
     pub fn remove(&mut self, name: &ItemName) -> Option<Entity> {
-        self.0.remove(name)
+        self.names.remove(name)
+    }
+
+    /// The next place in the bar, for an item being added now.
+    pub fn next_order(&mut self) -> Order {
+        let order = Order(self.next_order);
+        self.next_order += 1;
+        order
     }
 }
 
 /// Everything a new item starts as. Defaults match what a bar wants before a
 /// config says otherwise: visible, no background, modest padding.
 #[must_use]
-pub fn bundle(name: ItemName, position: Position) -> impl Bundle {
+pub fn bundle(name: ItemName, position: Position, order: Order) -> impl Bundle {
     (
         Item,
         Name(name),
@@ -394,17 +414,21 @@ pub fn bundle(name: ItemName, position: Position) -> impl Bundle {
             between: 5.0,
         },
         Offset(0.0),
-        Placement(position),
-        Drawing(true),
-        Updates(true),
-        Width(None),
-        ItemDisplay(DisplayTarget::All),
-        Routine {
-            every: 0,
-            elapsed: 0,
-        },
-        Subscriptions::default(),
-        Watching::default(),
+        // Nested only because a flat tuple this long stops being a `Bundle`.
+        (
+            Placement(position),
+            order,
+            Drawing(true),
+            Updates(true),
+            Width(None),
+            ItemDisplay(DisplayTarget::All),
+            Routine {
+                every: 0,
+                elapsed: 0,
+            },
+            Subscriptions::default(),
+            Watching::default(),
+        ),
     )
 }
 

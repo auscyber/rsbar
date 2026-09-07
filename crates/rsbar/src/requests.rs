@@ -8,7 +8,7 @@
 use crate::bar::{Changes, Panels, Settings};
 use crate::components::{
     AliasContent, AliasSpec, Background, ClickScript, DisplayTarget, Drawing, Icon, Index,
-    ItemDisplay, ItemHandle, Label, Members, Name, Offset, Padding, Placement, Routine, Run,
+    ItemDisplay, ItemHandle, Label, Members, Name, Offset, Order, Padding, Placement, Routine, Run,
     Script, Stale, Subscriptions, Updates, Watching, Width, bundle,
 };
 use crate::script::Job;
@@ -20,7 +20,7 @@ use bevy_ecs::query::QueryData;
 use bevy_ecs::system::SystemParam;
 use rsbar_protocol::{
     BackgroundPatch, Event, ItemName, ItemPatch, ItemState, Kind, Patch, Query as ProtocolQuery,
-    Request, Response, RunPatch, Selector,
+    Relative, Request, Response, RunPatch, Selector,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -43,6 +43,7 @@ pub struct ItemWrite {
     pub padding: &'static mut Padding,
     pub offset: &'static mut Offset,
     pub placement: &'static mut Placement,
+    pub order: &'static mut Order,
     pub drawing: &'static mut Drawing,
     pub updates: &'static mut Updates,
     pub width: &'static mut Width,
@@ -150,8 +151,12 @@ impl Items<'_, '_> {
     }
 
     #[must_use]
+    /// Every item, in the order the bar draws them -- not the query's own,
+    /// which is archetype order and means nothing to a caller.
     pub fn states(&self) -> Vec<ItemState> {
-        self.write.iter().map(|row| write_state(&row)).collect()
+        let mut rows: Vec<_> = self.write.iter().collect();
+        rows.sort_unstable_by_key(|row| *row.order);
+        rows.iter().map(write_state).collect()
     }
 
     #[must_use]
@@ -420,6 +425,88 @@ pub struct Context<'a> {
     /// A port this request arrived with, if the client wants its events
     /// pushed back rather than run as a script.
     pub subscriber: Option<async_mach_ports::Subscriber>,
+    /// What `--default` last set, applied to every item added from here on.
+    pub defaults: &'a mut Defaults,
+}
+
+/// The properties every item added from here on starts with.
+///
+/// Only what a `--default` actually named, never a fully-populated patch: an
+/// add that wrote every property would defeat the "changed nothing" check that
+/// keeps a repaint from happening for no reason.
+#[derive(Resource, Default)]
+pub struct Defaults(pub ItemPatch);
+
+/// A just-added item that has not had `--default`'s properties yet.
+///
+/// A marker and a system rather than a command, because the entity does not
+/// exist until the spawn is flushed and its components cannot be patched
+/// before they are there. Applying them through the ordinary patch path is
+/// what makes a default and an explicit `--set` of the same property behave
+/// identically -- including doing nothing at all when the value already
+/// matches, which is what keeps a fresh item off the repaint list.
+#[derive(Component)]
+pub struct NeedsDefaults;
+
+/// Applies `--default`'s properties to every item added since the last run.
+pub fn apply_defaults(
+    mut items: Items,
+    defaults: Res<Defaults>,
+    fresh: Query<Entity, With<NeedsDefaults>>,
+) {
+    for entity in &fresh {
+        if let Ok(mut row) = items.write.get_mut(entity) {
+            set_item(entity, &mut row, &defaults.0, &mut items.commands);
+        }
+        items.commands.entity(entity).remove::<NeedsDefaults>();
+    }
+}
+
+/// Every item, in the order the bar draws them.
+fn current_order(items: &Items<'_, '_>) -> Vec<(Entity, ItemName)> {
+    let mut order: Vec<_> = items
+        .write
+        .iter()
+        .map(|row| (*row.order, row.entity, row.name.0.clone()))
+        .collect();
+    order.sort_unstable_by_key(|(order, ..)| *order);
+    order
+        .into_iter()
+        .map(|(_, entity, name)| (entity, name))
+        .collect()
+}
+
+/// Writes a new left-to-right order, touching only what actually moved.
+///
+/// Renumbering from zero every time keeps the keys dense and the comparison
+/// exact; writing only where the value differs is what keeps a move from
+/// marking every item changed and repainting the whole bar.
+fn renumber(order: &[(Entity, ItemName)], items: &mut Items<'_, '_>) {
+    for (place, (entity, _)) in order.iter().enumerate() {
+        let Ok(mut row) = items.write.get_mut(*entity) else {
+            continue;
+        };
+        let next = Order(u32::try_from(place).unwrap_or(u32::MAX));
+        if *row.order != next {
+            *row.order = next;
+        }
+    }
+}
+
+/// Every item whose name matches `pattern`.
+///
+/// Resolved here rather than by the caller because only the daemon has a live
+/// item list — a client resolving it would race a config still adding items,
+/// which is exactly what a config does when it sets `/space\..*/` while the
+/// spaces are still arriving.
+fn matching(pattern: &str, items: &Items<'_, '_>) -> Result<Vec<Entity>, regex::Error> {
+    let regex = regex::Regex::new(pattern)?;
+    Ok(items
+        .write
+        .iter()
+        .filter(|row| regex.is_match(row.name.0.as_str()))
+        .map(|row| row.entity)
+        .collect())
 }
 
 /// Opens the menu behind an `Owner,Name` alias spec.
@@ -442,6 +529,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
         sources,
         subscribers,
         subscriber,
+        defaults,
     } = ctx;
     match request {
         Request::SetBar(patch) => {
@@ -485,8 +573,19 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
                 items.commands.entity(entity).remove::<Stale>();
                 return Outcome::ok();
             }
-            let entity = items.commands.spawn(bundle(name.clone(), position)).id();
+            let order = items.index.next_order();
+            let entity = items
+                .commands
+                .spawn(bundle(name.clone(), position, order))
+                .id();
             items.index.insert(name, entity);
+            // Applied through the ordinary patch path rather than baked into
+            // the bundle, so a default and an explicit `--set` of the same
+            // property behave identically -- including doing nothing when the
+            // value is already what the bundle starts with.
+            if defaults.0 != ItemPatch::default() {
+                items.commands.entity(entity).insert(NeedsDefaults);
+            }
             Outcome::ok()
         }
 
@@ -537,29 +636,91 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             Outcome::ok()
         }
 
-        // Resolving a `/pattern/` against the live item list needs a regex
-        // engine this crate does not yet depend on — see `Selector` in the
-        // protocol crate, which already anticipates it. Erroring rather than
-        // matching nothing keeps a config from silently doing less than it
-        // asked for.
-        Request::SetMatching { pattern, .. } | Request::RemoveMatching(pattern) => Outcome::error(
-            format!("selecting items by `/{pattern}/` is not implemented yet"),
-        ),
-
-        // `--default` needs a resource the item world consults on every
-        // `AddItem`, which has to be registered where the `App` is built —
-        // outside the files this pass touches. See the final report.
-        Request::SetDefault(_) => Outcome::error("`--default` is not implemented yet".to_owned()),
-
-        // Reordering an item within its bucket needs an explicit sort key
-        // `arrange` does not have yet — a bigger change to layout than this
-        // pass's properties, and one with real repaint-damage implications
-        // of its own that deserve their own pass rather than a rushed one
-        // here.
-        Request::Move { name, .. } => {
-            Outcome::error(format!("`{name}`: moving items is not implemented yet"))
+        Request::SetMatching { pattern, patch } => {
+            let matched = match matching(&pattern, items) {
+                Ok(matched) => matched,
+                Err(err) => return Outcome::error(err.to_string()),
+            };
+            tracing::debug!(pattern, matched = matched.len(), "set matching");
+            for entity in matched {
+                let Ok(mut row) = items.write.get_mut(entity) else {
+                    continue;
+                };
+                set_item(entity, &mut row, &patch, &mut items.commands);
+                items.commands.entity(entity).remove::<Stale>();
+            }
+            Outcome::ok()
         }
-        Request::Reorder(_) => Outcome::error("reordering items is not implemented yet".to_owned()),
+
+        Request::RemoveMatching(pattern) => {
+            let matched = match matching(&pattern, items) {
+                Ok(matched) => matched,
+                Err(err) => return Outcome::error(err.to_string()),
+            };
+            tracing::debug!(pattern, matched = matched.len(), "remove matching");
+            for entity in matched {
+                let Ok(row) = items.write.get(entity) else {
+                    continue;
+                };
+                let name = row.name.0.clone();
+                items.index.remove(&name);
+                cache.forget(entity);
+                captures.forget(entity);
+                subscribers.clear(entity);
+                items.commands.entity(entity).despawn();
+            }
+            Outcome::ok()
+        }
+
+        Request::SetDefault(patch) => {
+            tracing::debug!(?patch, "set defaults");
+            **defaults = Defaults(*patch);
+            Outcome::ok()
+        }
+
+        Request::Move {
+            name,
+            relative,
+            reference,
+        } => {
+            let mut order = current_order(items);
+            let Some(from) = order.iter().position(|(_, n)| *n == name) else {
+                return no_such(&name);
+            };
+            let moved = order.remove(from);
+            let Some(to) = order.iter().position(|(_, n)| *n == reference) else {
+                return no_such(&reference);
+            };
+            let to = match relative {
+                Relative::Before => to,
+                Relative::After => to + 1,
+            };
+            order.insert(to, moved);
+            renumber(&order, items);
+            Outcome::ok()
+        }
+
+        Request::Reorder(names) => {
+            // Anything the caller did not name keeps its relative place after
+            // the ones it did, rather than being dropped to an arbitrary spot.
+            let current = current_order(items);
+            let mut order: Vec<(Entity, ItemName)> = Vec::with_capacity(current.len());
+            for name in &names {
+                if let Some(found) = current.iter().find(|(_, n)| n == name) {
+                    order.push(found.clone());
+                } else {
+                    return no_such(name);
+                }
+            }
+            order.extend(
+                current
+                    .into_iter()
+                    .filter(|(_, n)| !names.contains(n))
+                    .collect::<Vec<_>>(),
+            );
+            renumber(&order, items);
+            Outcome::ok()
+        }
 
         Request::Subscribe { name, events } => {
             tracing::debug!(%name, ?events, "subscribe");
