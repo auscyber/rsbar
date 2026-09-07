@@ -145,6 +145,9 @@ struct ItemOptions {
     /// RSBAR_MODIFIERS in its environment. Pass an empty string to clear it.
     #[arg(long)]
     click_script: Option<String>,
+    /// Mirror a menu bar item, as `Owner,Name`. Empty stops mirroring.
+    #[arg(long)]
+    alias: Option<String>,
     /// Seconds between routine updates; 0 means event-driven only.
     #[arg(long)]
     update_freq: Option<u32>,
@@ -213,6 +216,7 @@ impl From<ItemOptions> for ItemPatch {
             drawing: o.drawing,
             script: o.script,
             click_script: o.click_script,
+            alias: o.alias,
             update_freq: o.update_freq,
         }
     }
@@ -228,7 +232,7 @@ fn main() -> ExitCode {
             ItemAction::Add { name, position } => Request::AddItem { name, position },
             ItemAction::Set { name, options } => Request::SetItem {
                 name,
-                patch: (*options).into(),
+                patch: Box::new((*options).into()),
             },
             ItemAction::Remove { name } => Request::RemoveItem(name),
             ItemAction::Subscribe { name, events } => Request::Subscribe { name, events },

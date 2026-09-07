@@ -159,6 +159,9 @@ pub struct ItemPatch {
     /// Run when this item is clicked. Receives the same, plus `RSBAR_BUTTON`
     /// and `RSBAR_MODIFIERS`.
     pub click_script: Option<String>,
+    /// A menu bar item to mirror, as `Owner,Name` — the form
+    /// `--query menu-items` lists. An empty string stops mirroring.
+    pub alias: Option<String>,
     /// Seconds between routine updates. Zero means "only on subscribed
     /// events", which is the right default for anything event-driven.
     pub update_freq: Option<u32>,
@@ -181,7 +184,9 @@ pub enum Request {
     },
     SetItem {
         name: ItemName,
-        patch: ItemPatch,
+        /// Boxed: an item patch is a dozen options and dwarfs every other
+        /// variant, so every request would be as big as the largest one.
+        patch: Box<ItemPatch>,
     },
     RemoveItem(ItemName),
     /// Replaces the item's subscriptions.
@@ -225,6 +230,8 @@ pub struct ItemState {
     pub click_script: Option<String>,
     pub update_freq: u32,
     pub events: Vec<Kind>,
+    /// What this item mirrors, if it is an alias.
+    pub alias: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -270,11 +277,11 @@ mod tests {
     fn requests_round_trip_through_postcard() {
         let request = Request::SetItem {
             name: ItemName::new("clock").unwrap(),
-            patch: ItemPatch {
+            patch: Box::new(ItemPatch {
                 label: Some("09:41".into()),
                 label_color: Some(0xffff_ffff),
                 ..Default::default()
-            },
+            }),
         };
         let bytes = postcard::to_allocvec(&request).unwrap();
         assert_eq!(postcard::from_bytes::<Request>(&bytes).unwrap(), request);

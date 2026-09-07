@@ -7,8 +7,8 @@
 
 use crate::bar::{Changes, Panels, Settings};
 use crate::components::{
-    AliasSpec, Background, ClickScript, Drawing, Icon, Index, Label, Name, Offset, Padding,
-    Placement, Routine, Run, Script, Stale, Subscriptions, Watching, bundle,
+    AliasContent, AliasSpec, Background, ClickScript, Drawing, Icon, Index, Label, Name, Offset,
+    Padding, Placement, Routine, Run, Script, Stale, Subscriptions, Watching, bundle,
 };
 use crate::script::Job;
 use crate::shaping::Cache;
@@ -538,13 +538,29 @@ fn set_item(
         &mut row.routine,
     );
 
-    apply_run(
-        icon.as_mut(),
+    // Only touched when the patch actually carries one of these, and only
+    // written when the value differs. `Mut::as_mut` is a `deref_mut`, which
+    // marks the component changed whatever you then do with it — so reaching
+    // for the icon unconditionally marked every item's text dirty on every
+    // `SetItem`, including ones that only set an update frequency. That fed
+    // straight into `reshape` and `needs_repaint`, so a script re-setting an
+    // unchanged value repainted the bar for as long as it kept running.
+    if let Some(next) = patched_run(
+        &icon.0,
         patch.icon.as_deref(),
         patch.icon_font.as_deref(),
         patch.icon_color,
-    );
-    apply_run_label(label.as_mut(), patch);
+    ) {
+        icon.0 = next;
+    }
+    if let Some(next) = patched_run(
+        &label.0,
+        patch.label.as_deref(),
+        patch.label_font.as_deref(),
+        patch.label_color,
+    ) {
+        label.0 = next;
+    }
 
     if let Some(c) = patch.background_color {
         background.color = Color(c);
@@ -587,30 +603,52 @@ fn set_item(
             commands.entity(entity).insert(ClickScript(script.clone()));
         }
     }
+    if let Some(alias) = &patch.alias {
+        if alias.is_empty() {
+            commands
+                .entity(entity)
+                .remove::<(AliasSpec, AliasContent)>();
+        } else {
+            commands
+                .entity(entity)
+                .insert((AliasSpec(alias.clone()), AliasContent::default()));
+        }
+    }
 }
 
-fn apply_run(run: &mut Icon, string: Option<&str>, font: Option<&str>, color: Option<u32>) {
+/// What the patch would make of this run, or `None` if it would make no
+/// difference.
+///
+/// Compared before anything is built, so the common case — a script re-setting
+/// the value it set last time — allocates nothing and, at the call site, never
+/// reaches for the `Mut`. `Mut::as_mut` is a `deref_mut`: touching a component
+/// at all marks it changed, and a component marked changed reshapes its text
+/// and repaints its rect whether or not a pixel moved.
+fn patched_run(
+    current: &Run,
+    string: Option<&str>,
+    font: Option<&str>,
+    color: Option<u32>,
+) -> Option<Run> {
+    let font = font.map(FontSpec::parse);
+    let differs = string.is_some_and(|s| s != current.string)
+        || font.as_ref().is_some_and(|f| *f != current.font)
+        || color.is_some_and(|c| Color(c) != current.color);
+    if !differs {
+        return None;
+    }
+
+    let mut next = current.clone();
     if let Some(s) = string {
-        s.clone_into(&mut run.0.string);
+        s.clone_into(&mut next.string);
     }
     if let Some(f) = font {
-        run.0.font = FontSpec::parse(f);
+        next.font = f;
     }
     if let Some(c) = color {
-        run.0.color = Color(c);
+        next.color = Color(c);
     }
-}
-
-fn apply_run_label(run: &mut Label, patch: &ItemPatch) {
-    if let Some(s) = &patch.label {
-        run.0.string.clone_from(s);
-    }
-    if let Some(f) = &patch.label_font {
-        run.0.font = FontSpec::parse(f);
-    }
-    if let Some(c) = patch.label_color {
-        run.0.color = Color(c);
-    }
+    Some(next)
 }
 
 const _: fn(&Run) = |_| {};

@@ -322,27 +322,27 @@ mod tests {
         });
         assert_eq!(bar.registered_for(WORKSPACE), vec![Kind::FrontAppSwitched]);
 
-        // Another item asks for the space. The source already exists, so it is
+        // Another item asks about waking. The source already exists, so it is
         // widened rather than rebuilt.
-        let space = bar.add("space", Position::Left);
+        let sleep = bar.add("sleep", Position::Left);
         bar.apply(Request::Subscribe {
-            name: space.clone(),
-            events: vec![Kind::SpaceChanged],
+            name: sleep.clone(),
+            events: vec![Kind::SystemWoke],
         });
         let mut both = bar.registered_for(WORKSPACE);
         both.sort();
-        let mut expected = vec![Kind::FrontAppSwitched, Kind::SpaceChanged];
+        let mut expected = vec![Kind::FrontAppSwitched, Kind::SystemWoke];
         expected.sort();
         assert_eq!(both, expected);
 
         // The first item goes. Nothing wants the front application any more,
-        // so the source stops observing it — and keeps observing the space.
+        // so the source stops observing it — and keeps observing wakes.
         bar.apply(Request::RemoveItem(front));
-        assert_eq!(bar.registered_for(WORKSPACE), vec![Kind::SpaceChanged]);
+        assert_eq!(bar.registered_for(WORKSPACE), vec![Kind::SystemWoke]);
         assert!(bar.running(WORKSPACE));
 
         // The second goes too. Nothing wants anything off it, so it stops.
-        bar.apply(Request::RemoveItem(space));
+        bar.apply(Request::RemoveItem(sleep));
         assert!(bar.registered_for(WORKSPACE).is_empty());
         assert!(!bar.running(WORKSPACE));
     }
@@ -372,10 +372,10 @@ mod tests {
 
         bar.apply(Request::SetItem {
             name: clock.clone(),
-            patch: ItemPatch {
+            patch: Box::new(ItemPatch {
                 label: Some("09:41".into()),
                 ..patch()
-            },
+            }),
         });
         let items = bar.items();
         assert_eq!(items.len(), 1);
@@ -391,7 +391,7 @@ mod tests {
         for request in [
             Request::SetItem {
                 name: name("ghost"),
-                patch: patch(),
+                patch: Box::new(patch()),
             },
             Request::RemoveItem(name("ghost")),
             Request::Subscribe {
@@ -426,10 +426,10 @@ mod tests {
         let listener = bar.add("listener", Position::Left);
         bar.apply(Request::SetItem {
             name: listener,
-            patch: ItemPatch {
+            patch: Box::new(ItemPatch {
                 script: Some("true".into()),
                 ..patch()
-            },
+            }),
         });
         bar.apply(Request::Subscribe {
             name: name("listener"),
@@ -447,10 +447,10 @@ mod tests {
         let unrelated = bar.add("unrelated", Position::Left);
         bar.apply(Request::SetItem {
             name: unrelated,
-            patch: ItemPatch {
+            patch: Box::new(ItemPatch {
                 script: Some("true".into()),
                 ..patch()
-            },
+            }),
         });
 
         let jobs = bar.jobs_for(&Event::VolumeChanged(VolumeChange { volume: 42 }));
@@ -468,10 +468,10 @@ mod tests {
         let item = bar.add("item", Position::Left);
         bar.apply(Request::SetItem {
             name: item,
-            patch: ItemPatch {
+            patch: Box::new(ItemPatch {
                 click_script: Some("clicked".into()),
                 ..patch()
-            },
+            }),
         });
         bar.apply(Request::Subscribe {
             name: name("item"),
@@ -486,10 +486,10 @@ mod tests {
 
         bar.apply(Request::SetItem {
             name: name("item"),
-            patch: ItemPatch {
+            patch: Box::new(ItemPatch {
                 script: Some("updated".into()),
                 ..patch()
-            },
+            }),
         });
         let jobs = bar.jobs_for(&Event::VolumeChanged(VolumeChange { volume: 1 }));
         assert_eq!(jobs.len(), 1);
@@ -509,10 +509,10 @@ mod tests {
         let front = bar.add("front", Position::Left);
         bar.apply(Request::SetItem {
             name: front,
-            patch: ItemPatch {
+            patch: Box::new(ItemPatch {
                 script: Some("true".into()),
                 ..patch()
-            },
+            }),
         });
         bar.apply(Request::Subscribe {
             name: name("front"),
@@ -533,10 +533,10 @@ mod tests {
         let item = bar.add("item", Position::Left);
         bar.apply(Request::SetItem {
             name: item,
-            patch: ItemPatch {
+            patch: Box::new(ItemPatch {
                 script: Some("true".into()),
                 ..patch()
-            },
+            }),
         });
 
         bar.apply(Request::Subscribe {
@@ -563,10 +563,10 @@ mod tests {
             let item = bar.add(name, Position::Left);
             bar.apply(Request::SetItem {
                 name: item,
-                patch: ItemPatch {
+                patch: Box::new(ItemPatch {
                     script: Some("true".into()),
                     ..patch()
-                },
+                }),
             });
         }
         bar.add("no-script", Position::Left);
@@ -587,10 +587,10 @@ mod tests {
         let mine = bar.add("mine", Position::Left);
         bar.apply(Request::SetItem {
             name: mine,
-            patch: ItemPatch {
+            patch: Box::new(ItemPatch {
                 script: Some("true".into()),
                 ..patch()
-            },
+            }),
         });
         bar.apply(Request::Subscribe {
             name: name("mine"),

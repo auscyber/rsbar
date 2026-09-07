@@ -5,6 +5,7 @@
     reason = "Bevy system parameters are taken by value by contract"
 )]
 
+use crate::alias::Captures;
 use crate::bar::{Panels, Settings, fill_rounded_rect};
 use crate::components::{Background, Drawing, Icon, Label, Offset, Padding, Placement};
 use crate::shaping::Cache;
@@ -28,6 +29,12 @@ pub type ItemQuery<'w, 's> = Query<
         &'static Drawing,
     ),
 >;
+
+/// How wide an alias's mirrored image is, or nothing if it is not an alias.
+fn alias_width(captures: &Captures, entity: Entity, padding: &Padding) -> Option<f64> {
+    let mirrored = captures.get(entity)?;
+    Some(padding.left + mirrored.size.width + padding.right)
+}
 
 /// How wide an item is, padding included.
 fn width(cache: &Cache, entity: Entity, icon: &Icon, label: &Label, padding: &Padding) -> f64 {
@@ -121,7 +128,12 @@ pub fn arrange<T: Copy>(items: &[Placed<T>], width: f64) -> Vec<(T, f64, f64)> {
 }
 
 /// Gathers the drawn items and hands them to [`arrange`].
-fn place(items: &ItemQuery, cache: &Cache, size: CGSize) -> Vec<(Entity, CGRect)> {
+fn place(
+    items: &ItemQuery,
+    cache: &Cache,
+    captures: &Captures,
+    size: CGSize,
+) -> Vec<(Entity, CGRect)> {
     let measured: Vec<Placed<Entity>> = items
         .iter()
         .filter(|(.., drawing)| drawing.0)
@@ -129,7 +141,10 @@ fn place(items: &ItemQuery, cache: &Cache, size: CGSize) -> Vec<(Entity, CGRect)
             |(entity, icon, label, _, padding, _, placement, _)| Placed {
                 id: entity,
                 position: placement.0,
-                width: width(cache, entity, icon, label, padding),
+                // An alias is as wide as what it mirrors; its own text, if it
+                // has any, is not drawn.
+                width: alias_width(captures, entity, padding)
+                    .unwrap_or_else(|| width(cache, entity, icon, label, padding)),
             },
         )
         .collect();
@@ -221,18 +236,34 @@ fn contains(rect: CGRect, point: CGPoint) -> bool {
         && point.y < rect.origin.y + rect.size.height
 }
 
+/// Everything drawing reads that is not an item: the shaped text, the
+/// mirrored images, and the windows to draw into.
+///
+/// Grouped because they always travel together, and a system taking them
+/// separately alongside its queries runs past what is readable.
+#[derive(bevy_ecs::system::SystemParam)]
+pub struct Surfaces<'w> {
+    cache: NonSend<'w, Cache>,
+    captures: NonSend<'w, Captures>,
+    panels: NonSend<'w, Panels>,
+}
+
 /// Lays out and repaints every panel.
 ///
 /// Runs only when something changed — see [`needs_repaint`].
 pub fn repaint(
     items: ItemQuery,
     dirty: DirtyItems,
-    cache: NonSend<Cache>,
-    panels: NonSend<Panels>,
+    surfaces: Surfaces,
     settings: Res<Settings>,
     force: Res<ForceRepaint>,
     mut placements: ResMut<Placements>,
 ) {
+    let Surfaces {
+        cache,
+        captures,
+        panels,
+    } = surfaces;
     // Taken, not cleared: where every item was last time is what says which
     // pixels an item that has moved left behind.
     let previous = std::mem::take(&mut placements.0);
@@ -258,6 +289,7 @@ pub fn repaint(
     paint_panels(
         &items,
         &cache,
+        &captures,
         &panels,
         &settings,
         &Repaint {
@@ -332,6 +364,7 @@ fn intersects(a: CGRect, b: CGRect) -> bool {
 fn paint_panels(
     items: &ItemQuery,
     cache: &Cache,
+    captures: &Captures,
     panels: &Panels,
     settings: &Settings,
     pass: &Repaint,
@@ -340,66 +373,82 @@ fn paint_panels(
     for panel in panels.iter() {
         let size = panel.frame.size;
         // Layout depends on the panel's width, so it is per display.
-        let placed = place(items, cache, size);
+        let placed = place(items, cache, captures, size);
         let torn = damage(pass, panel.display.id, panel.frame, &placed);
-        placements.0.push(PanelPlacements {
-            display: panel.display.id,
-            frame: panel.frame,
-            items: placed.clone(),
-        });
 
-        // Nothing on this display looks different. The common case on a
-        // multi-display bar, where one panel's clock ticks and the rest do not.
-        if torn.as_ref().is_some_and(Vec::is_empty) {
-            continue;
-        }
+        // Nothing on this display looks different — the common case on a
+        // multi-display bar, where one panel's clock ticks and the rest do
+        // not. The placements are still recorded below either way: a click is
+        // answered against them, so losing them would stop the bar taking
+        // clicks until something moved.
+        let unchanged = torn.as_ref().is_some_and(Vec::is_empty);
 
         let total = placed.len();
         let mut drawn = 0usize;
-        skylight::draw_damaged(panel.window.id(), size, torn.as_deref(), |ctx| {
-            fill_rounded_rect(
-                ctx,
-                CGRect::new(CGPoint::new(0.0, 0.0), size),
-                settings.corner_radius,
-                settings.color,
-            );
+        if !unchanged {
+            skylight::draw_damaged(panel.window.id(), size, torn.as_deref(), |ctx| {
+                fill_rounded_rect(
+                    ctx,
+                    CGRect::new(CGPoint::new(0.0, 0.0), size),
+                    settings.corner_radius,
+                    settings.color,
+                );
 
-            for (entity, frame) in placed {
-                // Everything overlapping the damage, not only what changed: the
-                // damaged pixels were cleared, so an untouched item sitting in
-                // them has to go back down too.
-                if let Some(torn) = &torn
-                    && !torn.iter().any(|rect| intersects(*rect, frame))
-                {
-                    continue;
-                }
-                let Ok((_, icon, label, background, padding, offset, _, _)) = items.get(entity)
-                else {
-                    continue;
-                };
-                let Some(shaped) = cache.get(entity) else {
-                    continue;
-                };
-                drawn += 1;
+                for &(entity, frame) in &placed {
+                    // Everything overlapping the damage, not only what changed: the
+                    // damaged pixels were cleared, so an untouched item sitting in
+                    // them has to go back down too.
+                    if let Some(torn) = &torn
+                        && !torn.iter().any(|rect| intersects(*rect, frame))
+                    {
+                        continue;
+                    }
+                    let Ok((_, icon, label, background, padding, offset, _, _)) = items.get(entity)
+                    else {
+                        continue;
+                    };
+                    let Some(shaped) = cache.get(entity) else {
+                        continue;
+                    };
+                    drawn += 1;
 
-                if !background.color.is_invisible() {
-                    fill_rounded_rect(ctx, frame, background.corner_radius, background.color);
-                }
+                    if !background.color.is_invisible() {
+                        fill_rounded_rect(ctx, frame, background.corner_radius, background.color);
+                    }
 
-                let mut x = frame.origin.x + padding.left;
-                let y = frame.origin.y + offset.0;
-                if !icon.0.is_empty() {
-                    let w = shaped.icon_metrics().width;
-                    let box_ = CGRect::new(CGPoint::new(x, y), CGSize::new(w, frame.size.height));
-                    shaped.draw_icon(ctx, box_, icon.0.color);
-                    x += w + padding.between;
+                    // An alias draws what it mirrors, and nothing else.
+                    if let Some(captured) = captures.get(entity) {
+                        let box_ = CGRect::new(
+                            CGPoint::new(frame.origin.x + padding.left, frame.origin.y + offset.0),
+                            captured.size,
+                        );
+                        crate::bar::draw_image(ctx, box_, &captured.image);
+                        continue;
+                    }
+
+                    let mut x = frame.origin.x + padding.left;
+                    let y = frame.origin.y + offset.0;
+                    if !icon.0.is_empty() {
+                        let w = shaped.icon_metrics().width;
+                        let box_ =
+                            CGRect::new(CGPoint::new(x, y), CGSize::new(w, frame.size.height));
+                        shaped.draw_icon(ctx, box_, icon.0.color);
+                        x += w + padding.between;
+                    }
+                    if !label.0.is_empty() {
+                        let w = shaped.label_metrics().width;
+                        let box_ =
+                            CGRect::new(CGPoint::new(x, y), CGSize::new(w, frame.size.height));
+                        shaped.draw_label(ctx, box_, label.0.color);
+                    }
                 }
-                if !label.0.is_empty() {
-                    let w = shaped.label_metrics().width;
-                    let box_ = CGRect::new(CGPoint::new(x, y), CGSize::new(w, frame.size.height));
-                    shaped.draw_label(ctx, box_, label.0.color);
-                }
-            }
+            });
+        }
+
+        placements.0.push(PanelPlacements {
+            display: panel.display.id,
+            frame: panel.frame,
+            items: placed,
         });
 
         tracing::debug!(
