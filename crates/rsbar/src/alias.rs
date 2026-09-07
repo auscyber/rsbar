@@ -103,10 +103,44 @@
 //! suspiciously unchanging, closing the gap a plain capture-and-hash loop —
 //! or a plugged-in push notification whose scope has already turned out to
 //! carry noise — cannot see on its own (see its doc comment).
+//!
+//! # The left-hand items: the Apple menu and File/Edit/View/... are not windows
+//!
+//! `list_menu_bar_items` only ever finds items at [`MENU_BAR_LAYER`] (0x19),
+//! and on a real bar that is every right-hand extra and nothing on the left —
+//! no Apple menu, no application name, no File/Edit/View/.... Widening the
+//! layer filter does not fix this, because there is nothing at any other
+//! layer to find either: `crates/rsbar/examples/layer_probe.rs`, written for
+//! this investigation, dumps every on-screen window at every layer, not just
+//! this one. On this machine (macOS 26.5.1) the entire left-hand menu bar
+//! chrome shows up as exactly two windows — both owned by `Window Server`,
+//! both named `"Menubar"`, one per display, one layer *below* the status
+//! items at 0x18 — each spanning the full width of its display. Nothing else
+//! in the unfiltered list, at 0x18, at 0x19, or anywhere else, corresponds to
+//! "File" or "Edit" or the Apple logo individually. This is a real platform
+//! limit, not a coverage gap in the filter: the window server paints an
+//! application's own menu titles directly into that one shared surface, from
+//! data it reads out of the frontmost application itself
+//! (`AXMenuBarAttribute`), the same way it always has — there is no
+//! per-title window here to decompose, capture, or alias.
+//!
+//! This does not mean the left-hand items can't be listed and made
+//! clickable — they can, natively, and [`crate::menus`] is how — only that
+//! they can never be pixel-mirrored the way [`list_menu_bar_items`]'s items
+//! are: [`Capture`] and [`Captures`] are built entirely around one specific
+//! window, and here there is no window narrower than the whole menu bar to
+//! capture from. The config this daemon replaces confirms this is the actual
+//! shape of the feature, not a shortcut: `items/menus.lua`/`items/left.lua`
+//! never try to alias the Apple menu or the app-menu row either — they draw
+//! the Apple glyph as a static icon and the rest as plain text labels kept in
+//! sync with `menus -l`, each bound to `menus -s <index>` as its click
+//! script. "Aliasable" for this class of item means listed-and-pressable,
+//! sourced from [`crate::menus::list`] and driven by
+//! [`crate::menus::press`], not mirrored through this module.
 
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{
-    CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
+    CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize, Type,
 };
 use objc2_core_graphics::{
     CGDataProvider, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo,
@@ -129,6 +163,10 @@ pub enum Error {
     NoWindowList,
     #[error("no menu bar item matches this alias")]
     NotFound,
+    #[error(
+        "pressing this menu bar item did not succeed (Accessibility permission is likely missing)"
+    )]
+    PressFailed,
     #[error(transparent)]
     Window(#[from] skylight::Error),
 }
@@ -212,6 +250,41 @@ pub fn list_menu_bar_items() -> Result<Vec<MenuBarItem>> {
             pid: w.pid,
         })
         .collect())
+}
+
+/// Presses the menu behind an already-listed alias item — `AXCancelAction`
+/// then `AXPressAction` on its `AXExtrasMenuBar` element, the same sequence
+/// `SketchyBar`'s own menu helper uses — so a click on a mirrored item opens
+/// the real menu instead of only ever showing a picture of it. Does not touch
+/// this item's [`Captures`]: the resulting menu is the system's own window,
+/// not this one's capture, so nothing here should ever look like a change to
+/// what is drawn.
+///
+/// A name carrying the `(n)` duplicate suffix from
+/// [`disambiguate_duplicates`] cannot be matched by identity (the real
+/// `AXDescription`/`AXTitle` never carries that suffix) and falls back to the
+/// nearest `AXExtrasMenuBar` child by on-screen frame — the same tolerance
+/// [`ax::resolve`] uses, just scoped to one already-known pid instead of
+/// walking every running application.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if no menu bar item currently matches `owner`/`name`,
+/// or nothing in that owner's `AXExtrasMenuBar` is close enough to be it —
+/// which is what missing Accessibility permission looks like from here, same
+/// as everywhere else in this module. [`Error::PressFailed`] if a matching
+/// element was found but the AX action itself was refused.
+pub fn press_item(owner: &str, name: &str) -> Result<()> {
+    let window = raw_menu_bar_windows()?
+        .into_iter()
+        .find(|w| w.owner == owner && w.name == name)
+        .ok_or(Error::NotFound)?;
+    let element = ax::find_extras_child(window.pid, name, window.bounds).ok_or(Error::NotFound)?;
+    if ax::press(&element) {
+        Ok(())
+    } else {
+        Err(Error::PressFailed)
+    }
 }
 
 /// A captured menu bar item, ready to draw.
@@ -522,13 +595,21 @@ fn point_distance(a: CGPoint, b: CGPoint) -> f64 {
 /// The macOS 26 Control Center workaround: recovering a menu bar item's real
 /// owner and title through the Accessibility API, cross-checked against
 /// `SketchyBar`'s `source_pid.m`.
-mod ax {
+///
+/// Also where [`super::press_item`]'s AX lookup lives, and — via
+/// [`frontmost_application`] and [`menu_bar_children`] — the two primitives
+/// [`crate::menus`] builds on for the frontmost application's own
+/// `AXMenuBar`, a different attribute from this module's `AXExtrasMenuBar`
+/// but the same unsafe AX plumbing underneath, so it is shared here rather
+/// than duplicated.
+pub(crate) mod ax {
     use super::{
         AXError, AXUIElement, AXValue, AXValueType, CFArray, CFRetained, CFString, CFType, CGPoint,
-        CGRect, CGSize, point_distance, rect_center,
+        CGRect, CGSize, Type, point_distance, rect_center,
     };
     use objc2_app_kit::NSWorkspace;
     use std::ptr::NonNull;
+    use std::time::Duration;
 
     /// One entry from a running application's `AXExtrasMenuBar`: a status
     /// item this process can plausibly be the real owner of.
@@ -680,25 +761,28 @@ mod ax {
         Some(unsafe { CFRetained::from_raw(ptr) })
     }
 
-    fn copy_element(element: &AXUIElement, name: &str) -> Option<CFRetained<AXUIElement>> {
+    pub(crate) fn copy_element(
+        element: &AXUIElement,
+        name: &str,
+    ) -> Option<CFRetained<AXUIElement>> {
         attribute(element, name)?.downcast::<AXUIElement>().ok()
     }
 
-    fn copy_array(element: &AXUIElement, name: &str) -> Option<CFRetained<CFArray>> {
+    pub(crate) fn copy_array(element: &AXUIElement, name: &str) -> Option<CFRetained<CFArray>> {
         attribute(element, name)?.downcast::<CFArray>().ok()
     }
 
     /// # Safety
     /// `i` must be a valid index into `array`, and every element must be an
     /// `AXUIElement`.
-    unsafe fn array_element(array: &CFArray, i: isize) -> Option<&AXUIElement> {
+    pub(crate) unsafe fn array_element(array: &CFArray, i: isize) -> Option<&AXUIElement> {
         let ptr = unsafe { array.value_at_index(i) };
         let ptr = NonNull::new(ptr.cast_mut())?.cast::<CFType>();
         let ty = unsafe { ptr.as_ref() };
         ty.downcast_ref::<AXUIElement>()
     }
 
-    fn attribute_string(element: &AXUIElement, name: &str) -> Option<String> {
+    pub(crate) fn attribute_string(element: &AXUIElement, name: &str) -> Option<String> {
         Some(
             attribute(element, name)?
                 .downcast::<CFString>()
@@ -737,7 +821,7 @@ mod ax {
         Some(unsafe { std::mem::transmute::<[u8; size_of::<CGSize>()], CGSize>(bytes) })
     }
 
-    fn attribute_frame(element: &AXUIElement) -> Option<CGRect> {
+    pub(crate) fn attribute_frame(element: &AXUIElement) -> Option<CGRect> {
         if let Some(bytes) =
             attribute_value::<{ size_of::<CGRect>() }>(element, "AXFrame", AXValueType::CGRect)
         {
@@ -748,6 +832,103 @@ mod ax {
         let position = attribute_point(element, "AXPosition")?;
         let size = attribute_size(element, "AXSize")?;
         Some(CGRect::new(position, size))
+    }
+
+    /// How far a candidate `AXExtrasMenuBar` child's on-screen frame may sit
+    /// from the resolved window's own bounds and still be trusted as the
+    /// element behind it, for [`find_extras_child`]'s fallback. Looser than
+    /// [`resolve`]'s own `LOOSE_RADIUS` (14pt): that constant tolerates a
+    /// window-vs-AX-frame mismatch while still searching *every* running
+    /// application for the right owner; here the owner is already known and
+    /// only its own items are candidates, so a same-pid neighbour a little
+    /// further off is still far more likely to be a mismeasurement than a
+    /// different item.
+    const PRESS_MATCH_RADIUS: f64 = 20.0;
+
+    /// Finds the `AXExtrasMenuBar` child behind an already-resolved window,
+    /// for [`super::press_item`]. Unlike [`resolve`], the pid is already
+    /// known, so only that one application's extras are walked rather than
+    /// every running one.
+    ///
+    /// Prefers an exact `AXDescription`/`AXTitle` match (same precedence as
+    /// [`enumerate_extras_menu_items`]), then falls back to the nearest
+    /// candidate by frame within [`PRESS_MATCH_RADIUS`] — what a disambiguated
+    /// `(n)` name always needs, since the real identity string never carries
+    /// that suffix.
+    pub(crate) fn find_extras_child(
+        pid: i32,
+        name_hint: &str,
+        frame_hint: CGRect,
+    ) -> Option<CFRetained<AXUIElement>> {
+        // SAFETY: `pid` is a process id the caller just read off the live
+        // window list.
+        let app = unsafe { AXUIElement::new_application(pid) };
+        let extras = copy_element(&app, "AXExtrasMenuBar")?;
+        let children = copy_array(&extras, "AXVisibleChildren")
+            .or_else(|| copy_array(&extras, "AXChildren"))?;
+
+        let mut nearest: Option<(CFRetained<AXUIElement>, f64)> = None;
+        for i in 0..children.count() {
+            // SAFETY: `i` is in bounds; every element is an `AXUIElement`,
+            // per `array_element`'s own contract.
+            let Some(child) = (unsafe { array_element(&children, i) }) else {
+                continue;
+            };
+            let identity = attribute_string(child, "AXDescription")
+                .filter(|d| !d.is_empty())
+                .or_else(|| attribute_string(child, "AXTitle").filter(|t| !t.is_empty()));
+            if identity.as_deref() == Some(name_hint) {
+                return Some(child.retain());
+            }
+            let Some(frame) = attribute_frame(child) else {
+                continue;
+            };
+            let distance = point_distance(rect_center(frame), rect_center(frame_hint));
+            if nearest.as_ref().is_none_or(|(_, best)| distance < *best) {
+                nearest = Some((child.retain(), distance));
+            }
+        }
+
+        let (element, distance) = nearest?;
+        (distance <= PRESS_MATCH_RADIUS).then_some(element)
+    }
+
+    /// `AXCancelAction` then `AXPressAction`, exactly the sequence
+    /// `SketchyBar`'s own menu helper performs — the cancel first dismisses
+    /// any menu already open, so the press reliably opens this one rather
+    /// than sometimes toggling it shut.
+    pub(crate) fn press(element: &AXUIElement) -> bool {
+        let cancel = CFString::from_str("AXCancel");
+        // SAFETY: `cancel` is a live `CFString` for the call's duration.
+        unsafe { element.perform_action(&cancel) };
+        std::thread::sleep(Duration::from_millis(1));
+        let press = CFString::from_str("AXPress");
+        // SAFETY: `press` is a live `CFString` for the call's duration.
+        unsafe { element.perform_action(&press) == AXError::Success }
+    }
+
+    /// The frontmost application's pid and name, for [`crate::menus`].
+    pub(crate) fn frontmost_application() -> Option<(i32, String)> {
+        let app = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+        let pid = app.processIdentifier();
+        if pid <= 0 {
+            return None;
+        }
+        let name = app
+            .localizedName()
+            .map_or_else(|| pid.to_string(), |name| name.to_string());
+        Some((pid, name))
+    }
+
+    /// One application's own top-level menu bar (`AXMenuBar`) — the Apple
+    /// menu and its File/Edit/View/... titles — as opposed to
+    /// [`enumerate_extras_menu_items`]'s `AXExtrasMenuBar`, a different
+    /// attribute entirely. For [`crate::menus`].
+    pub(crate) fn menu_bar_children(pid: i32) -> Option<CFRetained<CFArray>> {
+        // SAFETY: `pid` is a live process id.
+        let app = unsafe { AXUIElement::new_application(pid) };
+        let menu_bar = copy_element(&app, "AXMenuBar")?;
+        copy_array(&menu_bar, "AXVisibleChildren").or_else(|| copy_array(&menu_bar, "AXChildren"))
     }
 }
 

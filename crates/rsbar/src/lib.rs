@@ -13,6 +13,7 @@ pub mod ecs;
 mod harness;
 pub mod layout;
 pub mod lock;
+pub mod menus;
 pub mod requests;
 pub mod runloop;
 pub mod script;
