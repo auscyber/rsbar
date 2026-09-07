@@ -25,7 +25,7 @@
 //! because some of what arrives means quit. And once the event is in hand there
 //! is nothing to dispatch it to, which is why there is no handler at all.
 
-use crate::sources::{Cause, Emitter, Registration, Source, SourceId, StartError};
+use crate::sources::{Cause, Emitter, Registering, Registration, Source, SourceId, StartError};
 use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::{CGEvent, CGEventField, CGEventFlags};
 use rsbar_protocol::event::{MouseClick, Scroll};
@@ -216,7 +216,8 @@ impl Source for Mouse {
         ]
     }
 
-    fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {
+    fn register(&mut self, cx: &mut Registering<'_>) -> Result<Registration, StartError> {
+        let emit = cx.emitter();
         if objc2::MainThreadMarker::new().is_none() {
             return Err(StartError::new(self.id(), Cause::NotMainThread));
         }

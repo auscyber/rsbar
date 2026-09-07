@@ -19,7 +19,7 @@
 //! sound here only because this source is registered once for the process's
 //! one main display, never per-instance.
 
-use crate::sources::{Cause, Emitter, Registration, Source, SourceId, StartError};
+use crate::sources::{Cause, Emitter, Registering, Registration, Source, SourceId, StartError};
 use objc2_core_graphics::{CGDirectDisplayID, CGError, CGMainDisplayID};
 use rsbar_protocol::event::BrightnessChange;
 use rsbar_protocol::{Event, Kind};
@@ -113,7 +113,8 @@ impl Source for Brightness {
         vec![Kind::BrightnessChanged]
     }
 
-    fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {
+    fn register(&mut self, cx: &mut Registering<'_>) -> Result<Registration, StartError> {
+        let emit = cx.emitter();
         let display = CGMainDisplayID();
 
         // SAFETY: `display` is a live display id.

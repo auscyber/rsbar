@@ -273,7 +273,7 @@ pub trait Source: Send {
         false
     }
 
-    /// Registers observers that write into `emit`.
+    /// Registers observers that write into the emitter `cx` hands out.
     ///
     /// Called on the main thread, with the app's run loop current. The returned
     /// [`Registration`] is dropped on that same thread, which is what
@@ -283,9 +283,81 @@ pub trait Source: Send {
     /// # Errors
     ///
     /// Returns [`StartError`] if the underlying framework refuses. A source
-    /// that cannot start is dropped rather than retried: these fail for
-    /// structural reasons, not transient ones.
-    fn register(&mut self, emit: Emitter) -> Result<Registration, StartError>;
+    /// that cannot start is not asked again: these fail for structural reasons,
+    /// not transient ones.
+    fn register(&mut self, cx: &mut Registering<'_>) -> Result<Registration, StartError>;
+}
+
+/// What a source is handed when it registers.
+///
+/// A context rather than a bare [`Emitter`] because registering needs more than
+/// a sink: it needs whatever this source shares with the others.
+pub struct Registering<'a> {
+    id: SourceId,
+    emit: Emitter,
+    shared: &'a mut Shared,
+}
+
+impl Registering<'_> {
+    /// The sink this source's callbacks write into.
+    #[must_use]
+    pub fn emitter(&self) -> Emitter {
+        self.emit.clone()
+    }
+
+    /// Context this source shares with every other one that asks for it.
+    ///
+    /// For what more than one source needs and none should own twice — a thread
+    /// serving several observers, a connection, a subscription upstream. Built
+    /// on first ask and handed out by [`Arc`](std::sync::Arc) after that, which
+    /// matters most for the sources that are indexed by an entity: one per item
+    /// on the bar, all wanting the same thing behind them.
+    ///
+    /// Held only by its users. The registry keeps a [`Weak`](std::sync::Weak),
+    /// so when the last source holding one stops, the context goes with it and
+    /// the next ask builds a fresh one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StartError`] if the context cannot be built, which fails the
+    /// registration that asked for it.
+    pub fn shared<T: Context>(&mut self) -> Result<std::sync::Arc<T>, StartError> {
+        self.shared
+            .get_or_create::<T>()
+            .map_err(|cause| StartError::new(self.id, cause))
+    }
+}
+
+/// Something more than one source needs, built once and shared.
+pub trait Context: std::any::Any + Send + Sync {
+    /// Builds it. Called on the main thread, on the first ask.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Cause`] the source that asked will fail with.
+    fn create() -> Result<Self, Cause>
+    where
+        Self: Sized;
+}
+
+/// The shared contexts currently alive, by type.
+#[derive(Default)]
+struct Shared(HashMap<std::any::TypeId, std::sync::Weak<dyn std::any::Any + Send + Sync>>);
+
+impl Shared {
+    fn get_or_create<T: Context>(&mut self) -> Result<std::sync::Arc<T>, Cause> {
+        let key = std::any::TypeId::of::<T>();
+        if let Some(live) = self.0.get(&key).and_then(std::sync::Weak::upgrade) {
+            // Keyed by the type it was stored under, so this is the same type.
+            if let Ok(shared) = live.downcast::<T>() {
+                return Ok(shared);
+            }
+        }
+        let made = std::sync::Arc::new(T::create()?);
+        let weak = std::sync::Arc::downgrade(&(made.clone() as std::sync::Arc<_>));
+        self.0.insert(key, weak);
+        Ok(made)
+    }
 }
 
 /// State a C callback is handed a pointer to.
@@ -394,13 +466,22 @@ impl<T: Payload> CallbackState<T> {
 /// # Errors
 ///
 /// Returns [`StartError`] if the framework refuses.
-pub fn start(source: &mut dyn Source, waker: &crate::runloop::Waker) -> Result<Feed, StartError> {
+fn start(
+    source: &mut dyn Source,
+    shared: &mut Shared,
+    waker: &crate::runloop::Waker,
+) -> Result<Feed, StartError> {
     let id = source.id();
     let (queue, events) = tokio::sync::mpsc::channel(QUEUE_DEPTH);
-    let registration = source.register(Emitter {
-        queue,
-        waker: waker.clone(),
-    })?;
+    let mut cx = Registering {
+        id,
+        emit: Emitter {
+            queue,
+            waker: waker.clone(),
+        },
+        shared,
+    };
+    let registration = source.register(&mut cx)?;
     Ok(Feed::new(id, events, registration))
 }
 
@@ -426,6 +507,8 @@ pub struct Registry {
     /// number: replacing an item's subscriptions has to release exactly what it
     /// used to want, which a count cannot tell you.
     held: HashMap<Entity, HashSet<SourceId>>,
+    /// Context the sources share, built on first ask.
+    shared: Shared,
     /// Events with no framework behind them — a click, or `--trigger`.
     manual: Feed,
     emit: Emitter,
@@ -486,6 +569,7 @@ impl Registry {
             sources: registered,
             providers,
             held: HashMap::new(),
+            shared: Shared::default(),
             manual,
             emit,
             waker,
@@ -573,14 +657,19 @@ impl Registry {
 
     /// Brings one source into line with whether anything still wants it.
     fn reconcile(&mut self, id: SourceId, because: Option<&Kind>) {
-        let Self { sources, waker, .. } = self;
+        let Self {
+            sources,
+            shared,
+            waker,
+            ..
+        } = self;
         let Some(entry) = sources.get_mut(&id) else {
             return;
         };
         let wanted = entry.pinned || !entry.users.is_empty();
 
         match (wanted, entry.feed.is_some()) {
-            (true, false) if !entry.failed => match start(entry.source.as_mut(), waker) {
+            (true, false) if !entry.failed => match start(entry.source.as_mut(), shared, waker) {
                 Ok(feed) => {
                     tracing::debug!(source = %id, kind = ?because, "started event source");
                     entry.feed = Some(feed);

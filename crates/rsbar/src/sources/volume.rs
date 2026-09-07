@@ -6,7 +6,9 @@
 //! So the device-change listener re-registers the volume listener on whatever
 //! became default.
 
-use crate::sources::{CallbackState, Cause, Emitter, Registration, Source, SourceId, StartError};
+use crate::sources::{
+    CallbackState, Cause, Emitter, Registering, Registration, Source, SourceId, StartError,
+};
 use rsbar_protocol::event::VolumeChange;
 use rsbar_protocol::{Event, Kind};
 use std::ffi::c_void;
@@ -397,7 +399,8 @@ impl Source for Volume {
         vec![Kind::VolumeChanged]
     }
 
-    fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {
+    fn register(&mut self, cx: &mut Registering<'_>) -> Result<Registration, StartError> {
+        let emit = cx.emitter();
         if default_output_device().is_none() {
             return Err(StartError::new(self.id(), Cause::NoOutputDevice));
         }

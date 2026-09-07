@@ -7,7 +7,7 @@
 //! plugged in. They live together in [`super::displays`] instead.
 
 use crate::sources::observers::{Observers, ToEvent};
-use crate::sources::{Emitter, Registration, Source, SourceId, StartError};
+use crate::sources::{Registering, Registration, Source, SourceId, StartError};
 use objc2_app_kit::{NSRunningApplication, NSWorkspace};
 use objc2_foundation::{NSNotification, NSString};
 use rsbar_protocol::event::{FrontApp, SpaceChange, SystemWillSleep, SystemWoke};
@@ -62,7 +62,8 @@ impl Source for Workspace {
         ]
     }
 
-    fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {
+    fn register(&mut self, cx: &mut Registering<'_>) -> Result<Registration, StartError> {
+        let emit = cx.emitter();
         let center = NSWorkspace::sharedWorkspace().notificationCenter();
         let mut observers = Observers::new(center);
 

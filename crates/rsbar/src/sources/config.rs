@@ -4,7 +4,7 @@
 //! stream everything else does.
 
 use crate::config::{self, Debounce, Shared};
-use crate::sources::{Cause, Emitter, Registration, Source, SourceId, StartError};
+use crate::sources::{Cause, Registering, Registration, Source, SourceId, StartError};
 use notify::{RecursiveMode, Watcher as _};
 use rsbar_protocol::event::ConfigReload;
 use rsbar_protocol::{Event, Kind};
@@ -30,7 +30,8 @@ impl Source for Watcher {
         true
     }
 
-    fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {
+    fn register(&mut self, cx: &mut Registering<'_>) -> Result<Registration, StartError> {
+        let emit = cx.emitter();
         let Some(path) = self.config.blocking_read().path.clone() else {
             return Err(StartError::new(self.id(), Cause::NoConfigFile));
         };

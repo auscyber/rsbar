@@ -8,7 +8,9 @@
 //! source — split across two, subscribing to the event started both of them.
 
 use crate::sources::observers::{Observers, ToEvent};
-use crate::sources::{CallbackState, Cause, Emitter, Registration, Source, SourceId, StartError};
+use crate::sources::{
+    CallbackState, Cause, Emitter, Registering, Registration, Source, SourceId, StartError,
+};
 use objc2_app_kit::NSWorkspace;
 use objc2_core_graphics::{
     CGDirectDisplayID, CGDisplayChangeSummaryFlags, CGDisplayRegisterReconfigurationCallback,
@@ -70,7 +72,8 @@ impl Source for Displays {
         true
     }
 
-    fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {
+    fn register(&mut self, cx: &mut Registering<'_>) -> Result<Registration, StartError> {
+        let emit = cx.emitter();
         let state = CallbackState::new(emit);
         let status = state.with_ptr(|context| {
             // SAFETY: the state outlives the registration; see `CallbackState`.
