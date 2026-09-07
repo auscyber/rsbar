@@ -1,6 +1,7 @@
 //! The rsbar daemon: bar geometry, the item world, drawing, and the app that
 //! drives them.
 
+pub mod alias;
 pub mod bar;
 pub mod components;
 pub mod config;

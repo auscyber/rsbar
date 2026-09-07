@@ -1,0 +1,657 @@
+//! Alias items: mirroring another application's menu bar item into our bar.
+//!
+//! The window server keeps every menu bar extra as an ordinary window at
+//! [`MENU_BAR_LAYER`], owned (per `kCGWindowOwnerPID`) by the process that
+//! drew it. Historically that made aliasing straightforward: list the
+//! layer-25 windows, match one by owner and title, and capture its window ID.
+//!
+//! On macOS 26 that ownership link partly breaks. Many menu bar extras that
+//! used to belong to their own process (Sound, Clock, Focus, Bluetooth's
+//! "`BentoBox`" module, ...) are now drawn directly by **Control Center**, so
+//! `kCGWindowOwnerPID`/`kCGWindowOwnerName` both say "Control Center" no
+//! matter which module it is. `kCGWindowName` is *not* generally empty —
+//! measured on this machine (macOS 26.5.1) it is often a real title
+//! ("Sound", "Clock", "`FocusModes`"), but several unrelated modules also share
+//! the literal placeholder name `Item-0`, which by itself names nothing in
+//! particular. The window is still capturable either way — window server
+//! geometry does not care who owns a window — but a bare `Item-0` cannot be
+//! told apart from the four other windows also called `Item-0`.
+//!
+//! Two fixes apply, both cross-checked against `SketchyBar`:
+//! - **Recovering a real owner**, from `source_pid.m`: every running
+//!   application exposes its status items through `AXExtrasMenuBar`, titled
+//!   and positioned in screen coordinates, whether or not that application
+//!   ends up compositing its own window. So when a window's owner looks like
+//!   Control Center, this module walks every running application's extras
+//!   menu bar and matches the window's bounds against an AX element's frame.
+//!   A match within a few points recovers the item's real owner and name; on
+//!   this machine it did not fire for any of the genuinely Control
+//!   Center-native modules (Sound, Clock, `FocusModes`, `BentoBox`), because
+//!   there is no other process to recover — Control Center really is the
+//!   owner now. Nothing papers over that: an unresolved item is reported
+//!   under the owner "Control Center", not silently dropped.
+//! - **Disambiguating what's left**, from alias.c's "rework alias logic to
+//!   handle duplicate entries": [`list_menu_bar_items`] appends a `(n)`
+//!   suffix to every name that repeats, so what would otherwise be five
+//!   indistinguishable `Item-0`s become `Item-0(1)` through `Item-0(5)`.
+//!
+//! Both permissions this relies on fail silently:
+//! - **Screen Recording** — without it [`skylight::Window::capture`] leaves
+//!   the image null; this module surfaces that as [`Error::Window`].
+//! - **Accessibility** — without it every `AXUIElementCopyAttributeValue`
+//!   call returns [`AXError::APIDisabled`], so the Control Center workaround
+//!   silently finds nothing. [`accessibility_trusted`] reports this ahead of
+//!   time so a caller can tell "no items" from "no permission".
+
+use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
+use objc2_core_foundation::{
+    CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
+};
+use objc2_core_graphics::{
+    CGImage, CGPreflightScreenCaptureAccess, CGRectMakeWithDictionaryRepresentation,
+    CGRequestScreenCaptureAccess, CGWindowListCopyWindowInfo, CGWindowListOption, kCGWindowBounds,
+    kCGWindowLayer, kCGWindowName, kCGWindowNumber, kCGWindowOwnerName, kCGWindowOwnerPID,
+};
+use skylight::{Window, WindowId};
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::ptr::NonNull;
+
+/// `CGWindowLevelForKey(kCGStatusWindowLevelKey)`'s window list layer.
+/// Stable for two decades; `SketchyBar` hardcodes the same value.
+const MENU_BAR_LAYER: i64 = 0x19;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Error {
+    #[error("the window server would not list its windows")]
+    NoWindowList,
+    #[error("no menu bar item matches this alias")]
+    NotFound,
+    #[error(transparent)]
+    Window(#[from] skylight::Error),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Whether this process can capture other windows' pixels.
+///
+/// Absence is silent everywhere else in this module, so check this once and
+/// report it — a config with no aliasable items and a config that can't
+/// capture anything look identical otherwise.
+#[must_use]
+pub fn screen_capture_trusted() -> bool {
+    CGPreflightScreenCaptureAccess()
+}
+
+/// Prompts the user for Screen Recording access if it is not already granted.
+/// A no-op, returning `true` immediately, if it already is.
+#[must_use]
+pub fn request_screen_capture() -> bool {
+    CGRequestScreenCaptureAccess()
+}
+
+/// Whether this process can query other applications' accessibility trees.
+///
+/// Needed only for the macOS 26 Control Center workaround — a menu bar item
+/// still owned by its own process aliases fine without this.
+#[must_use]
+pub fn accessibility_trusted() -> bool {
+    // SAFETY: no arguments.
+    unsafe { objc2_application_services::AXIsProcessTrusted() }
+}
+
+/// Prompts the user for Accessibility access if it is not already granted.
+#[must_use]
+pub fn request_accessibility() -> bool {
+    // SAFETY: reads a `'static` extern constant.
+    let key = unsafe { objc2_application_services::kAXTrustedCheckOptionPrompt };
+    let true_value = objc2_core_foundation::CFBoolean::new(true);
+    let dict = CFDictionary::from_slices(&[key], &[true_value]);
+    // SAFETY: `dict` maps the documented prompt key to a `CFBoolean`, exactly
+    // as `AXIsProcessTrustedWithOptions` expects.
+    unsafe { objc2_application_services::AXIsProcessTrustedWithOptions(Some(dict.as_opaque())) }
+}
+
+/// One menu bar item a config can name in an alias, as `--query
+/// default_menu_items` would report it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MenuBarItem {
+    pub owner: String,
+    pub name: String,
+    pub pid: i32,
+}
+
+/// Lists every aliasable menu bar item currently on screen, left to right.
+///
+/// An item whose owner could not be resolved off Control Center is still
+/// listed under the owner "Control Center" — the window is real and
+/// capturable even when nothing identifies who really draws it (see the
+/// module docs). What such items commonly lack is a *unique* name: several
+/// unrelated Control Center modules currently share the placeholder name
+/// `Item-0`. Rather than hide that, every name repeated within this listing
+/// gets a `(n)` suffix appended, 1-based in left-to-right order among just
+/// that duplicate group, cross-checked against upstream `SketchyBar`'s own
+/// fix for this (`rework alias logic to handle duplicate entries`). Use the
+/// suffixed form verbatim when constructing an [`Alias`] for such an item.
+///
+/// # Errors
+///
+/// Returns [`Error::NoWindowList`] if the window server refuses the list,
+/// which is what a missing Screen Recording grant looks like from here.
+pub fn list_menu_bar_items() -> Result<Vec<MenuBarItem>> {
+    let mut windows = raw_menu_bar_windows()?;
+    windows.retain(|w| !w.name.is_empty());
+    windows.sort_by(|a, b| a.bounds.origin.x.total_cmp(&b.bounds.origin.x));
+    Ok(windows
+        .into_iter()
+        .map(|w| MenuBarItem {
+            owner: w.owner,
+            name: w.name,
+            pid: w.pid,
+        })
+        .collect())
+}
+
+/// A captured menu bar item, ready to draw.
+#[derive(Clone)]
+pub struct Capture {
+    pub image: CFRetained<CGImage>,
+    /// The window's true size in screen points — what `SketchyBar` draws the
+    /// capture at, which can disagree with the window list's own bounds.
+    pub size: CGSize,
+}
+
+/// Mirrors one other application's menu bar item.
+///
+/// Holds the resolved window across captures so a refresh is one window
+/// server round trip rather than a full re-scan and re-resolve. The window is
+/// re-found automatically if it disappears (the app quit, the item was
+/// removed) or a capture fails.
+pub struct Alias {
+    owner: String,
+    name: String,
+    window: Option<Window>,
+}
+
+impl Alias {
+    #[must_use]
+    pub fn new(owner: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            owner: owner.into(),
+            name: name.into(),
+            window: None,
+        }
+    }
+
+    #[must_use]
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Forces the next [`Alias::capture`] to re-resolve the window rather
+    /// than reuse a cached one.
+    pub fn invalidate(&mut self) {
+        self.window = None;
+    }
+
+    /// Captures the item's current contents, re-finding its window first if
+    /// none is cached or the cached one no longer captures.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if no menu bar item goes by this owner and
+    /// name any more, or the window server's error if the capture itself
+    /// fails — including [`skylight::Error::NoCapture`], which is what a
+    /// missing Screen Recording grant looks like.
+    pub fn capture(&mut self) -> Result<Capture> {
+        if self.window.is_none() {
+            self.window = Some(self.find_window()?);
+        }
+
+        // Populated immediately above, or already present.
+        let Some(window) = self.window.as_ref() else {
+            return Err(Error::NotFound);
+        };
+        match window.capture() {
+            Ok(image) => {
+                let size = window.true_rect()?.size;
+                Ok(Capture { image, size })
+            }
+            Err(err) => {
+                // The window most likely closed since it was found; drop it
+                // so the next capture re-resolves instead of repeating the
+                // same failure forever.
+                self.window = None;
+                Err(err.into())
+            }
+        }
+    }
+
+    fn find_window(&self) -> Result<Window> {
+        raw_menu_bar_windows()?
+            .into_iter()
+            .find(|w| w.owner == self.owner && w.name == self.name)
+            .map(|w| Window::from_existing(w.id))
+            .ok_or(Error::NotFound)
+    }
+}
+
+/// A menu bar layer window, with its Control Center ownership already
+/// resolved where possible.
+struct RawWindow {
+    id: WindowId,
+    owner: String,
+    name: String,
+    pid: i32,
+    bounds: CGRect,
+}
+
+/// Every menu bar layer window before [`list_menu_bar_items`]'s filtering —
+/// including ones with an empty name, and Control Center items whose real
+/// owner could not be resolved. For diagnosing what the window server and the
+/// Accessibility API actually expose on a given machine.
+#[derive(Debug, Clone)]
+pub struct RawMenuBarWindow {
+    pub id: WindowId,
+    pub owner: String,
+    pub name: String,
+    pub pid: i32,
+    pub bounds: CGRect,
+}
+
+/// Every window at the menu bar layer, unfiltered — empty names and
+/// unresolved Control Center items included.
+///
+/// # Errors
+///
+/// Returns [`Error::NoWindowList`] if the window server refuses the list.
+pub fn diagnostics() -> Result<Vec<RawMenuBarWindow>> {
+    Ok(raw_menu_bar_windows()?
+        .into_iter()
+        .map(|w| RawMenuBarWindow {
+            id: w.id,
+            owner: w.owner,
+            name: w.name,
+            pid: w.pid,
+            bounds: w.bounds,
+        })
+        .collect())
+}
+
+fn raw_menu_bar_windows() -> Result<Vec<RawWindow>> {
+    let list =
+        CGWindowListCopyWindowInfo(CGWindowListOption::OptionAll, 0).ok_or(Error::NoWindowList)?;
+
+    // The Accessibility scan is expensive (walks every running app) and only
+    // useful once Control Center shows up as an owner, so it runs at most
+    // once per call, lazily.
+    let mut extras: Option<Vec<ax::ExtrasMenuItem>> = None;
+
+    let mut windows = Vec::new();
+    for i in 0..list.count() {
+        // SAFETY: `i` is in bounds; every element of this array is a
+        // `CFDictionary`, per `CGWindowListCopyWindowInfo`'s documented
+        // contract.
+        let Some(dict) = (unsafe { dict_at(&list, i) }) else {
+            continue;
+        };
+
+        let Some(layer) = dict_i64(dict, unsafe { kCGWindowLayer }) else {
+            continue;
+        };
+        if layer != MENU_BAR_LAYER {
+            continue;
+        }
+
+        let Some(owner) = dict_string(dict, unsafe { kCGWindowOwnerName }) else {
+            continue;
+        };
+        if owner == "Window Server" {
+            continue;
+        }
+        let Some(pid) = dict_i64(dict, unsafe { kCGWindowOwnerPID }) else {
+            continue;
+        };
+        let Some(id) = dict_i64(dict, unsafe { kCGWindowNumber }) else {
+            continue;
+        };
+        let Some(bounds) = dict_rect(dict, unsafe { kCGWindowBounds }) else {
+            continue;
+        };
+        let name = dict_string(dict, unsafe { kCGWindowName }).unwrap_or_default();
+
+        let pid = i32::try_from(pid).unwrap_or(i32::MAX);
+        let (owner, pid) = if is_control_center_owner(&owner) {
+            let extras = extras.get_or_insert_with(ax::enumerate_extras_menu_items);
+            ax::resolve(&name, bounds, extras)
+                .map(|item| (item.owner.clone(), item.pid))
+                .unwrap_or((owner, pid))
+        } else {
+            (owner, pid)
+        };
+
+        windows.push(RawWindow {
+            id: WindowId::try_from(id).unwrap_or(WindowId::MAX),
+            owner,
+            name,
+            pid,
+            bounds,
+        });
+    }
+
+    disambiguate_duplicates(&mut windows);
+    Ok(windows)
+}
+
+/// Appends a `(n)` suffix, 1-based in left-to-right order, to the name of
+/// every window whose `(owner, name)` is not already unique — matching
+/// upstream `SketchyBar`'s fix for the same problem. Windows with a unique
+/// name are untouched.
+fn disambiguate_duplicates(windows: &mut [RawWindow]) {
+    let mut order: Vec<usize> = (0..windows.len()).collect();
+    order.sort_by(|&a, &b| {
+        windows[a]
+            .bounds
+            .origin
+            .x
+            .total_cmp(&windows[b].bounds.origin.x)
+    });
+
+    let mut total: HashMap<(String, String), u32> = HashMap::new();
+    for &i in &order {
+        *total
+            .entry((windows[i].owner.clone(), windows[i].name.clone()))
+            .or_insert(0) += 1;
+    }
+
+    let mut seen: HashMap<(String, String), u32> = HashMap::new();
+    for i in order {
+        let key = (windows[i].owner.clone(), windows[i].name.clone());
+        if total[&key] <= 1 {
+            continue;
+        }
+        let count = seen.entry(key).or_insert(0);
+        *count += 1;
+        windows[i].name = format!("{}({})", windows[i].name, count);
+    }
+}
+
+fn is_control_center_owner(owner: &str) -> bool {
+    matches!(owner, "Control Center" | "ControlCenter" | "Control Centre")
+}
+
+// ---- CFDictionary field extraction -----------------------------------------
+
+/// # Safety
+/// `i` must be a valid index into `array`, and every element must be a
+/// `CFDictionary`.
+unsafe fn dict_at(array: &CFArray, i: isize) -> Option<&CFDictionary> {
+    let ptr = unsafe { array.value_at_index(i) };
+    let ptr = NonNull::new(ptr.cast_mut())?.cast::<CFType>();
+    let ty = unsafe { ptr.as_ref() };
+    ty.downcast_ref::<CFDictionary>()
+}
+
+fn cf_key(key: &CFString) -> *const c_void {
+    (std::ptr::from_ref(key)).cast()
+}
+
+fn dict_value<'a>(dict: &'a CFDictionary, key: &CFString) -> Option<&'a CFType> {
+    // SAFETY: `key` is a valid, live `CFString` for the duration of the call.
+    let ptr = unsafe { dict.value(cf_key(key)) };
+    let ptr = NonNull::new(ptr.cast_mut())?.cast::<CFType>();
+    // SAFETY: the pointer came from the dictionary we borrowed `dict` from,
+    // so it lives at least as long as `dict` does.
+    Some(unsafe { ptr.as_ref() })
+}
+
+fn dict_string(dict: &CFDictionary, key: &CFString) -> Option<String> {
+    Some(
+        dict_value(dict, key)?
+            .downcast_ref::<CFString>()?
+            .to_string(),
+    )
+}
+
+fn dict_i64(dict: &CFDictionary, key: &CFString) -> Option<i64> {
+    dict_value(dict, key)?.downcast_ref::<CFNumber>()?.as_i64()
+}
+
+fn dict_rect(dict: &CFDictionary, key: &CFString) -> Option<CGRect> {
+    let bounds = dict_value(dict, key)?.downcast_ref::<CFDictionary>()?;
+    let mut rect = CGRect::default();
+    // SAFETY: `bounds` is a valid dictionary and `rect` a valid out-pointer.
+    unsafe { CGRectMakeWithDictionaryRepresentation(Some(bounds), &raw mut rect) }.then_some(rect)
+}
+
+fn rect_center(rect: CGRect) -> CGPoint {
+    CGPoint::new(
+        rect.origin.x + rect.size.width / 2.0,
+        rect.origin.y + rect.size.height / 2.0,
+    )
+}
+
+fn point_distance(a: CGPoint, b: CGPoint) -> f64 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    dx.hypot(dy)
+}
+
+/// The macOS 26 Control Center workaround: recovering a menu bar item's real
+/// owner and title through the Accessibility API, cross-checked against
+/// `SketchyBar`'s `source_pid.m`.
+mod ax {
+    use super::{
+        AXError, AXUIElement, AXValue, AXValueType, CFArray, CFRetained, CFString, CFType, CGPoint,
+        CGRect, CGSize, point_distance, rect_center,
+    };
+    use objc2_app_kit::NSWorkspace;
+    use std::ptr::NonNull;
+
+    /// One entry from a running application's `AXExtrasMenuBar`: a status
+    /// item this process can plausibly be the real owner of.
+    pub(super) struct ExtrasMenuItem {
+        pub owner: String,
+        pub title: String,
+        pub pid: i32,
+        pub frame: CGRect,
+    }
+
+    /// Walks every running application's extras menu bar. Returns nothing,
+    /// silently, if Accessibility permission is not granted — the same
+    /// silent-failure shape as Screen Recording, which is why
+    /// [`super::accessibility_trusted`] exists.
+    pub(super) fn enumerate_extras_menu_items() -> Vec<ExtrasMenuItem> {
+        let mut items = Vec::new();
+
+        let workspace = NSWorkspace::sharedWorkspace();
+        let running = workspace.runningApplications();
+
+        for app in &running.to_vec() {
+            let pid = app.processIdentifier();
+            if pid <= 0 {
+                continue;
+            }
+            let owner = app
+                .localizedName()
+                .map_or_else(|| pid.to_string(), |name| name.to_string());
+
+            // SAFETY: `pid` is a valid, live process id.
+            let element = unsafe { AXUIElement::new_application(pid) };
+            let Some(extras) = copy_element(&element, "AXExtrasMenuBar") else {
+                continue;
+            };
+            let Some(children) = copy_array(&extras, "AXVisibleChildren")
+                .or_else(|| copy_array(&extras, "AXChildren"))
+            else {
+                continue;
+            };
+
+            for i in 0..children.count() {
+                // SAFETY: `i` is in bounds; every element of an
+                // `AXUIElement`'s children attribute is itself an
+                // `AXUIElement`.
+                let Some(child) = (unsafe { array_element(&children, i) }) else {
+                    continue;
+                };
+
+                if !attribute_bool(child, "AXEnabled").unwrap_or(true) {
+                    continue;
+                }
+                let Some(title) = attribute_string(child, "AXTitle") else {
+                    continue;
+                };
+                if title.is_empty() {
+                    continue;
+                }
+                let Some(frame) = attribute_frame(child) else {
+                    continue;
+                };
+
+                items.push(ExtrasMenuItem {
+                    owner: owner.clone(),
+                    title,
+                    pid,
+                    frame,
+                });
+            }
+        }
+
+        items
+    }
+
+    /// Matches a captured window's name and bounds against the extras
+    /// gathered by [`enumerate_extras_menu_items`], the same two-pass
+    /// tolerance `SketchyBar`'s `source_pid_for_window_with_name_hint` uses:
+    /// first an exact title match within a tight radius, then bounds alone
+    /// within a looser one for items whose title didn't round-trip.
+    pub(super) fn resolve<'a>(
+        window_name: &str,
+        bounds: CGRect,
+        extras: &'a [ExtrasMenuItem],
+    ) -> Option<&'a ExtrasMenuItem> {
+        const TIGHT_RADIUS: f64 = 6.0;
+        const TIGHT_SIZE_TOLERANCE: f64 = 8.0;
+        const LOOSE_RADIUS: f64 = 14.0;
+
+        let center = rect_center(bounds);
+        let close_enough = |item: &&ExtrasMenuItem| {
+            let d = point_distance(center, rect_center(item.frame));
+            let w_diff = (item.frame.size.width - bounds.size.width).abs();
+            let h_diff = (item.frame.size.height - bounds.size.height).abs();
+            d <= TIGHT_RADIUS && w_diff <= TIGHT_SIZE_TOLERANCE && h_diff <= TIGHT_SIZE_TOLERANCE
+        };
+
+        if !window_name.is_empty() {
+            let named = extras
+                .iter()
+                .filter(|item| item.title == window_name)
+                .filter(close_enough)
+                .min_by(|a, b| {
+                    point_distance(center, rect_center(a.frame))
+                        .total_cmp(&point_distance(center, rect_center(b.frame)))
+                });
+            if named.is_some() {
+                return named;
+            }
+        }
+
+        extras
+            .iter()
+            .filter(|item| point_distance(center, rect_center(item.frame)) <= LOOSE_RADIUS)
+            .min_by(|a, b| {
+                point_distance(center, rect_center(a.frame))
+                    .total_cmp(&point_distance(center, rect_center(b.frame)))
+            })
+    }
+
+    fn attribute(element: &AXUIElement, name: &str) -> Option<CFRetained<CFType>> {
+        let attr = CFString::from_str(name);
+        let mut value: *const CFType = std::ptr::null();
+        // SAFETY: `attr` is a live `CFString` for the call's duration, and
+        // `value` is a valid out-pointer.
+        let err = unsafe { element.copy_attribute_value(&attr, NonNull::from(&mut value)) };
+        if err != AXError::Success {
+            return None;
+        }
+        let ptr = NonNull::new(value.cast_mut())?;
+        // SAFETY: a non-null result from `AXUIElementCopyAttributeValue`
+        // carries a +1 reference, which transfers to `CFRetained`.
+        Some(unsafe { CFRetained::from_raw(ptr) })
+    }
+
+    fn copy_element(element: &AXUIElement, name: &str) -> Option<CFRetained<AXUIElement>> {
+        attribute(element, name)?.downcast::<AXUIElement>().ok()
+    }
+
+    fn copy_array(element: &AXUIElement, name: &str) -> Option<CFRetained<CFArray>> {
+        attribute(element, name)?.downcast::<CFArray>().ok()
+    }
+
+    /// # Safety
+    /// `i` must be a valid index into `array`, and every element must be an
+    /// `AXUIElement`.
+    unsafe fn array_element(array: &CFArray, i: isize) -> Option<&AXUIElement> {
+        let ptr = unsafe { array.value_at_index(i) };
+        let ptr = NonNull::new(ptr.cast_mut())?.cast::<CFType>();
+        let ty = unsafe { ptr.as_ref() };
+        ty.downcast_ref::<AXUIElement>()
+    }
+
+    fn attribute_string(element: &AXUIElement, name: &str) -> Option<String> {
+        Some(
+            attribute(element, name)?
+                .downcast::<CFString>()
+                .ok()?
+                .to_string(),
+        )
+    }
+
+    fn attribute_bool(element: &AXUIElement, name: &str) -> Option<bool> {
+        let value = attribute(element, name)?;
+        let boolean = value.downcast::<objc2_core_foundation::CFBoolean>().ok()?;
+        Some(boolean.as_bool())
+    }
+
+    fn attribute_value<const N: usize>(
+        element: &AXUIElement,
+        name: &str,
+        the_type: AXValueType,
+    ) -> Option<[u8; N]> {
+        let value = attribute(element, name)?.downcast::<AXValue>().ok()?;
+        let mut buf = [0u8; N];
+        // SAFETY: `buf` has exactly the size `the_type`'s C structure needs,
+        // matched by the caller.
+        let ok = unsafe { value.value(the_type, NonNull::from(&mut buf).cast()) };
+        ok.then_some(buf)
+    }
+
+    fn attribute_point(element: &AXUIElement, name: &str) -> Option<CGPoint> {
+        let bytes =
+            attribute_value::<{ size_of::<CGPoint>() }>(element, name, AXValueType::CGPoint)?;
+        Some(unsafe { std::mem::transmute::<[u8; size_of::<CGPoint>()], CGPoint>(bytes) })
+    }
+
+    fn attribute_size(element: &AXUIElement, name: &str) -> Option<CGSize> {
+        let bytes = attribute_value::<{ size_of::<CGSize>() }>(element, name, AXValueType::CGSize)?;
+        Some(unsafe { std::mem::transmute::<[u8; size_of::<CGSize>()], CGSize>(bytes) })
+    }
+
+    fn attribute_frame(element: &AXUIElement) -> Option<CGRect> {
+        if let Some(bytes) =
+            attribute_value::<{ size_of::<CGRect>() }>(element, "AXFrame", AXValueType::CGRect)
+        {
+            return Some(unsafe {
+                std::mem::transmute::<[u8; size_of::<CGRect>()], CGRect>(bytes)
+            });
+        }
+        let position = attribute_point(element, "AXPosition")?;
+        let size = attribute_size(element, "AXSize")?;
+        Some(CGRect::new(position, size))
+    }
+}
