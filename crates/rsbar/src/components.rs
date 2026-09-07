@@ -10,8 +10,8 @@
 use bevy_ecs::prelude::*;
 use rsbar_protocol::style::{Color, FontSpec};
 use rsbar_protocol::{ItemName, Kind, Position};
-use std::collections::{BTreeSet, HashMap};
-use std::num::NonZeroU32;
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::num::{NonZeroU32, NonZeroU64};
 
 /// Which display something is restricted to: every one, or a single 1-based
 /// index into [`crate::display::active`]'s order — the same order
@@ -208,7 +208,7 @@ pub struct Padding {
 #[derive(Component, Debug, Clone, Copy, PartialEq)]
 pub struct Offset(pub f64);
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Component, Debug, Clone, PartialEq, Eq)]
 pub struct Placement(pub Position);
 
 /// Where the item sits among the others in its bucket, left to right.
@@ -345,6 +345,137 @@ pub struct Members(pub Vec<ItemName>);
 /// identical — which is most re-captures.
 #[derive(Component, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AliasContent(pub u64);
+
+/// Which Mission Control space a `space` item represents — `SketchyBar`'s own
+/// `associated_space` on `struct bar_item` (`bar_item.h`).
+///
+/// `None` until something sets it. Nothing can yet: real `SketchyBar` takes
+/// this as an ordinary `--set` property, same class as `icon` or `label`, and
+/// [`rsbar_protocol::ItemPatch`] has no field for it — see the daemon's own
+/// notes on this pass for why that is a protocol gap rather than something
+/// invented here.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AssociatedSpace(pub Option<NonZeroU64>);
+
+/// Whether a space item's own [`AssociatedSpace`] is the one currently on
+/// screen — `SketchyBar`'s own `bar_item->selected`, recomputed in
+/// `bar_manager_update_space_components` every time a space changes.
+///
+/// Recomputed in `ecs.rs`'s `update_space_selection`, off `Event::SpaceChanged`.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Selected(pub bool);
+
+/// How many samples a graph keeps by default, absent any way to say
+/// otherwise.
+///
+/// Real `SketchyBar` takes this as a width argument on `--add graph <name>
+/// <position> <width>` (`graph_setup` in `graph.c`); `AddComponent` carries no
+/// such argument, so every graph starts at this fixed size instead — see the
+/// daemon's own notes on this pass.
+pub const DEFAULT_GRAPH_SAMPLES: usize = 100;
+
+/// A graph's rolling window of samples, oldest first — `struct graph` in
+/// `SketchyBar`'s own `graph.c`, which is exactly this ring buffer. Pushed by
+/// `--push <name> <value>` there; `rsbar_protocol::Request` has no variant
+/// for that yet, so `requests::push` exists and is tested but nothing routes
+/// a request to it — see the daemon's own notes on this pass.
+///
+/// Fixed capacity at creation and never grown, same as `graph_setup`'s own
+/// `malloc`'d buffer: a graph forgets its oldest sample rather than widening.
+#[derive(Component, Debug, Clone, PartialEq)]
+pub struct Graph {
+    pub samples: VecDeque<f32>,
+    pub capacity: usize,
+    pub line_color: Color,
+    pub fill_color: Color,
+    pub fill: bool,
+    pub line_width: f64,
+}
+
+impl Graph {
+    /// Matches `graph_init`'s own defaults in `graph.c`.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            samples: VecDeque::with_capacity(capacity),
+            capacity,
+            line_color: Color(0xffcc_cccc),
+            fill_color: Color(0xffcc_cccc),
+            fill: true,
+            line_width: 0.5,
+        }
+    }
+
+    /// Whether pushing `value` now would move anything visible.
+    ///
+    /// Checked before ever reaching for a `Mut<Graph>` — see the module doc on
+    /// why that matters. A script re-reporting the same reading is the common
+    /// case, not the exception, and must not reshape or repaint the item.
+    #[must_use]
+    pub fn would_change(&self, value: f32) -> bool {
+        self.samples.back() != Some(&value)
+    }
+
+    /// Pushes one new sample onto the end, dropping the oldest once full —
+    /// `graph_push_back` in `graph.c`. Callers check [`Self::would_change`]
+    /// first; this always writes.
+    pub fn push(&mut self, value: f32) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.samples.len() == self.capacity {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(value);
+    }
+}
+
+/// A slider's own width, absent any way to say otherwise.
+///
+/// Real `SketchyBar` takes this as a width argument on `--add slider <name>
+/// <position> <width>` (`slider_setup` in `slider.c`), exactly the same gap as
+/// [`DEFAULT_GRAPH_SAMPLES`] — see the daemon's own notes on this pass.
+pub const DEFAULT_SLIDER_WIDTH: f64 = 100.0;
+
+/// A slider's own state — `struct slider` in `SketchyBar`'s own `slider.c`:
+/// how far along the knob sits, and the track it slides on.
+///
+/// Nothing writes [`Self::percentage`] after creation yet: real `SketchyBar`
+/// takes it as an ordinary `--set <name> percentage=<n>` property, and
+/// [`rsbar_protocol::ItemPatch`] has no field for it, the same gap
+/// [`AssociatedSpace`] has — see the daemon's own notes on this pass. Dragging
+/// the knob, which is how a volume slider is actually used, additionally
+/// needs pointer-drag routing that only exists for clicks today.
+#[derive(Component, Debug, Clone, PartialEq)]
+pub struct Slider {
+    /// Clamped to 0-100 by [`Self::clamp`], same as `slider_set_percentage`.
+    pub percentage: u8,
+    pub width: f64,
+    pub track_color: Color,
+    pub fill_color: Color,
+    pub knob: Run,
+}
+
+impl Slider {
+    /// Matches `slider_init`'s own defaults in `slider.c`.
+    #[must_use]
+    pub fn new(width: f64) -> Self {
+        Self {
+            percentage: 0,
+            width,
+            track_color: Color(0xff00_0000),
+            fill_color: Color(0xff00_00ff),
+            knob: Run::new("sketchybar-app-font:Regular:16.0", Color::WHITE),
+        }
+    }
+
+    /// 0-100, the same clamp `slider_set_percentage` applies before ever
+    /// comparing against the value already there.
+    #[must_use]
+    pub fn clamp(percentage: u32) -> u8 {
+        u8::try_from(percentage.min(100)).unwrap_or(100)
+    }
+}
 
 /// The claims this item holds on the sources behind its subscriptions.
 ///
@@ -524,5 +655,55 @@ mod tests {
         assert!(DisplayTarget::All.matches(2));
         assert!(!two.matches(1));
         assert!(two.matches(2));
+    }
+
+    #[test]
+    fn a_graph_forgets_its_oldest_sample_once_full() {
+        let mut graph = Graph::new(3);
+        for sample in [1.0, 2.0, 3.0, 4.0] {
+            graph.push(sample);
+        }
+        assert_eq!(
+            graph.samples,
+            std::collections::VecDeque::from([2.0, 3.0, 4.0])
+        );
+    }
+
+    #[test]
+    fn pushing_the_value_a_graph_already_ends_on_changes_nothing() {
+        // The hard requirement this whole pass is about: a script re-reporting
+        // an unchanged reading must not be visible as a change, or it repaints
+        // the bar for as long as it keeps running.
+        let mut graph = Graph::new(3);
+        graph.push(42.0);
+        assert!(!graph.would_change(42.0));
+        assert!(graph.would_change(43.0));
+    }
+
+    #[test]
+    fn a_graph_with_no_capacity_never_keeps_a_sample() {
+        let mut graph = Graph::new(0);
+        graph.push(1.0);
+        assert!(graph.samples.is_empty());
+    }
+
+    #[test]
+    fn a_slider_percentage_clamps_into_range() {
+        assert_eq!(Slider::clamp(0), 0);
+        assert_eq!(Slider::clamp(100), 100);
+        assert_eq!(Slider::clamp(150), 100);
+    }
+
+    #[test]
+    fn a_fresh_slider_starts_at_zero() {
+        let slider = Slider::new(DEFAULT_SLIDER_WIDTH);
+        assert_eq!(slider.percentage, 0);
+        assert!((slider.width - DEFAULT_SLIDER_WIDTH).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_fresh_space_item_is_unassigned_and_unselected() {
+        assert_eq!(AssociatedSpace::default(), AssociatedSpace(None));
+        assert_eq!(Selected::default(), Selected(false));
     }
 }

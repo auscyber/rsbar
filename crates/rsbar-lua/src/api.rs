@@ -18,7 +18,7 @@ use rsbar_protocol::{ItemName, ItemPatch, Query, Request, Response};
 use crate::convert::{
     bar_patch_from_table, bar_state_to_table, deep_merge, item_name_from_str,
     item_patch_from_table, item_position_from_table, item_state_to_table, kinds_from_value,
-    pattern_from_name,
+    selector_from_name,
 };
 use crate::dispatch::Dispatcher;
 use crate::events::Registry;
@@ -178,6 +178,39 @@ async fn add_item(
     expect_ok(dispatcher.call(Request::AddItem { name, position }).await)
 }
 
+/// `Request::AddComponent`, degrading to a plain item if the daemon rejects
+/// the kind outright — a `Response::Error` reaches this as
+/// [`crate::error::ApiError::Rejected`], the [`Dispatcher`]'s own way of
+/// turning "recognised, but I cannot draw one yet" into an error rather than
+/// letting that abort the whole config over one component it cannot draw.
+async fn add_component(
+    dispatcher: &Rc<dyn Dispatcher>,
+    name: ItemName,
+    position: rsbar_protocol::Position,
+    kind: rsbar_protocol::ComponentKind,
+) -> mlua::Result<()> {
+    match dispatcher
+        .call(Request::AddComponent {
+            name: name.clone(),
+            position: position.clone(),
+            kind,
+        })
+        .await
+    {
+        Ok(Response::Ok) => Ok(()),
+        Ok(other) => Err(unexpected(&other)),
+        Err(crate::error::ApiError::Rejected(message)) => {
+            tracing::error!(
+                ?kind,
+                %message,
+                "the daemon cannot draw this component yet; adding a plain item instead"
+            );
+            add_item(dispatcher, name, position).await
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
 async fn set_item(
     dispatcher: &Rc<dyn Dispatcher>,
     name: ItemName,
@@ -256,9 +289,17 @@ fn members_from_value(members: &Value) -> mlua::Result<Vec<rsbar_protocol::Selec
 }
 
 /// `SketchyBar` kinds `--add` accepts but nothing on the daemon side can draw
-/// yet ([`rsbar_protocol::ComponentKind`]) — real, not a typo, so `add_fn`
+/// yet — real, not a typo, so `add_fn` models them as [`ComponentKind`]
+/// (`Request::AddComponent`) rather than falling back to a plain item, and
 /// logs them differently from a kind it has never heard of.
-const RECOGNISED_UNIMPLEMENTED_KINDS: &[&str] = &["space", "graph", "slider"];
+fn component_kind_from_str(kind: &str) -> Option<rsbar_protocol::ComponentKind> {
+    match kind {
+        "space" => Some(rsbar_protocol::ComponentKind::Space),
+        "graph" => Some(rsbar_protocol::ComponentKind::Graph),
+        "slider" => Some(rsbar_protocol::ComponentKind::Slider),
+        _ => None,
+    }
+}
 
 /// `rsbar.add(kind, name, ...)` — `SketchyBar`'s own calling convention, kept
 /// deliberately close to it rather than to a different shape rsbar might
@@ -276,9 +317,10 @@ const RECOGNISED_UNIMPLEMENTED_KINDS: &[&str] = &["space", "graph", "slider"];
 ///   no request that could); only checks `name` is a name `subscribe`/
 ///   `trigger` will accept later. Returns `nil`.
 /// * `"space"`, `"graph"`, `"slider"` — `SketchyBar` kinds rsbar recognises
-///   ([`rsbar_protocol::ComponentKind`]) but cannot draw yet; logged as such
-///   and, like any other unmodelled kind, given a plain item instead of
-///   nothing so `:set`/`:subscribe` on the handle still works.
+///   but cannot draw yet: sent as `Request::AddComponent` (a real
+///   [`rsbar_protocol::ComponentKind`]) rather than an item, so the daemon
+///   knows what was actually asked for, logged as such rather than as an
+///   unknown kind.
 /// * anything else — a config's typo, most likely; logged by name and
 ///   treated as a plain item all the same, rather than aborting the config
 ///   over one bad `add`.
@@ -326,10 +368,10 @@ fn add_fn(
                         }
                     } else {
                         if kind != "item" && kind != "alias" {
-                            if RECOGNISED_UNIMPLEMENTED_KINDS.contains(&kind.as_str()) {
+                            if component_kind_from_str(&kind).is_some() {
                                 tracing::error!(
                                     kind = %kind,
-                                    "recognised, but rsbar cannot draw a {kind} yet; adding a plain item instead"
+                                    "recognised, but rsbar cannot draw a {kind} yet; adding it as a `ComponentKind` the daemon can at least track"
                                 );
                             } else {
                                 tracing::error!(
@@ -366,7 +408,13 @@ fn add_fn(
                 let merged = merged_opts(&lua, &defaults, opts_table.as_ref())?;
                 let position = item_position_from_table(&merged)?;
 
-                add_item(&dispatcher, item_name.clone(), position).await?;
+                match component_kind_from_str(&kind) {
+                    Some(component_kind) => {
+                        add_component(&dispatcher, item_name.clone(), position, component_kind)
+                            .await?;
+                    }
+                    None => add_item(&dispatcher, item_name.clone(), position).await?,
+                }
 
                 let mut patch = item_patch_from_table(&merged)?;
                 if kind == "alias" && patch.alias.is_none() {
@@ -397,8 +445,8 @@ fn set_fn(lua: &Lua, dispatcher: &Rc<dyn Dispatcher>) -> mlua::Result<Function> 
         let dispatcher = Rc::clone(&dispatcher);
         async move {
             let patch = item_patch_from_table(&patch)?;
-            match pattern_from_name(&name)? {
-                Some(pattern) => expect_ok(
+            match selector_from_name(&name)? {
+                rsbar_protocol::Selector::Pattern(pattern) => expect_ok(
                     dispatcher
                         .call(Request::SetMatching {
                             pattern,
@@ -406,7 +454,7 @@ fn set_fn(lua: &Lua, dispatcher: &Rc<dyn Dispatcher>) -> mlua::Result<Function> 
                         })
                         .await,
                 ),
-                None => set_item(&dispatcher, item_name_from_str(&name)?, patch).await,
+                rsbar_protocol::Selector::Name(name) => set_item(&dispatcher, name, patch).await,
             }
         }
     })
@@ -443,9 +491,12 @@ fn default_fn(lua: &Lua, defaults: &Rc<RefCell<Option<Table>>>) -> mlua::Result<
 fn exec_fn(lua: &Lua) -> mlua::Result<Function> {
     lua.create_async_function(
         move |_, (command, callback): (String, Option<Function>)| async move {
+            // `PATH` so that a config's own `sketchybar --update` reaches the
+            // daemon, which is that CLI. See `rsbar_protocol::shim_dir`.
             match tokio::process::Command::new("sh")
                 .arg("-c")
                 .arg(&command)
+                .env("PATH", rsbar_protocol::shimmed_path())
                 .output()
                 .await
             {
@@ -477,13 +528,13 @@ fn remove_fn(lua: &Lua, dispatcher: &Rc<dyn Dispatcher>) -> mlua::Result<Functio
     lua.create_async_function(move |_, name: String| {
         let dispatcher = Rc::clone(&dispatcher);
         async move {
-            match pattern_from_name(&name)? {
-                Some(pattern) => expect_ok(dispatcher.call(Request::RemoveMatching(pattern)).await),
-                None => expect_ok(
-                    dispatcher
-                        .call(Request::RemoveItem(item_name_from_str(&name)?))
-                        .await,
-                ),
+            match selector_from_name(&name)? {
+                rsbar_protocol::Selector::Pattern(pattern) => {
+                    expect_ok(dispatcher.call(Request::RemoveMatching(pattern)).await)
+                }
+                rsbar_protocol::Selector::Name(name) => {
+                    expect_ok(dispatcher.call(Request::RemoveItem(name)).await)
+                }
             }
         }
     })

@@ -461,6 +461,15 @@ mod tests {
     #[test]
     fn an_item_state_renders_geometry_and_style() {
         let state = ItemState {
+            popup: rsbar_protocol::PopupState {
+                drawing: false,
+                horizontal: false,
+                align: "left".into(),
+                topmost: true,
+                height: 0.0,
+                y_offset: 0.0,
+                background: rsbar_protocol::Background::default(),
+            },
             name: ItemName::new("clock").unwrap(),
             geometry: Geometry {
                 drawing: true,

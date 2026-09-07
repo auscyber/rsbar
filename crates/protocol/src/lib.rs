@@ -25,6 +25,98 @@ pub fn service_name() -> String {
     std::env::var("RSBAR_SERVICE").unwrap_or_else(|_| "com.auscyber.rsbar".to_owned())
 }
 
+/// A boolean a config can also ask to flip.
+///
+/// `SketchyBar` accepts `drawing=toggle` wherever it accepts `on`/`off`, and
+/// the user's own config binds a click to `popup.drawing=toggle`. A plain
+/// `bool` cannot carry that: whether it ends up true or false depends on what
+/// it already was, which only the daemon knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Toggle {
+    On,
+    Off,
+    Flip,
+}
+
+impl Toggle {
+    /// What this makes of a value that is currently `current`.
+    #[must_use]
+    pub fn resolve(self, current: bool) -> bool {
+        match self {
+            Self::On => true,
+            Self::Off => false,
+            Self::Flip => !current,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("`{0}` is not on/off, true/false, yes/no, 1/0 or toggle")]
+pub struct InvalidToggle(String);
+
+impl FromStr for Toggle {
+    type Err = InvalidToggle;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "on" | "true" | "yes" | "1" => Ok(Self::On),
+            "off" | "false" | "no" | "0" => Ok(Self::Off),
+            "toggle" => Ok(Self::Flip),
+            _ => Err(InvalidToggle(s.to_owned())),
+        }
+    }
+}
+
+impl fmt::Display for Toggle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::On => "on",
+            Self::Off => "off",
+            Self::Flip => "toggle",
+        })
+    }
+}
+
+impl Serialize for Toggle {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Toggle {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Where the daemon puts a `sketchybar`-named link to itself.
+///
+/// A config's plugin scripts shell out to `sketchybar` by name to set the item
+/// they were run for, and its `init.lua` finishes with `sketchybar --update`.
+/// The daemon is that CLI, so it puts a link under this directory and anything
+/// running a config's commands -- the daemon's own script runner, and the Lua
+/// host, which is a separate process -- puts it in front of `PATH`. Agreed
+/// here because it is a convention between the daemon and its clients, which
+/// is what this crate is for.
+#[must_use]
+pub fn shim_dir() -> std::path::PathBuf {
+    // SAFETY: `getuid` cannot fail and touches nothing.
+    let uid = unsafe { libc::getuid() };
+    std::env::temp_dir().join(format!("rsbar-{uid}-bin"))
+}
+
+/// `PATH` with [`shim_dir`] in front of it.
+#[must_use]
+pub fn shimmed_path() -> std::ffi::OsString {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let mut path = std::ffi::OsString::from(shim_dir());
+    if !inherited.is_empty() {
+        path.push(":");
+        path.push(&inherited);
+    }
+    path
+}
+
 /// An item's identity. A newtype so an item name and a stray string cannot be
 /// swapped for one another.
 ///
@@ -188,7 +280,10 @@ impl<'de> Deserialize<'de> for Edge {
 ///
 /// The two centre-adjacent buckets exist so a config can put something beside
 /// a centred item without it being re-centred along with it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Not `Copy`: the popup case names the item it hangs off, and that name is
+/// an `Arc<str>`. Cloning one is a reference count, which is the same price
+/// every other clone in this protocol pays.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Position {
     #[default]
     Left,
@@ -196,6 +291,9 @@ pub enum Position {
     Center,
     CenterRight,
     Right,
+    /// Inside the named item's popup rather than anywhere on the bar, which
+    /// is how a config writes `position = "popup.volume"`.
+    Popup(ItemName),
 }
 
 /// `SketchyBar`'s own spellings, which is what its `--query` prints -- `q`
@@ -210,6 +308,7 @@ impl fmt::Display for Position {
             Self::Center => "center",
             Self::CenterRight => "e",
             Self::Right => "right",
+            Self::Popup(host) => return write!(f, "popup.{host}"),
         })
     }
 }
@@ -244,7 +343,14 @@ impl FromStr for Position {
             "center" | "centre" | "c" => Ok(Self::Center),
             "center-right" | "centre-right" | "e" => Ok(Self::CenterRight),
             "right" | "r" => Ok(Self::Right),
-            _ => Err(InvalidPosition(s.to_owned())),
+            // Matched before the error so the host's name keeps its own case,
+            // which the lowercased copy above has already lost.
+            _ => match s.split_once('.') {
+                Some(("popup", host)) => ItemName::new(host)
+                    .map(Self::Popup)
+                    .map_err(|_| InvalidPosition(s.to_owned())),
+                _ => Err(InvalidPosition(s.to_owned())),
+            },
         }
     }
 }
@@ -280,6 +386,17 @@ pub struct BarPatch {
     pub padding_right: Option<f64>,
     /// Which displays the bar appears on: `all`, or a 1-based index.
     pub display: Option<String>,
+    /// Whether the bar stays put across a space switch.
+    pub sticky: Option<bool>,
+    /// Whether the bar draws over a fullscreen app.
+    pub show_in_fullscreen: Option<bool>,
+    /// The gap the centre buckets leave around the notch. Built-in display
+    /// only, which is the only one that has one.
+    pub notch_width: Option<f64>,
+    /// Added to the bar's frame on the built-in display.
+    pub notch_offset: Option<f64>,
+    /// Overrides the bar's height on the built-in display, when above zero.
+    pub notch_display_height: Option<f64>,
 }
 
 /// A partial update to one item.
@@ -296,7 +413,7 @@ pub struct ItemPatch {
     pub padding_right: Option<f64>,
     pub y_offset: Option<f64>,
     pub position: Option<Position>,
-    pub drawing: Option<bool>,
+    pub drawing: Option<Toggle>,
     /// Run on every update. Receives `RSBAR_NAME`, `RSBAR_SENDER` and the
     /// event's payload as named variables.
     pub script: Option<String>,
@@ -328,6 +445,36 @@ pub struct ItemPatch {
     pub width: Option<f64>,
     /// Which displays this item appears on: `all`, or a 1-based index.
     pub display: Option<String>,
+    /// Which space a `space` item stands for. `Some(None)` unsets it, which
+    /// is why it is doubly optional: the outer layer is "did the patch say
+    /// anything", the inner one is the value.
+    pub associated_space: Option<Option<std::num::NonZeroU64>>,
+    /// A slider's fill, 0-100.
+    pub percentage: Option<u8>,
+    /// A slider's knob.
+    pub knob: Option<RunPatch>,
+    /// A space item's colour when it is the selected one.
+    pub highlight_color: Option<Color>,
+    /// The popup this item hangs off itself, shown by `popup.drawing=on`.
+    pub popup: Option<PopupPatch>,
+}
+
+/// A partial update to an item's own popup.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PopupPatch {
+    pub drawing: Option<Toggle>,
+    /// Rows run left to right instead of stacking.
+    pub horizontal: Option<bool>,
+    /// Which edge of the host the popup lines up with: `left`, `center` or
+    /// `right`.
+    pub align: Option<String>,
+    pub topmost: Option<bool>,
+    /// Each row's height.
+    pub height: Option<f64>,
+    /// Gap between the host item and the popup.
+    pub y_offset: Option<f64>,
+    pub background: Option<BackgroundPatch>,
 }
 
 // `struct_patch::Patch` compares each field to decide what a patch changed.
@@ -501,6 +648,12 @@ pub enum Request {
         name: ItemName,
         events: Vec<Kind>,
     },
+    /// `--push <name> <value>`: one more sample for a graph.
+    Push {
+        name: ItemName,
+        /// `f32` to match the sample type a graph stores.
+        value: f32,
+    },
     /// Fires an event now, as if a source had produced it.
     Trigger(Event),
     /// Runs every item's script immediately, ignoring update frequency.
@@ -528,6 +681,10 @@ pub enum Request {
 }
 
 /// What the daemon currently believes the bar looks like.
+// A report, not a configuration object: every flag the bar has is on it by
+// definition, so grouping them into sub-structs would only make a caller
+// reassemble what it asked for.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BarState {
     pub height: f64,
@@ -540,6 +697,11 @@ pub struct BarState {
     pub topmost: bool,
     pub hidden: bool,
     pub displays: usize,
+    pub sticky: bool,
+    pub show_in_fullscreen: bool,
+    pub notch_width: f64,
+    pub notch_offset: f64,
+    pub notch_display_height: f64,
 }
 
 /// An item's on-screen geometry and background, mirroring the nesting
@@ -568,10 +730,26 @@ pub struct Scripting {
     pub updates: bool,
 }
 
+/// An item's popup, as `--query` reports it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PopupState {
+    pub drawing: bool,
+    pub horizontal: bool,
+    pub align: String,
+    pub topmost: bool,
+    pub height: f64,
+    pub y_offset: f64,
+    pub background: Background,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ItemState {
     pub name: ItemName,
     pub geometry: Geometry,
+    /// Always present, even on an item with no popup, because a config reads
+    /// it without checking -- `overflow:query().popup.drawing == "on"` -- and
+    /// a missing key there is a crash rather than a false.
+    pub popup: PopupState,
     pub icon: Run,
     pub label: Run,
     pub scripting: Scripting,

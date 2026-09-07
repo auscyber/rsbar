@@ -87,26 +87,18 @@ pub fn kinds_from_value(value: &Value) -> mlua::Result<Vec<Kind>> {
     }
 }
 
-/// `SketchyBar`'s own convention for matching several items by name at once:
-/// `/menu\..*/` rather than one literal name. Only the *shape* is checked
-/// here — the regex source itself (returned without its `/.../` delimiters)
-/// is compiled and matched daemon-side, against its own live item list,
-/// since only it has one without racing a config that is still adding items.
-/// Compiling it here too, and discarding the result, is only to give a
-/// malformed pattern a named error at the call site rather than a daemon
-/// rejection three requests later.
+/// `name`, as a [`Selector`] — an exact name, or `SketchyBar`'s own
+/// `/menu\..*/` shorthand for "every item whose name matches this regex".
+/// Never compiled or matched here: only the daemon has a live item list, so
+/// only it can resolve a [`Selector::Pattern`] without racing a config that
+/// is still adding items — see [`Selector`]'s own doc comment.
 ///
 /// # Errors
 ///
-/// Returns [`ApiError::InvalidPattern`] if `name` looks like a pattern (is
-/// wrapped in `/.../`) but its interior is not a valid regex.
-pub fn pattern_from_name(name: &str) -> Result<Option<String>> {
-    let Some(inner) = name.strip_prefix('/').and_then(|s| s.strip_suffix('/')) else {
-        return Ok(None);
-    };
-    regex::Regex::new(inner)
-        .map(|_| Some(inner.to_string()))
-        .map_err(|e| ApiError::InvalidPattern(name.to_string(), e.to_string()))
+/// Returns [`ApiError::InvalidName`] if `name` is shaped as a literal name
+/// (not `/.../`) but is not one — empty, say.
+pub fn selector_from_name(name: &str) -> Result<Selector> {
+    Selector::from_str(name).map_err(|e| ApiError::InvalidName(name.to_string(), e))
 }
 
 /// Merges `overlay` onto `base`, recursively wherever both sides have a table
@@ -143,6 +135,56 @@ fn opt<T: mlua::FromLua>(table: &Table, key: &str) -> mlua::Result<Option<T>> {
     table.get::<Option<T>>(key)
 }
 
+/// A boolean that may also be `"toggle"`, which only the daemon can resolve:
+/// `SketchyBar` accepts it wherever it accepts on/off, and this config binds a
+/// click to `popup.drawing=toggle`.
+fn opt_toggle(table: &Table, key: &str) -> mlua::Result<Option<rsbar_protocol::Toggle>> {
+    match table.get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::Boolean(b) => Ok(Some(if b {
+            rsbar_protocol::Toggle::On
+        } else {
+            rsbar_protocol::Toggle::Off
+        })),
+        Value::String(s) => {
+            let s = s.to_str()?;
+            s.parse()
+                .map(Some)
+                .map_err(|e| mlua::Error::RuntimeError(format!("`{key}`: {e}")))
+        }
+        other => Err(mlua::Error::RuntimeError(format!(
+            "`{key}` must be a boolean or a string, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// A boolean-shaped property, accepting a real Lua boolean or one of
+/// `SketchyBar`'s own on/off spellings as a string -- never `mlua`'s own
+/// `FromLua<bool>`, which follows Lua's truthiness rule and would read the
+/// string `"off"` as `true`, since it is neither `nil` nor `false`. A real
+/// config leans on exactly this, writing `"off"` back as a string.
+fn opt_bool(table: &Table, key: &str) -> mlua::Result<Option<bool>> {
+    match table.get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::Boolean(b) => Ok(Some(b)),
+        Value::String(s) => {
+            let text = s.to_str()?;
+            match text.to_ascii_lowercase().as_str() {
+                "on" | "true" | "yes" | "1" => Ok(Some(true)),
+                "off" | "false" | "no" | "0" => Ok(Some(false)),
+                _ => Err(mlua::Error::RuntimeError(format!(
+                    "`{key}` is not a boolean: expected on/off, true/false, yes/no or 1/0, got \"{text}\""
+                ))),
+            }
+        }
+        other => Err(mlua::Error::RuntimeError(format!(
+            "`{key}` must be a boolean or an on/off string, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
 fn opt_color(table: &Table, key: &str) -> mlua::Result<Option<Color>> {
     match table.get::<Value>(key)? {
         Value::Nil => Ok(None),
@@ -166,11 +208,21 @@ fn opt_display(table: &Table, key: &str) -> mlua::Result<Option<String>> {
     }
 }
 
+/// `position = "left"`, or `SketchyBar`'s `"popup.<owner item>"`, which is a
+/// popup anchor rather than a bar bucket. Anything unparseable is logged and
+/// dropped rather than raised: one bad `position` should not crash the whole
+/// config, any more than an unknown key does.
 fn opt_position(table: &Table, key: &str) -> mlua::Result<Option<Position>> {
-    opt::<String>(table, key)?
-        .map(|s| position_from_str(&s))
-        .transpose()
-        .map_err(Into::into)
+    let Some(s) = opt::<String>(table, key)? else {
+        return Ok(None);
+    };
+    match position_from_str(&s) {
+        Ok(position) => Ok(Some(position)),
+        Err(err) => {
+            tracing::error!(position = %s, %err, "unknown position; leaving it unset");
+            Ok(None)
+        }
+    }
 }
 
 /// The `position` an add options table carries, or [`Position::default`] if
@@ -230,7 +282,7 @@ fn background_patch(table: &Table) -> mlua::Result<Option<rsbar_protocol::Backgr
     };
     warn_unknown(&sub, "background", KNOWN);
     Ok(Some(rsbar_protocol::BackgroundPatch {
-        drawing: opt(&sub, "drawing")?,
+        drawing: opt_bool(&sub, "drawing")?,
         color: opt_color(&sub, "color")?,
         corner_radius: opt(&sub, "corner_radius")?,
         height: opt(&sub, "height")?,
@@ -296,10 +348,7 @@ fn warn_unknown_with(table: &Table, what: &str, known: &[&str], unsupported: &[(
 /// `SketchyBar` item properties rsbar has no `ItemPatch` field for yet. Each
 /// needs a protocol change; noted here so a config that uses one is loud about
 /// it instead of silently dropping it.
-const ITEM_UNSUPPORTED: &[(&str, &str)] = &[(
-    "popup",
-    "a popup attached to this item; needs popup support (tracked separately)",
-)];
+const ITEM_UNSUPPORTED: &[(&str, &str)] = &[];
 
 /// The known key closest to `key`, when one is close enough to be worth
 /// suggesting — a prefix, a suffix, or a one-character slip.
@@ -326,6 +375,16 @@ fn nearest<'a>(key: &str, known: &[&'a str]) -> Option<&'a str> {
         })
 }
 
+/// A real `SketchyBar` `icon`/`label` property this crate has no field for
+/// yet. `y_offset` needs a `Run`/`RunPatch::y_offset` field, which in turn
+/// needs the daemon's own `components::Run` (and its two hand-written
+/// conversions to and from this crate's `Run`) to grow the same field —
+/// outside `crates/rsbar-lua`, so logged rather than modelled here.
+const ICON_LABEL_UNSUPPORTED: &[(&str, &str)] = &[(
+    "y_offset",
+    "shifting the icon/label independently of the item; needs a `Run`/`RunPatch::y_offset` field (tracked separately)",
+)];
+
 impl IconOrLabel {
     // `string` is the spelling a real SketchyBar config uses for the text
     // content of an icon/label; `text` is kept too so nothing that already
@@ -348,14 +407,14 @@ impl IconOrLabel {
                 ..Self::default()
             }),
             Value::Table(sub) => {
-                warn_unknown(&sub, key, Self::KNOWN);
+                warn_unknown_with(&sub, key, Self::KNOWN, ICON_LABEL_UNSUPPORTED);
                 let string = opt::<String>(&sub, "string")?;
                 let text = opt::<String>(&sub, "text")?;
                 Ok(Self {
                     text: string.or(text),
                     color: opt_color(&sub, "color")?,
                     font: font_from_value(sub.get("font")?)?,
-                    drawing: opt(&sub, "drawing")?,
+                    drawing: opt_bool(&sub, "drawing")?,
                     padding_left: opt(&sub, "padding_left")?,
                     padding_right: opt(&sub, "padding_right")?,
                 })
@@ -430,6 +489,11 @@ const BAR_KEYS: &[&str] = &[
     "topmost",
     "padding_left",
     "padding_right",
+    "sticky",
+    "show_in_fullscreen",
+    "notch_width",
+    "notch_offset",
+    "notch_display_height",
     "display",
 ];
 
@@ -462,6 +526,11 @@ pub fn bar_patch_from_table(table: &Table) -> mlua::Result<BarPatch> {
             .transpose()?,
     };
     Ok(BarPatch {
+        sticky: opt_bool(table, "sticky")?,
+        show_in_fullscreen: opt_bool(table, "show_in_fullscreen")?,
+        notch_width: opt(table, "notch_width")?,
+        notch_offset: opt(table, "notch_offset")?,
+        notch_display_height: opt(table, "notch_display_height")?,
         padding_left: opt(table, "padding_left")?,
         padding_right: opt(table, "padding_right")?,
         display: opt_display(table, "display")?,
@@ -472,8 +541,8 @@ pub fn bar_patch_from_table(table: &Table) -> mlua::Result<BarPatch> {
         y_offset: opt(table, "y_offset")?,
         corner_radius: opt(table, "corner_radius")?,
         blur_radius: opt(table, "blur_radius")?,
-        hidden: opt(table, "hidden")?,
-        topmost: opt(table, "topmost")?,
+        hidden: opt_bool(table, "hidden")?,
+        topmost: opt_bool(table, "topmost")?,
     })
 }
 
@@ -484,6 +553,32 @@ pub fn bar_patch_from_table(table: &Table) -> mlua::Result<BarPatch> {
 /// Returns a Lua error if any field has the wrong type or an invalid value.
 /// Every key an item table may carry. `icon` and `label` also accept the
 /// nested sugar table, whose own keys are checked separately.
+/// `popup = { drawing = true, align = "center", background = { ... } }`.
+fn popup_patch(table: &Table) -> mlua::Result<Option<rsbar_protocol::PopupPatch>> {
+    const KNOWN: &[&str] = &[
+        "drawing",
+        "horizontal",
+        "align",
+        "topmost",
+        "height",
+        "y_offset",
+        "background",
+    ];
+    let Some(sub) = opt::<Table>(table, "popup")? else {
+        return Ok(None);
+    };
+    warn_unknown(&sub, "popup", KNOWN);
+    Ok(Some(rsbar_protocol::PopupPatch {
+        drawing: opt_toggle(&sub, "drawing")?,
+        horizontal: opt(&sub, "horizontal")?,
+        align: opt(&sub, "align")?,
+        topmost: opt_bool(&sub, "topmost")?,
+        height: opt(&sub, "height")?,
+        y_offset: opt(&sub, "y_offset")?,
+        background: background_patch(&sub)?,
+    }))
+}
+
 const ITEM_KEYS: &[&str] = &[
     "icon",
     "label",
@@ -492,6 +587,7 @@ const ITEM_KEYS: &[&str] = &[
     "padding_right",
     "y_offset",
     "position",
+    "popup",
     "drawing",
     "script",
     "click_script",
@@ -558,7 +654,12 @@ pub fn item_patch_from_table(table: &Table) -> mlua::Result<ItemPatch> {
     let label = IconOrLabel::read(table, "label")?;
 
     Ok(ItemPatch {
-        updates: opt(table, "updates")?,
+        associated_space: None,
+        percentage: opt(table, "percentage")?,
+        knob: None,
+        highlight_color: opt_color(table, "highlight_color")?,
+        popup: popup_patch(table)?,
+        updates: opt_bool(table, "updates")?,
         width: opt(table, "width")?,
         display: opt_display(table, "display")?,
         // `IconOrLabel::read` already covers both the bare-string and the
@@ -572,7 +673,7 @@ pub fn item_patch_from_table(table: &Table) -> mlua::Result<ItemPatch> {
         padding_right: opt(table, "padding_right")?,
         y_offset: opt(table, "y_offset")?,
         position: opt_position(table, "position")?,
-        drawing: opt(table, "drawing")?,
+        drawing: opt_toggle(table, "drawing")?,
         script: opt(table, "script")?,
         click_script: opt(table, "click_script")?,
         alias: alias_from_table(table)?,
@@ -603,26 +704,52 @@ fn serde_table<T: Serialize>(lua: &Lua, value: &T) -> mlua::Result<Table> {
     }
 }
 
+/// `SketchyBar`'s own spelling for a flag a query reads back — the string
+/// `"on"`/`"off"`, never a JSON/Lua boolean (`bar_item_serialize` in
+/// `SketchyBar`'s own `bar_item.c`) — so a config's `:query().geometry.drawing
+/// == "on"` sees the same thing real `SketchyBar` would.
+fn on_off(value: bool) -> &'static str {
+    if value { "on" } else { "off" }
+}
+
 /// # Errors
 ///
 /// Returns a Lua error only if table creation itself fails.
 pub fn item_state_to_table(lua: &Lua, state: &ItemState) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     table.set("name", state.name.as_str())?;
+
     // Nested the same way `SketchyBar`'s own `--query` is (`bar_item.c`), so
     // a config's own `geometry.drawing`/`geometry.position` field paths work
     // unchanged — see `ItemState`'s doc comment. `Geometry` already nests
-    // `background`, so one serialize covers both levels.
-    table.set("geometry", serde_table(lua, &state.geometry)?)?;
-    table.set("icon", serde_table(lua, &state.icon)?)?;
-    table.set("label", serde_table(lua, &state.label)?)?;
-    table.set("scripting", serde_table(lua, &state.scripting)?)?;
+    // `background`, so one serialize covers both levels; `serde_table` gets
+    // every `bool` in the tree wrong (a Lua boolean, not `"on"`/`"off"`), so
+    // each one is patched afterwards.
+    let geometry = serde_table(lua, &state.geometry)?;
+    geometry.set("drawing", on_off(state.geometry.drawing))?;
+    let background: Table = geometry.get("background")?;
+    background.set("drawing", on_off(state.geometry.background.drawing))?;
+    table.set("geometry", geometry)?;
+
+    let icon = serde_table(lua, &state.icon)?;
+    icon.set("drawing", on_off(state.icon.drawing))?;
+    table.set("icon", icon)?;
+
+    let label = serde_table(lua, &state.label)?;
+    label.set("drawing", on_off(state.label.drawing))?;
+    table.set("label", label)?;
+
+    let scripting = serde_table(lua, &state.scripting)?;
+    scripting.set("updates", on_off(state.scripting.updates))?;
+    table.set("scripting", scripting)?;
+
     table.set("alias", state.alias.clone())?;
     table.set("members", serde_table(lua, &state.members)?)?;
 
     // `Kind` derives a plain `Serialize` (its variant's Rust name, not the
     // snake_case string a config actually writes/reads), so this is the one
-    // field `serde_table` would get wrong — built from `Kind::name` instead.
+    // field `serde_table` would get wrong the other way — built from
+    // `Kind::name` instead.
     let events = lua.create_table()?;
     for (index, kind) in state.events.iter().enumerate() {
         events.set(index + 1, kind.name())?;
@@ -635,7 +762,10 @@ pub fn item_state_to_table(lua: &Lua, state: &ItemState) -> mlua::Result<Table> 
 ///
 /// Returns a Lua error only if table creation itself fails.
 pub fn bar_state_to_table(lua: &Lua, state: &BarState) -> mlua::Result<Table> {
-    serde_table(lua, state)
+    let table = serde_table(lua, state)?;
+    table.set("topmost", on_off(state.topmost))?;
+    table.set("hidden", on_off(state.hidden))?;
+    Ok(table)
 }
 
 /// A field value as a script should see it: numbers stay numbers, everything
@@ -672,20 +802,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_plain_name_is_not_a_pattern() {
-        assert!(pattern_from_name("front_app").unwrap().is_none());
+    fn a_plain_name_is_a_selector_name() {
+        assert_eq!(
+            selector_from_name("front_app").unwrap(),
+            Selector::Name(item_name_from_str("front_app").unwrap())
+        );
     }
 
     #[test]
-    fn a_slash_wrapped_name_yields_its_regex_source() {
-        let pattern = pattern_from_name("/menu\\..*/").unwrap().unwrap();
-        assert_eq!(pattern, "menu\\..*");
+    fn a_slash_wrapped_name_is_a_selector_pattern() {
+        assert_eq!(
+            selector_from_name("/menu\\..*/").unwrap(),
+            Selector::Pattern("menu\\..*".to_string())
+        );
     }
 
     #[test]
-    fn an_invalid_pattern_names_itself_in_the_error() {
-        let err = pattern_from_name("/[/").unwrap_err();
-        assert!(matches!(err, ApiError::InvalidPattern(name, _) if name == "/[/"));
+    fn a_malformed_regex_still_parses_as_a_pattern() {
+        // Not compiled here any more — only the daemon has a live item list
+        // to resolve one against, so it is the one that rejects a bad regex.
+        assert_eq!(
+            selector_from_name("/[/").unwrap(),
+            Selector::Pattern("[".to_string())
+        );
     }
 
     #[test]
@@ -783,6 +922,94 @@ mod tests {
     }
 
     #[test]
+    fn an_alias_table_degrades_to_none_instead_of_erroring() {
+        // A real config tints a mirrored menu bar icon with
+        // `alias = { color = ... }` — a table, not the plain name string
+        // `ItemPatch::alias` actually carries. rsbar has no field for the
+        // tint, but that is one dropped property, not a reason to fail the
+        // whole `add`.
+        let lua = Lua::new();
+        let table: Table = lua
+            .load(r"{ alias = { color = 0xffff0000 } }")
+            .eval()
+            .unwrap();
+        let patch = item_patch_from_table(&table).unwrap();
+        assert_eq!(patch.alias, None);
+    }
+
+    #[test]
+    fn a_popup_position_names_the_item_it_hangs_off() {
+        // `position = "popup.<owner>"` is a relationship, not a bar bucket:
+        // the item goes inside that item's popup and takes no space on the
+        // bar at all.
+        let lua = Lua::new();
+        let table: Table = lua.load(r#"{ position = "popup.volume" }"#).eval().unwrap();
+        assert_eq!(
+            item_position_from_table(&table).unwrap(),
+            Position::Popup(rsbar_protocol::ItemName::new("volume").unwrap())
+        );
+    }
+
+    #[test]
+    fn a_popup_drawing_string_is_read_as_an_on_off_flag_not_lua_truthiness() {
+        // A real config round-trips `popup.drawing` as `overflow:query().popup.drawing
+        // == "on" and "off" or "on"` -- a Lua *string*, not a boolean. `mlua`'s
+        // own `FromLua<bool>` follows Lua's truthiness rule, under which the
+        // non-nil, non-false string `"off"` is truthy, so naively using it here
+        // would turn "off" into `true` and never actually close the popup.
+        let lua = Lua::new();
+        let table: Table = lua
+            .load(r#"{ popup = { drawing = "off" } }"#)
+            .eval()
+            .unwrap();
+        let patch = item_patch_from_table(&table).unwrap();
+        assert_eq!(
+            patch.popup.unwrap().drawing,
+            Some(rsbar_protocol::Toggle::Off)
+        );
+
+        let table: Table = lua
+            .load(r#"{ popup = { drawing = "on" } }"#)
+            .eval()
+            .unwrap();
+        let patch = item_patch_from_table(&table).unwrap();
+        assert_eq!(
+            patch.popup.unwrap().drawing,
+            Some(rsbar_protocol::Toggle::On)
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_bool_string_is_a_named_error_not_a_silent_true() {
+        // Lua truthiness makes any non-nil string true, so a bad spelling
+        // used to become `drawing = on` silently.
+        let lua = Lua::new();
+        let table: Table = lua
+            .load(r#"{ popup = { drawing = "perhaps" } }"#)
+            .eval()
+            .unwrap();
+        let err = item_patch_from_table(&table).unwrap_err();
+        assert!(err.to_string().contains("drawing"), "{err}");
+    }
+
+    #[test]
+    fn a_popup_can_be_asked_to_toggle() {
+        // What the config's click script does:
+        // `sketchybar -m --set $NAME popup.drawing=toggle`. Only the daemon
+        // can resolve it, so it has to survive the conversion intact.
+        let lua = Lua::new();
+        let table: Table = lua
+            .load(r#"{ popup = { drawing = "toggle" } }"#)
+            .eval()
+            .unwrap();
+        let patch = item_patch_from_table(&table).unwrap();
+        assert_eq!(
+            patch.popup.unwrap().drawing,
+            Some(rsbar_protocol::Toggle::Flip)
+        );
+    }
+
+    #[test]
     fn a_background_table_only_carries_the_fields_it_set() {
         let lua = Lua::new();
         let table: Table = lua
@@ -794,6 +1021,88 @@ mod tests {
         assert_eq!(background.color, Some(Color(0xffff_0000)));
         assert_eq!(background.height, None);
         assert_eq!(background.corner_radius, None);
+    }
+
+    #[test]
+    fn a_query_result_renders_flags_as_on_off_strings_not_booleans() {
+        // Real `SketchyBar` never puts a JSON/Lua boolean in a query result —
+        // a config reads `:query().geometry.drawing == "on"` — and rsbar's
+        // own `item:query()` has to match that, not `mlua`'s own default
+        // `bool -> boolean` serialization.
+        let lua = Lua::new();
+        let state = ItemState {
+            popup: rsbar_protocol::PopupState {
+                drawing: false,
+                horizontal: false,
+                align: "left".into(),
+                topmost: true,
+                height: 0.0,
+                y_offset: 0.0,
+                background: rsbar_protocol::Background::default(),
+            },
+            name: item_name_from_str("clock").unwrap(),
+            geometry: rsbar_protocol::Geometry {
+                drawing: true,
+                position: Position::Right,
+                y_offset: 0.0,
+                padding_left: 2.0,
+                padding_right: 2.0,
+                width: None,
+                background: rsbar_protocol::Background {
+                    drawing: false,
+                    ..Default::default()
+                },
+            },
+            icon: rsbar_protocol::Run {
+                drawing: true,
+                ..Default::default()
+            },
+            label: rsbar_protocol::Run::default(),
+            scripting: rsbar_protocol::Scripting {
+                script: None,
+                click_script: None,
+                update_freq: 0,
+                updates: true,
+            },
+            events: Vec::new(),
+            alias: None,
+            members: Vec::new(),
+        };
+
+        let table = item_state_to_table(&lua, &state).unwrap();
+        let geometry: Table = table.get("geometry").unwrap();
+        assert_eq!(geometry.get::<String>("drawing").unwrap(), "on");
+        let background: Table = geometry.get("background").unwrap();
+        assert_eq!(background.get::<String>("drawing").unwrap(), "off");
+        let icon: Table = table.get("icon").unwrap();
+        assert_eq!(icon.get::<String>("drawing").unwrap(), "on");
+        let scripting: Table = table.get("scripting").unwrap();
+        assert_eq!(scripting.get::<String>("updates").unwrap(), "on");
+    }
+
+    #[test]
+    fn a_bar_query_result_renders_flags_as_on_off_strings() {
+        let lua = Lua::new();
+        let state = BarState {
+            height: 32.0,
+            edge: Edge::Top,
+            color: Color::BLACK,
+            margin: 0.0,
+            y_offset: 0.0,
+            corner_radius: 0.0,
+            blur_radius: 0,
+            topmost: true,
+            hidden: false,
+            displays: 1,
+            sticky: false,
+            show_in_fullscreen: false,
+            notch_width: 0.0,
+            notch_offset: 0.0,
+            notch_display_height: 0.0,
+        };
+        let table = bar_state_to_table(&lua, &state).unwrap();
+        assert_eq!(table.get::<String>("topmost").unwrap(), "on");
+        assert_eq!(table.get::<String>("hidden").unwrap(), "off");
     }
 
     #[test]

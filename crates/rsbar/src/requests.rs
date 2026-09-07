@@ -7,10 +7,12 @@
 
 use crate::bar::{Changes, Panels, Settings};
 use crate::components::{
-    AliasContent, AliasSpec, Background, ClickScript, DisplayTarget, Drawing, Icon, Index,
-    ItemDisplay, ItemHandle, Label, Members, Name, Offset, Order, Padding, Placement, Routine, Run,
-    Script, Stale, Subscriptions, Updates, Watching, Width, bundle,
+    AliasContent, AliasSpec, AssociatedSpace, Background, ClickScript, DEFAULT_GRAPH_SAMPLES,
+    DEFAULT_SLIDER_WIDTH, DisplayTarget, Drawing, Graph, Icon, Index, ItemDisplay, ItemHandle,
+    Label, Members, Name, Offset, Order, Padding, Placement, Routine, Run, Script, Selected,
+    Slider, Stale, Subscriptions, Updates, Watching, Width, bundle,
 };
+use crate::popup::{PopupConfig, PopupOf};
 use crate::script::Job;
 use crate::shaping::Cache;
 use crate::sources::{Registry, Target};
@@ -19,8 +21,8 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::query::QueryData;
 use bevy_ecs::system::SystemParam;
 use rsbar_protocol::{
-    BackgroundPatch, Event, ItemName, ItemPatch, ItemState, Kind, Patch, Query as ProtocolQuery,
-    Relative, Request, Response, RunPatch, Selector,
+    BackgroundPatch, ComponentKind, Event, ItemName, ItemPatch, ItemState, Kind, Patch, Position,
+    Query as ProtocolQuery, Relative, Request, Response, RunPatch, Selector,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -54,6 +56,7 @@ pub struct ItemWrite {
     pub click: Option<&'static ClickScript>,
     pub alias: Option<&'static AliasSpec>,
     pub members: Option<&'static Members>,
+    pub popup: Option<&'static PopupConfig>,
 }
 
 /// Every component a query or a dispatch reads.
@@ -79,6 +82,7 @@ pub struct ItemRead {
     pub click: Option<&'static ClickScript>,
     pub alias: Option<&'static AliasSpec>,
     pub members: Option<&'static Members>,
+    pub popup: Option<&'static PopupConfig>,
 }
 
 /// Everything a request may write to in the item world.
@@ -94,6 +98,11 @@ pub struct Items<'w, 's> {
     /// Items nothing has claimed since the config began. Read-only and
     /// disjoint from what `write` mutates, so the two can share a system.
     pub unclaimed: Query<'w, 's, (Entity, &'static Name), With<Stale>>,
+    /// A graph's own samples, queried separately from [`Self::write`]: a
+    /// different component type never conflicts with it no matter which
+    /// entities overlap, so this costs nothing on every item that is not a
+    /// graph.
+    pub graphs: Query<'w, 's, &'static mut Graph>,
 }
 
 /// Reads only, for the systems that do not also write.
@@ -168,14 +177,31 @@ impl Items<'_, '_> {
     }
 }
 
+/// An item's popup as a caller sees it, defaulted when it has none -- a
+/// config reads `query().popup.drawing` without checking, so a missing key
+/// there is a crash rather than a false.
+fn popup_state(config: Option<&PopupConfig>) -> rsbar_protocol::PopupState {
+    let config = config.copied().unwrap_or_default();
+    rsbar_protocol::PopupState {
+        drawing: config.drawing,
+        horizontal: config.horizontal,
+        align: config.align.to_string(),
+        topmost: config.topmost,
+        height: config.height,
+        y_offset: config.y_offset,
+        background: (&config.background).into(),
+    }
+}
+
 /// The same projection as [`state_of`], off the read-only view of the write
 /// query — `iter()` on a mutable query yields plain references, not `Mut`.
 fn write_state(row: &ItemWriteReadOnlyItem<'_, '_>) -> ItemState {
     ItemState {
         name: row.name.0.clone(),
+        popup: popup_state(row.popup),
         geometry: rsbar_protocol::Geometry {
             drawing: row.drawing.0,
-            position: row.placement.0,
+            position: row.placement.0.clone(),
             y_offset: row.offset.0,
             padding_left: row.padding.left,
             padding_right: row.padding.right,
@@ -311,9 +337,10 @@ impl ItemsRead<'_, '_> {
 fn state_of(row: &ItemReadItem<'_, '_>) -> ItemState {
     ItemState {
         name: row.name.0.clone(),
+        popup: popup_state(row.popup),
         geometry: rsbar_protocol::Geometry {
             drawing: row.drawing.0,
-            position: row.placement.0,
+            position: row.placement.0.clone(),
             y_offset: row.offset.0,
             padding_left: row.padding.left,
             padding_right: row.padding.right,
@@ -462,6 +489,57 @@ pub fn apply_defaults(
     }
 }
 
+/// Merges a `popup.*` patch into the host item's own popup configuration.
+///
+/// Written only when the merge makes a difference, like every other property
+/// here: a script toggling `popup.drawing` to what it already is must not
+/// repaint the popup, and `Mut::as_mut` would mark it changed regardless.
+fn apply_popup(
+    entity: Entity,
+    current: Option<&PopupConfig>,
+    patch: &rsbar_protocol::PopupPatch,
+    commands: &mut Commands,
+) {
+    let existing = current.copied().unwrap_or_default();
+    let patch = crate::popup::PopupPatch {
+        drawing: patch.drawing.map(|d| d.resolve(existing.drawing)),
+        horizontal: patch.horizontal,
+        align: patch.align.as_deref().and_then(|a| a.parse().ok()),
+        topmost: patch.topmost,
+        height: patch.height,
+        y_offset: patch.y_offset,
+        background: patch.background,
+    };
+    if let Some(next) = crate::popup::patched(&existing, &patch) {
+        commands.entity(entity).insert(next);
+    } else if current.is_none() {
+        // First mention of a popup on this item, even one that changed
+        // nothing against the defaults, is what brings it into being.
+        commands.entity(entity).insert(existing);
+    }
+}
+
+/// Attaches an item to the popup it named, or detaches it from one.
+///
+/// A popup is a relationship rather than a place along the bar, so it is a
+/// component of its own: `place()` skips anything carrying one, and a popup's
+/// contents are laid out and repainted entirely separately. The host is
+/// resolved by name here because only the daemon has a live item list -- and
+/// a config may well name a host that does not exist yet, which is why an
+/// unresolved name leaves the item off the bar rather than dropping it into
+/// the left bucket by surprise.
+fn host_of(position: &Position, index: &Index, entity: Entity, commands: &mut Commands) {
+    let Position::Popup(host) = position else {
+        commands.entity(entity).remove::<PopupOf>();
+        return;
+    };
+    if let Some(found) = index.get(host) {
+        commands.entity(entity).insert(PopupOf(found));
+    } else {
+        tracing::warn!(%host, "no such item to hang a popup off");
+    }
+}
+
 /// Every item, in the order the bar draws them.
 fn current_order(items: &Items<'_, '_>) -> Vec<(Entity, ItemName)> {
     let mut order: Vec<_> = items
@@ -552,6 +630,15 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
                 if changes.contains(Changes::LEVEL) {
                     panels.set_level(settings)?;
                 }
+                // Retagging a window that already exists. Without these, only
+                // a panel built fresh -- a new display, or a restart -- ever
+                // picked the setting up.
+                if changes.contains(Changes::STICKY) {
+                    panels.set_sticky(settings.sticky)?;
+                }
+                if changes.contains(Changes::FULLSCREEN) {
+                    panels.set_show_in_fullscreen(settings.show_in_fullscreen)?;
+                }
                 Ok(())
             })();
             match result {
@@ -567,18 +654,22 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
                 // it. That is what makes a reload cheap: entity identity
                 // survives, so change detection sees only what actually
                 // changed rather than every item disappearing and coming back.
-                if let Ok(mut row) = items.write.get_mut(entity) {
-                    row.placement.0 = position;
+                if let Ok(mut row) = items.write.get_mut(entity)
+                    && row.placement.0 != position
+                {
+                    row.placement.0 = position.clone();
                 }
+                host_of(&position, &items.index, entity, &mut items.commands);
                 items.commands.entity(entity).remove::<Stale>();
                 return Outcome::ok();
             }
             let order = items.index.next_order();
             let entity = items
                 .commands
-                .spawn(bundle(name.clone(), position, order))
+                .spawn(bundle(name.clone(), position.clone(), order))
                 .id();
             items.index.insert(name, entity);
+            host_of(&position, &items.index, entity, &mut items.commands);
             // Applied through the ordinary patch path rather than baked into
             // the bundle, so a default and an explicit `--set` of the same
             // property behave identically -- including doing nothing when the
@@ -589,15 +680,60 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             Outcome::ok()
         }
 
-        // `ComponentKind` is modelled in the protocol precisely so a config
-        // using one gets a named error here rather than a plain item it
-        // never asked for, or never reaching the daemon at all — see the
-        // doc on `Request::AddComponent`. Drawing a slider or graph is a
-        // different feature from the properties this pass covers; nothing
-        // here draws one yet.
-        Request::AddComponent { name, kind, .. } => Outcome::error(format!(
-            "`{name}`: `{kind:?}` items are not implemented yet"
-        )),
+        Request::AddComponent {
+            name,
+            position,
+            kind,
+        } => {
+            tracing::debug!(%name, ?position, ?kind, "add component");
+            if let Some(entity) = items.index.get(&name) {
+                // Same re-add-moves-it semantics as `AddItem`: entity identity
+                // survives, so a reload only touches what actually changed.
+                if let Ok(mut row) = items.write.get_mut(entity) {
+                    row.placement.0 = position;
+                }
+                items.commands.entity(entity).remove::<Stale>();
+                return Outcome::ok();
+            }
+            let order = items.index.next_order();
+            let mut spawned = items.commands.spawn(bundle(name.clone(), position, order));
+            // A space auto-subscribes to space changes the way `SketchyBar`'s
+            // own `bar_item_set_type` sets `UPDATE_SPACE_CHANGE` — a config
+            // never has to ask for it. Graph and slider have nothing to
+            // subscribe to: they are driven by `--push`/a percentage set, not
+            // an event.
+            let watch: Vec<Kind> = match kind {
+                ComponentKind::Space => {
+                    spawned.insert((AssociatedSpace::default(), Selected::default()));
+                    vec![Kind::SpaceChanged]
+                }
+                ComponentKind::Graph => {
+                    spawned.insert(Graph::new(DEFAULT_GRAPH_SAMPLES));
+                    Vec::new()
+                }
+                ComponentKind::Slider => {
+                    spawned.insert(Slider::new(DEFAULT_SLIDER_WIDTH));
+                    Vec::new()
+                }
+            };
+            let entity = spawned.id();
+            items.index.insert(name, entity);
+            if defaults.0 != ItemPatch::default() {
+                items.commands.entity(entity).insert(NeedsDefaults);
+            }
+            if !watch.is_empty() {
+                let watches = sources.watch_all(entity, watch.iter().cloned());
+                items.commands.entity(entity).insert((
+                    Watching(watches),
+                    // So `--query` reports it: a space item watches this on
+                    // its own, and a client asking what it is subscribed to
+                    // should see that, the same as it would for an explicit
+                    // `--subscribe`.
+                    Subscriptions(watch.into_iter().collect()),
+                ));
+            }
+            Outcome::ok()
+        }
 
         Request::SetItem { name, patch } => {
             tracing::trace!(%name, ?patch, "set item");
@@ -790,6 +926,8 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             )),
             Err(err) => Outcome::error(err.to_string()),
         },
+        Request::Push { name, value } => push(&name, value, items),
+
         Request::Query(ProtocolQuery::AppMenus) => match crate::menus::list() {
             Ok(found) => Outcome::answer(Response::AppMenus(
                 found.into_iter().map(|menu| menu.title).collect(),
@@ -797,11 +935,8 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             Err(err) => Outcome::error(err.to_string()),
         },
 
-        // `SetDefault` is not implemented (see its own arm above), so there
-        // is never anything stashed to report — an empty patch is the
-        // honest answer, not a guess.
         Request::Query(ProtocolQuery::Defaults) => {
-            Outcome::answer(Response::Defaults(Box::default()))
+            Outcome::answer(Response::Defaults(Box::new(defaults.0.clone())))
         }
 
         Request::PressAppMenu(index) => match crate::menus::press(index) {
@@ -876,6 +1011,29 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
     }
 }
 
+/// Pushes one sample onto a graph — `SketchyBar`'s `--push <name> <value>`.
+///
+/// `rsbar_protocol::Request` has no variant for this yet — see the daemon's
+/// own notes on this pass — so nothing calls this outside a test. Written
+/// now so wiring it up is a one-line match arm once the variant exists.
+///
+/// `Graph::would_change` is read before `graphs.get_mut` is ever touched
+/// mutably, the same discipline `patched` uses: a script re-reporting the
+/// reading it already pushed must not mark the component changed.
+#[must_use]
+pub fn push(name: &ItemName, value: f32, items: &mut Items) -> Outcome {
+    let Some(entity) = items.index.get(name) else {
+        return no_such(name);
+    };
+    let Ok(mut graph) = items.graphs.get_mut(entity) else {
+        return Outcome::error(format!("`{name}` is not a graph"));
+    };
+    if graph.would_change(value) {
+        graph.push(value);
+    }
+    Outcome::ok()
+}
+
 /// Writes a patch onto one item.
 ///
 /// Every assignment goes through `set_if_neq` where the type allows, so a
@@ -924,11 +1082,13 @@ fn set_item(
     if let Some(y) = patch.y_offset {
         offset.0 = y;
     }
-    if let Some(p) = patch.position {
+    if let Some(p) = patch.position.clone() {
         placement.0 = p;
     }
     if let Some(d) = patch.drawing {
-        drawing.0 = d;
+        // Resolved here, not by the caller: `toggle` means "the opposite of
+        // whatever it is now", and only the daemon knows what that is.
+        drawing.set_if_neq(Drawing(d.resolve(drawing.0)));
     }
     // `Width` and `ItemDisplay` affect layout, so — unlike the plain
     // assignments above — they go through `set_if_neq`: a script re-setting
@@ -948,6 +1108,9 @@ fn set_item(
         // A changed frequency restarts the clock, so setting it twice does not
         // fire early on the second set.
         routine.elapsed = 0;
+    }
+    if let Some(popup) = &patch.popup {
+        apply_popup(entity, row.popup, popup, commands);
     }
     if let Some(script) = &patch.script {
         if script.is_empty() {
@@ -1132,5 +1295,79 @@ mod patch_tests {
         };
         let next = patched_run(&current, Some(&patch)).expect("padding moved");
         assert!((next.padding_left - 5.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod component_tests {
+    use crate::harness::Harness;
+    use rsbar_protocol::{ComponentKind, ItemName, Position, Request, Response};
+
+    fn name(s: &str) -> ItemName {
+        ItemName::new(s).expect("valid name")
+    }
+
+    #[test]
+    fn adding_a_space_spawns_a_real_item_and_watches_space_changes_on_its_own() {
+        // Real `SketchyBar` sets `UPDATE_SPACE_CHANGE` the moment a `space`
+        // item is created (`bar_item_set_type` in `bar_item.c`) -- a config
+        // never has to `--subscribe` it itself.
+        let mut bar = Harness::new();
+        let outcome = bar.apply(Request::AddComponent {
+            name: name("space.1"),
+            position: Position::Left,
+            kind: ComponentKind::Space,
+        });
+        assert_eq!(outcome.response, Response::Ok);
+        assert_eq!(bar.order(), ["space.1"]);
+        assert!(
+            bar.running("spaces"),
+            "a space item should start the spaces source unasked"
+        );
+        assert_eq!(
+            bar.items()[0].events,
+            vec![rsbar_protocol::Kind::SpaceChanged],
+            "and report it, the same as an explicit --subscribe would"
+        );
+    }
+
+    #[test]
+    fn adding_a_graph_or_a_slider_spawns_a_real_item_and_watches_nothing() {
+        // Neither is driven by an event: a graph is driven by `--push`, a
+        // slider by a percentage set. Nothing here should start a source.
+        let mut bar = Harness::new();
+        for (item, kind) in [
+            ("cpu", ComponentKind::Graph),
+            ("volume_options", ComponentKind::Slider),
+        ] {
+            let outcome = bar.apply(Request::AddComponent {
+                name: name(item),
+                position: Position::Right,
+                kind,
+            });
+            assert_eq!(outcome.response, Response::Ok);
+        }
+        assert_eq!(bar.order(), ["cpu", "volume_options"]);
+        assert!(!bar.running("spaces"));
+    }
+
+    #[test]
+    fn re_adding_a_component_by_name_moves_it_rather_than_duplicating_it() {
+        // Same identity-survives-a-reload contract `AddItem` already has.
+        let mut bar = Harness::new();
+        bar.apply(Request::AddComponent {
+            name: name("cpu"),
+            position: Position::Left,
+            kind: ComponentKind::Graph,
+        });
+        bar.apply(Request::AddComponent {
+            name: name("cpu"),
+            position: Position::Right,
+            kind: ComponentKind::Graph,
+        });
+
+        let items = bar.items();
+        assert_eq!(items.len(), 1, "the same name is the same item");
+        assert_eq!(items[0].geometry.position, Position::Right, "and it moved");
     }
 }

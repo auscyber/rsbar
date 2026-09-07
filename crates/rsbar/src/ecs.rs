@@ -33,8 +33,8 @@
 
 use crate::bar::{Panels, Settings};
 use crate::components::{
-    AliasContent, AliasSpec, ClickScript, Icon, Index, Item, ItemHandle, Label, Name, Routine,
-    Script, Stale, Updates,
+    AliasContent, AliasSpec, AssociatedSpace, ClickScript, Icon, Index, Item, ItemHandle, Label,
+    Name, Routine, Script, Selected, Stale, Updates,
 };
 use crate::config::Shared as SharedConfig;
 use crate::layout::{self, ForceRepaint, Hit, Placements};
@@ -45,7 +45,10 @@ use crate::sources::{Registry, Target};
 use bevy_app::{App, First, Last, PostUpdate, PreUpdate, Update};
 use bevy_ecs::prelude::*;
 use objc2_core_foundation::{CFRunLoop, CFRunLoopRunResult, kCFRunLoopDefaultMode};
+use rsbar_protocol::event::SpaceChange;
 use rsbar_protocol::{Event, Kind, Request};
+use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 /// How many further waiting sources a wake will take before running a pass.
@@ -141,10 +144,13 @@ pub fn build(
         .insert_resource(settings)
         .init_resource::<Index>()
         .init_resource::<Queue>()
+        .init_resource::<ActiveSpaces>()
         .init_resource::<ReloadWatch>()
         .init_resource::<ForceRepaint>()
         .init_resource::<Placements>()
         .init_resource::<crate::requests::Defaults>()
+        .init_resource::<crate::popup::PopupPlacements>()
+        .init_non_send::<crate::popup::Popups>()
         // Starts true, so the first tick runs the config. The bar comes up
         // empty and fills in a moment later, which is what a config run is.
         .insert_resource(Reloading(config_exists))
@@ -164,6 +170,7 @@ pub fn build(
             (
                 route_pointer,
                 dispatch_events,
+                update_space_selection,
                 tick,
                 run_queued,
                 reload_config,
@@ -178,6 +185,10 @@ pub fn build(
                 settle_sources,
                 refresh_aliases,
                 layout::repaint.run_if(layout::needs_repaint),
+                // Its own gate, and its own retained placements: a popup
+                // opening must not repaint the bar, and a change inside one
+                // must not either.
+                crate::popup::repaint_popups.run_if(crate::popup::needs_repaint_popups),
                 layout::clear_force_repaint,
             )
                 .chain(),
@@ -379,6 +390,55 @@ fn apply_requests(
         {
             tracing::debug!(%err, "client stopped waiting for its answer");
         }
+    }
+}
+
+/// The space each display is currently showing, by `CGDirectDisplayID`.
+///
+/// What real `SketchyBar` reads off `bar->sid` per bar in
+/// `bar_manager_update_space_components` — kept here instead because this
+/// daemon has no standing per-display bar state to hang it on.
+#[derive(Resource, Default)]
+pub struct ActiveSpaces(BTreeMap<u32, NonZeroU64>);
+
+/// Recomputes every space item's [`Selected`] after one `space_changed`
+/// event — `bar_manager_update_space_components` in `SketchyBar`'s
+/// `bar_item.c`: a space is selected if some display is currently showing it.
+///
+/// Checked and written through [`Mut::set_if_neq`] rather than
+/// `Mut::as_mut`, and the whole scan is skipped unless the event actually
+/// moved a display's space — a config with a dozen space items must not have
+/// all twelve mark themselves changed just because one space elsewhere came
+/// and went.
+pub(crate) fn recompute_space_selection(
+    event: &Event,
+    active: &mut ActiveSpaces,
+    spaces: &mut Query<(&AssociatedSpace, &mut Selected)>,
+) {
+    let Event::SpaceChanged(SpaceChange { display, space }) = event else {
+        return;
+    };
+    let Some(space) = NonZeroU64::new(*space) else {
+        return;
+    };
+    if active.0.insert(*display, space) == Some(space) {
+        return;
+    }
+    for (associated, mut selected) in spaces.iter_mut() {
+        let is_selected = associated
+            .0
+            .is_some_and(|mine| active.0.values().any(|&shown| shown == mine));
+        selected.set_if_neq(Selected(is_selected));
+    }
+}
+
+fn update_space_selection(
+    mut events: MessageReader<EventMessage>,
+    mut active: ResMut<ActiveSpaces>,
+    mut spaces: Query<(&AssociatedSpace, &mut Selected)>,
+) {
+    for EventMessage(event) in events.read() {
+        recompute_space_selection(event, &mut active, &mut spaces);
     }
 }
 

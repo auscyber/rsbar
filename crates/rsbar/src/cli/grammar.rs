@@ -278,14 +278,9 @@ fn known_gap(pairs: &[(String, String)], gaps: &[(&str, &'static str)]) -> Resul
 
 const BAR_GAPS: &[(&str, &str)] = &[
     ("space", "no matching BarPatch field yet"),
-    ("sticky", "no matching BarPatch field yet"),
-    ("show_in_fullscreen", "no matching BarPatch field yet"),
     ("font_smoothing", "no matching BarPatch field yet"),
     ("shadow", "no matching BarPatch field yet"),
     ("align", "no matching BarPatch field yet"),
-    ("notch_width", "no matching BarPatch field yet"),
-    ("notch_offset", "no matching BarPatch field yet"),
-    ("notch_display_height", "no matching BarPatch field yet"),
     ("horizontal", "no matching BarPatch field yet"),
     ("border_color", "no matching BarPatch field yet"),
     ("border_width", "no matching BarPatch field yet"),
@@ -1114,7 +1109,7 @@ mod tests {
             vec![Request::SetMatching {
                 pattern: r"menu\..*".into(),
                 patch: Box::new(ItemPatch {
-                    drawing: Some(false),
+                    drawing: Some(rsbar_protocol::Toggle::Off),
                     ..Default::default()
                 }),
             }]

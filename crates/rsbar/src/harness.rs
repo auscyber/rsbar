@@ -13,6 +13,7 @@
 #![cfg(test)]
 
 use crate::bar::{Panels, Settings};
+use crate::ecs::ActiveSpaces;
 use crate::layout::Placements;
 use crate::requests::{Context, Items, ItemsRead, Outcome};
 use crate::script::Job;
@@ -21,7 +22,19 @@ use crate::sources::Registry;
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::RunSystemOnce as _;
 use bevy_ecs::system::SystemState;
+use rsbar_protocol::event::SpaceChange;
 use rsbar_protocol::{Event, ItemName, Kind, Request};
+use std::num::NonZeroU64;
+
+/// What [`crate::ecs::recompute_space_selection`] needs from the world.
+type SpaceSelectionQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static crate::components::AssociatedSpace,
+        &'static mut crate::components::Selected,
+    ),
+>;
 
 /// A world with the item machinery and nothing platform-bound running.
 pub struct Harness {
@@ -40,6 +53,7 @@ impl Harness {
         let mut world = World::new();
         world.init_resource::<crate::components::Index>();
         world.init_resource::<Placements>();
+        world.init_resource::<ActiveSpaces>();
 
         // A waker needs a run loop, and a test thread has one; nothing is ever
         // signalled because no source starts.
@@ -156,6 +170,72 @@ impl Harness {
         });
         name
     }
+
+    /// Pushes one sample onto a graph, through `requests::push` — standing in
+    /// for `--push` until the protocol carries a request for it.
+    pub fn push(&mut self, name: &ItemName, value: f32) -> Outcome {
+        let mut state: SystemState<Items> = SystemState::new(&mut self.world);
+        let outcome = {
+            let mut items = state
+                .get_mut(&mut self.world)
+                .expect("item params are always valid");
+            crate::requests::push(name, value, &mut items)
+        };
+        state.apply(&mut self.world);
+        outcome
+    }
+
+    /// Sets a space item's associated space directly, standing in for
+    /// `associated_space` as an ordinary `--set` property until the protocol
+    /// carries a field for it.
+    pub fn set_associated_space(&mut self, name: &ItemName, space: NonZeroU64) {
+        let entity = self
+            .world
+            .resource::<crate::components::Index>()
+            .get(name)
+            .expect("item exists");
+        self.world
+            .get_mut::<crate::components::AssociatedSpace>(entity)
+            .expect("a space item")
+            .0 = Some(space);
+    }
+
+    /// Feeds a `space_changed` event through the same recomputation
+    /// `ecs::update_space_selection` runs on the real event bus.
+    pub fn space_changed(&mut self, display: u32, space: NonZeroU64) {
+        let event = Event::SpaceChanged(SpaceChange {
+            display,
+            space: space.get(),
+        });
+        let mut state: SystemState<(ResMut<ActiveSpaces>, SpaceSelectionQuery)> =
+            SystemState::new(&mut self.world);
+        let (mut active, mut spaces) = state
+            .get_mut(&mut self.world)
+            .expect("item params are always valid");
+        crate::ecs::recompute_space_selection(&event, &mut active, &mut spaces);
+        state.apply(&mut self.world);
+    }
+
+    /// Drops every component's changed-since-last-check mark, so a test can
+    /// tell whether the *next* operation touched one.
+    pub fn clear_trackers(&mut self) {
+        self.world.clear_trackers();
+    }
+
+    /// Whether `T` was written on the named item since the last
+    /// [`Self::clear_trackers`] — the cheapest proof that a no-op write did
+    /// not mark a component changed, and so would not have repainted it.
+    pub fn changed<T: Component>(&mut self, name: &ItemName) -> bool {
+        let entity = self
+            .world
+            .resource::<crate::components::Index>()
+            .get(name)
+            .expect("item exists");
+        self.world
+            .query::<Ref<T>>()
+            .get(&self.world, entity)
+            .is_ok_and(|value| value.is_changed())
+    }
 }
 
 impl Default for Harness {
@@ -168,7 +248,10 @@ impl Default for Harness {
 mod tests {
     use super::Harness;
     use rsbar_protocol::event::{Forced, FrontApp, VolumeChange};
-    use rsbar_protocol::{Event, ItemName, ItemPatch, Kind, Position, Relative, Request, Response};
+    use rsbar_protocol::{
+        ComponentKind, Event, ItemName, ItemPatch, Kind, Position, Relative, Request, Response,
+    };
+    use std::num::NonZeroU64;
 
     /// The workspace source, which `front_app_switched` is the lazy way in to.
     const WORKSPACE: &str = "workspace";
@@ -498,7 +581,7 @@ mod tests {
         bar.apply(Request::SetMatching {
             pattern: r"menu\..*".into(),
             patch: Box::new(ItemPatch {
-                drawing: Some(false),
+                drawing: Some(rsbar_protocol::Toggle::Off),
                 ..Default::default()
             }),
         });
@@ -810,5 +893,119 @@ mod tests {
         let outcome = bar.apply(Request::Shutdown);
         assert!(outcome.exit);
         assert_eq!(bar.items().len(), 1);
+    }
+
+    fn space(bar: &mut Harness, item: &str) -> ItemName {
+        let name = name(item);
+        bar.apply(Request::AddComponent {
+            name: name.clone(),
+            position: Position::Left,
+            kind: ComponentKind::Space,
+        });
+        name
+    }
+
+    #[test]
+    fn re_pushing_a_graphs_current_value_changes_nothing() {
+        let mut bar = Harness::new();
+        bar.apply(Request::AddComponent {
+            name: name("cpu"),
+            position: Position::Right,
+            kind: ComponentKind::Graph,
+        });
+        let cpu = name("cpu");
+
+        assert_eq!(bar.push(&cpu, 1.0).response, Response::Ok);
+        bar.clear_trackers();
+
+        assert_eq!(
+            bar.push(&cpu, 1.0).response,
+            Response::Ok,
+            "re-pushing the same reading is not an error"
+        );
+        assert!(
+            !bar.changed::<crate::components::Graph>(&cpu),
+            "an unchanged reading must not mark the graph changed"
+        );
+
+        bar.push(&cpu, 2.0);
+        assert!(
+            bar.changed::<crate::components::Graph>(&cpu),
+            "a moved reading must"
+        );
+    }
+
+    #[test]
+    fn pushing_onto_something_that_is_not_a_graph_is_an_error() {
+        let mut bar = Harness::new();
+        let clock = bar.add("clock", Position::Left);
+        assert!(matches!(bar.push(&clock, 1.0).response, Response::Error(_)));
+    }
+
+    #[test]
+    fn a_space_change_selects_the_item_associated_with_it_and_deselects_the_rest() {
+        // Models `bar_manager_update_space_components`: selection follows
+        // whichever space a display is now showing.
+        let mut bar = Harness::new();
+        let one = space(&mut bar, "space.1");
+        let two = space(&mut bar, "space.2");
+        bar.set_associated_space(&one, NonZeroU64::new(1).unwrap());
+        bar.set_associated_space(&two, NonZeroU64::new(2).unwrap());
+
+        // `ItemState` does not report `Selected` yet — a protocol gap, not
+        // this pass's — so the recomputation is checked directly through
+        // `Harness::changed`, which is exactly the damage-tracking question
+        // this pass is about.
+        bar.space_changed(1, NonZeroU64::new(1).unwrap());
+        bar.clear_trackers();
+        bar.space_changed(1, NonZeroU64::new(1).unwrap());
+        assert!(
+            !bar.changed::<crate::components::Selected>(&one),
+            "the same space changing again must not re-mark an already-selected item"
+        );
+        assert!(
+            !bar.changed::<crate::components::Selected>(&two),
+            "nor an already-deselected one"
+        );
+
+        bar.space_changed(1, NonZeroU64::new(2).unwrap());
+        assert!(
+            bar.changed::<crate::components::Selected>(&one),
+            "space.1 lost the display it had"
+        );
+        assert!(
+            bar.changed::<crate::components::Selected>(&two),
+            "space.2 gained it"
+        );
+    }
+
+    #[test]
+    fn a_space_stays_selected_while_another_display_still_shows_it() {
+        // Two displays can each be on their own space; a space item is
+        // selected if *any* display currently shows it, the same as
+        // `bar_manager_update_space_components` checking every bar in turn.
+        let mut bar = Harness::new();
+        let one = space(&mut bar, "space.1");
+        bar.set_associated_space(&one, NonZeroU64::new(1).unwrap());
+
+        bar.space_changed(1, NonZeroU64::new(1).unwrap());
+        bar.space_changed(2, NonZeroU64::new(9).unwrap());
+        bar.clear_trackers();
+
+        // Display 1 moves off space 1, but display 2 never showed it, so
+        // nothing here actually changes... except it does: space 1 is no
+        // longer shown anywhere, so it must be deselected.
+        bar.space_changed(1, NonZeroU64::new(3).unwrap());
+        assert!(bar.changed::<crate::components::Selected>(&one));
+
+        // Reselect it on display 1, then move display 2 elsewhere: display 1
+        // still shows it, so nothing should change.
+        bar.space_changed(1, NonZeroU64::new(1).unwrap());
+        bar.clear_trackers();
+        bar.space_changed(2, NonZeroU64::new(4).unwrap());
+        assert!(
+            !bar.changed::<crate::components::Selected>(&one),
+            "still shown on display 1"
+        );
     }
 }
