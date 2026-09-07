@@ -436,6 +436,7 @@ fn settle_reload(
     mut index: ResMut<Index>,
     mut cache: NonSendMut<Cache>,
     mut captures: NonSendMut<crate::alias::Captures>,
+    mut subscribers: NonSendMut<crate::subscribers::Subscribers>,
     stale: Query<(Entity, &Name), With<Stale>>,
     config: Res<ConfigHandle>,
 ) {
@@ -455,6 +456,7 @@ fn settle_reload(
         if succeeded {
             cache.forget(entity);
             captures.forget(entity);
+            subscribers.clear(entity);
             index.remove(&name.0);
             // The item's claims are components, so the despawn releases them
             // and a source nothing wants any more stops on the next settle.

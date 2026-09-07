@@ -51,11 +51,16 @@ pub fn providing_source() -> PowerSource {
 struct Watch {
     source: CFRetained<CFRunLoopSource>,
     run_loop: CFRetained<CFRunLoop>,
+    /// The state `IOKit` was handed a pointer to. Held, never read: the
+    /// callback recovers it from that pointer, so it has to outlive the
+    /// registration. Dropping it here — after `Drop` has removed the source —
+    /// is what makes that safe.
+    _state: CallbackState<Emitter>,
 }
 
 impl Watch {
     /// Starts reporting power source changes on the current run loop.
-    fn install(state: &CallbackState<Emitter>) -> Result<Self, StartError> {
+    fn install(state: CallbackState<Emitter>) -> Result<Self, StartError> {
         extern "C-unwind" fn changed(context: *mut c_void) {
             // SAFETY: the registration passed a `CallbackState<Emitter>` pointer.
             let Some(emit) = (unsafe { CallbackState::<Emitter>::recover(context) }) else {
@@ -82,7 +87,11 @@ impl Watch {
         run_loop.add_source(Some(&source), unsafe {
             objc2_core_foundation::kCFRunLoopCommonModes
         });
-        Ok(Self { source, run_loop })
+        Ok(Self {
+            source,
+            run_loop,
+            _state: state,
+        })
     }
 }
 
@@ -103,8 +112,7 @@ impl Source for Power {
         cx: &mut Registering<'_>,
     ) -> Result<Registration, StartError> {
         let emit = cx.emitter();
-        let state = CallbackState::new(emit);
-        Ok(Box::new(Watch::install(&state)?))
+        Ok(Box::new(Watch::install(CallbackState::new(emit))?))
     }
 }
 
