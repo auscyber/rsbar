@@ -68,6 +68,9 @@ impl Harness {
         // Spawns and despawns are queued as commands; nothing is visible to the
         // next query until they are applied.
         state.apply(&mut self.world);
+        // What the daemon does in `Last`: claims taken and dropped by the
+        // request are only counts until something registers against them.
+        self.sources.settle();
         outcome
     }
 
@@ -273,6 +276,74 @@ mod tests {
             events: vec![],
         });
         assert_eq!(bar.registered_for(WORKSPACE), vec![Kind::SystemWoke]);
+    }
+
+    #[test]
+    fn two_items_wanting_the_same_event_share_one_observer() {
+        // Both claims refer to the same underlying thing. The first release
+        // must not take it away from the item still holding one — and the
+        // second must, or it observes forever.
+        let mut bar = Harness::new();
+        let first = bar.add("one", Position::Left);
+        let second = bar.add("two", Position::Left);
+        for item in [&first, &second] {
+            bar.apply(Request::Subscribe {
+                name: item.clone(),
+                events: vec![Kind::FrontAppSwitched],
+            });
+        }
+        assert_eq!(bar.registered_for(WORKSPACE), vec![Kind::FrontAppSwitched]);
+
+        bar.apply(Request::RemoveItem(first));
+        assert_eq!(
+            bar.registered_for(WORKSPACE),
+            vec![Kind::FrontAppSwitched],
+            "the other item still holds a claim on it"
+        );
+
+        bar.apply(Request::RemoveItem(second));
+        assert!(bar.registered_for(WORKSPACE).is_empty());
+        assert!(!bar.running(WORKSPACE));
+    }
+
+    #[test]
+    fn a_sources_events_come_and_go_with_the_items_that_want_them() {
+        // One source, two items, two different events off it, each arriving
+        // and leaving independently.
+        let mut bar = Harness::new();
+
+        // An item asks for the front application. The source is created and
+        // serves exactly that.
+        let front = bar.add("front", Position::Left);
+        bar.apply(Request::Subscribe {
+            name: front.clone(),
+            events: vec![Kind::FrontAppSwitched],
+        });
+        assert_eq!(bar.registered_for(WORKSPACE), vec![Kind::FrontAppSwitched]);
+
+        // Another item asks for the space. The source already exists, so it is
+        // widened rather than rebuilt.
+        let space = bar.add("space", Position::Left);
+        bar.apply(Request::Subscribe {
+            name: space.clone(),
+            events: vec![Kind::SpaceChanged],
+        });
+        let mut both = bar.registered_for(WORKSPACE);
+        both.sort();
+        let mut expected = vec![Kind::FrontAppSwitched, Kind::SpaceChanged];
+        expected.sort();
+        assert_eq!(both, expected);
+
+        // The first item goes. Nothing wants the front application any more,
+        // so the source stops observing it — and keeps observing the space.
+        bar.apply(Request::RemoveItem(front));
+        assert_eq!(bar.registered_for(WORKSPACE), vec![Kind::SpaceChanged]);
+        assert!(bar.running(WORKSPACE));
+
+        // The second goes too. Nothing wants anything off it, so it stops.
+        bar.apply(Request::RemoveItem(space));
+        assert!(bar.registered_for(WORKSPACE).is_empty());
+        assert!(!bar.running(WORKSPACE));
     }
 
     #[test]

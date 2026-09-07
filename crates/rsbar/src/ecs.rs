@@ -152,6 +152,7 @@ pub fn build(
         .add_systems(
             Last,
             (
+                settle_sources,
                 layout::repaint.run_if(layout::needs_repaint),
                 layout::clear_force_repaint,
             )
@@ -218,6 +219,16 @@ fn rebuild_panels(
 }
 
 /// Takes everything queued across every running source.
+/// Starts and stops sources to match the claims items are holding.
+///
+/// Separate from taking and dropping a claim because those happen anywhere —
+/// a `Watch` is dropped by a despawn, on whatever thread the ECS pleases —
+/// while registering and deregistering have to happen here, on the main
+/// thread, with the run loop current.
+fn settle_sources(mut sources: NonSendMut<Sources>) {
+    sources.0.settle();
+}
+
 fn drain_events(mut sources: NonSendMut<Sources>, mut out: MessageWriter<EventMessage>) {
     for (id, event) in sources.0.drain() {
         tracing::trace!(source = %id, kind = %event.kind(), "drained");
@@ -324,7 +335,6 @@ fn settle_reload(
     mut commands: Commands,
     mut index: ResMut<Index>,
     mut cache: NonSendMut<Cache>,
-    mut sources: NonSendMut<Sources>,
     stale: Query<(Entity, &Name), With<Stale>>,
     config: Res<ConfigHandle>,
 ) {
@@ -344,9 +354,8 @@ fn settle_reload(
         if succeeded {
             cache.forget(entity);
             index.remove(&name.0);
-            // A config that dropped the only item watching the volume stops
-            // the audio listener with it.
-            sources.0.release(entity);
+            // The item's claims are components, so the despawn releases them
+            // and a source nothing wants any more stops on the next settle.
             commands.entity(entity).despawn();
         } else {
             commands.entity(entity).remove::<Stale>();

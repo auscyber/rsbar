@@ -8,7 +8,7 @@
 use crate::bar::{Changes, Panels, Settings};
 use crate::components::{
     Background, ClickScript, Drawing, Icon, Index, Label, Name, Offset, Padding, Placement,
-    Routine, Run, Script, Stale, Subscriptions, bundle,
+    Routine, Run, Script, Stale, Subscriptions, Watching, bundle,
 };
 use crate::script::Job;
 use crate::shaping::Cache;
@@ -426,7 +426,8 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             // it swept up as stale.
             items.commands.entity(entity).remove::<Stale>();
             if let Some(subscribed) = subscribed {
-                sources.holds(entity, needs(&subscribed, true));
+                let watches = sources.watch_all(needs(&subscribed, true));
+                items.commands.entity(entity).insert(Watching(watches));
                 take_clicks(panels);
             }
             Outcome::ok()
@@ -438,9 +439,8 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
                 return no_such(&name);
             };
             cache.forget(entity);
-            // Before the despawn: this is what stops a source nothing wants any
-            // more, and the entity is the handle it is held by.
-            sources.release(entity);
+            // The item's claims go with it: `Watching` is a component, so the
+            // despawn drops them and the sources nothing wants any more stop.
             items.commands.entity(entity).despawn();
             Outcome::ok()
         }
@@ -458,7 +458,10 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             let subscribed: BTreeSet<Kind> = events.into_iter().collect();
             let clickable = row.11.is_some_and(|script| !script.0.is_empty())
                 || subscribed.iter().any(is_pointer);
-            sources.holds(entity, needs(&subscribed, clickable));
+            // Inserting replaces whatever it held before, and dropping those
+            // releases exactly what this item stopped wanting.
+            let watches = sources.watch_all(needs(&subscribed, clickable));
+            items.commands.entity(entity).insert(Watching(watches));
             if clickable {
                 take_clicks(panels);
             }

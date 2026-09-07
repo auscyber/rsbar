@@ -46,7 +46,6 @@ pub mod power;
 pub mod volume;
 pub mod workspace;
 
-use bevy_ecs::entity::Entity;
 use rsbar_protocol::{Event, Kind};
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
@@ -518,6 +517,80 @@ impl<T: Payload> CallbackState<T> {
     }
 }
 
+/// A live claim on one event.
+///
+/// The claim *is* the reference count. Every item wanting the same event holds
+/// a handle on one shared [`Claim`], and the registry keeps only a [`Weak`] to
+/// it — so the event is wanted for exactly as long as a handle exists, with no
+/// counter to keep in step with reality. A second demander clones rather than
+/// allocating a second claim, and the last handle to go frees it once.
+///
+/// Dropping only records the release. Deregistering has to happen on the main
+/// thread with the run loop current, and a `Drop` can run anywhere, so the
+/// registry settles the change on its next pass.
+#[derive(Debug, Clone)]
+pub struct Watch(
+    /// Held for its destructor and nothing else. Never read: what it *is* is
+    /// the claim, and letting go of it is the whole interface.
+    #[allow(dead_code, reason = "the value is the reference, not something read")]
+    std::sync::Arc<Claim>,
+);
+
+/// The thing a [`Watch`] is a handle on: one event being wanted.
+///
+/// Never held by the registry, only pointed at weakly. Its destructor running
+/// is what "nothing wants this any more" means.
+#[derive(Debug)]
+struct Claim {
+    /// Set when this dies, so the registry knows to look without walking every
+    /// source on every pass.
+    moved: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.moved.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The claims currently alive, by event.
+#[derive(Debug, Default)]
+struct Claims {
+    live: HashMap<Kind, std::sync::Weak<Claim>>,
+    moved: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Claims {
+    /// A handle on `kind`, sharing the one claim if it is already alive.
+    fn take(&mut self, kind: &Kind) -> Watch {
+        if let Some(existing) = self.live.get(kind).and_then(std::sync::Weak::upgrade) {
+            return Watch(existing);
+        }
+        let claim = std::sync::Arc::new(Claim {
+            moved: std::sync::Arc::clone(&self.moved),
+        });
+        self.live
+            .insert(kind.clone(), std::sync::Arc::downgrade(&claim));
+        self.mark();
+        Watch(claim)
+    }
+
+    fn mark(&self) {
+        self.moved.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether any claim was taken or died since the last ask.
+    fn moved(&self) -> bool {
+        self.moved.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// The events still claimed, forgetting the ones whose claim has died.
+    fn wanted(&mut self) -> BTreeSet<Kind> {
+        self.live.retain(|_, claim| claim.strong_count() > 0);
+        self.live.keys().cloned().collect()
+    }
+}
+
 /// Starts a source, giving back the feed it produces.
 ///
 /// Registration happens here, on the caller's thread, which is the main one.
@@ -564,9 +637,8 @@ pub struct Registry {
     /// per-item pointer events will come from sources indexed by the entity
     /// they watch — so this maps to a list rather than pretending otherwise.
     providers: HashMap<Kind, Vec<SourceId>>,
-    /// Which sources each item currently has a claim on, so releasing it
-    /// knows where to look. What it wants from them lives on the source.
-    held: HashMap<Entity, Vec<SourceId>>,
+    /// Every claim currently out, however many items hold a handle on each.
+    claims: Claims,
     /// Context the sources share, built on first ask.
     shared: Shared,
     /// Events with no framework behind them — a click, or `--trigger`.
@@ -583,10 +655,6 @@ struct Registered {
     feed: Option<Feed>,
     /// Everything this source can produce.
     provides: BTreeSet<Kind>,
-    /// What each item wants from it. Emptying this stops the source, and
-    /// changing it re-registers against the new set — which is what lets a
-    /// reload ask for an event nobody wanted before.
-    wanted: HashMap<Entity, BTreeSet<Kind>>,
     /// What it is serving right now, so a change of demand is detectable.
     serving: BTreeSet<Kind>,
     /// Kept running regardless of who wants it: the bar's own geometry and its
@@ -600,12 +668,12 @@ struct Registered {
 }
 
 impl Registered {
-    /// Everything anything wants from this source.
-    fn demand(&self) -> BTreeSet<Kind> {
+    /// Everything still claimed that this source provides.
+    fn demand(&self, claimed: &BTreeSet<Kind>) -> BTreeSet<Kind> {
         if self.pinned {
             return self.provides.clone();
         }
-        self.wanted.values().flatten().cloned().collect()
+        self.provides.intersection(claimed).cloned().collect()
     }
 }
 
@@ -637,7 +705,6 @@ impl Registry {
                     provides: provided,
                     source,
                     feed: None,
-                    wanted: HashMap::new(),
                     serving: BTreeSet::new(),
                     failed: false,
                 },
@@ -648,7 +715,7 @@ impl Registry {
         Self {
             sources: registered,
             providers,
-            held: HashMap::new(),
+            claims: Claims::default(),
             shared: Shared::default(),
             manual,
             emit,
@@ -702,61 +769,38 @@ impl Registry {
     /// an event it provides, and stops when the last one stops wanting it. An
     /// item that drops `volume_changed` from its subscriptions stops the audio
     /// listener, and a config reload that removes the item entirely does too.
-    pub fn holds(&mut self, who: Entity, kinds: impl IntoIterator<Item = Kind>) {
-        // Split by source, so each is told what *it* is being asked for rather
-        // than that somebody wants something it happens to provide.
-        let mut per_source: HashMap<SourceId, BTreeSet<Kind>> = HashMap::new();
-        for kind in kinds {
-            let Some(ids) = self.providers.get(&kind) else {
-                tracing::debug!(%kind, "nothing provides this event");
-                continue;
-            };
-            for id in ids {
-                per_source.entry(*id).or_default().insert(kind.clone());
-            }
+    /// Claims an event for as long as the returned [`Watch`] lives.
+    ///
+    /// Claiming an event already claimed hands back a handle on the same one
+    /// rather than a second of it. The source is actually started, or stopped,
+    /// by [`settle`](Registry::settle) on the next pass, because registering
+    /// and deregistering have to happen on the main thread while a `Drop` can
+    /// run anywhere.
+    #[must_use]
+    pub fn watch(&mut self, kind: &Kind) -> Watch {
+        if !self.providers.contains_key(kind) {
+            tracing::debug!(%kind, "nothing provides this event");
         }
-
-        // Every source this item had a claim on, plus every source it has one
-        // on now: the ones it dropped have to be told too.
-        let previously = self.held.remove(&who).unwrap_or_default();
-        let touched: Vec<SourceId> = previously
-            .iter()
-            .copied()
-            .chain(per_source.keys().copied())
-            .collect();
-
-        for id in &touched {
-            let Some(entry) = self.sources.get_mut(id) else {
-                continue;
-            };
-            match per_source.get(id) {
-                Some(kinds) => {
-                    entry.wanted.insert(who, kinds.clone());
-                }
-                None => {
-                    entry.wanted.remove(&who);
-                }
-            }
-        }
-
-        if !per_source.is_empty() {
-            self.held.insert(who, per_source.keys().copied().collect());
-        }
-        for id in touched {
-            self.reconcile(id);
-        }
+        self.claims.take(kind)
     }
 
-    /// Releases everything an item was keeping alive, because it is gone.
-    pub fn release(&mut self, who: Entity) {
-        let Some(held) = self.held.remove(&who) else {
+    /// Claims several events at once.
+    pub fn watch_all(&mut self, kinds: impl IntoIterator<Item = Kind>) -> Vec<Watch> {
+        kinds.into_iter().map(|kind| self.watch(&kind)).collect()
+    }
+
+    /// Brings every source into line with the claims currently out.
+    ///
+    /// Cheap when nothing moved, which is almost every pass: a flag says
+    /// whether any claim was taken or dropped since last time.
+    pub fn settle(&mut self) {
+        if !self.claims.moved() {
             return;
-        };
-        for id in held {
-            if let Some(entry) = self.sources.get_mut(&id) {
-                entry.wanted.remove(&who);
-            }
-            self.reconcile(id);
+        }
+        let claimed = self.claims.wanted();
+        let ids: Vec<SourceId> = self.sources.keys().copied().collect();
+        for id in ids {
+            self.reconcile_against(id, &claimed);
         }
     }
 
@@ -769,6 +813,11 @@ impl Registry {
     /// for it, rather than relying on the source having quietly installed one
     /// nobody asked for.
     fn reconcile(&mut self, id: SourceId) {
+        let claimed = self.claims.wanted();
+        self.reconcile_against(id, &claimed);
+    }
+
+    fn reconcile_against(&mut self, id: SourceId, claimed: &BTreeSet<Kind>) {
         let Self {
             sources,
             shared,
@@ -778,7 +827,7 @@ impl Registry {
         let Some(entry) = sources.get_mut(&id) else {
             return;
         };
-        let demand = entry.demand();
+        let demand = entry.demand(claimed);
 
         if demand.is_empty() {
             if entry.feed.is_some() {
@@ -853,5 +902,58 @@ impl Registry {
             }
         }
         drained
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::{Claims, Kind};
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    #[test]
+    fn a_second_claim_on_one_event_is_a_handle_on_the_first() {
+        let mut claims = Claims::default();
+        let first = claims.take(&Kind::SystemWoke);
+        let second = claims.take(&Kind::SystemWoke);
+        assert!(
+            Arc::ptr_eq(&first.0, &second.0),
+            "one claim, two handles — not two claims"
+        );
+    }
+
+    #[test]
+    fn an_event_stays_wanted_until_the_last_handle_goes() {
+        let mut claims = Claims::default();
+        let first = claims.take(&Kind::SystemWoke);
+        let second = claims.take(&Kind::SystemWoke);
+
+        drop(first);
+        assert_eq!(claims.wanted(), BTreeSet::from([Kind::SystemWoke]));
+
+        drop(second);
+        assert!(claims.wanted().is_empty());
+    }
+
+    #[test]
+    fn a_claim_taken_again_after_dying_is_a_fresh_one() {
+        let mut claims = Claims::default();
+        drop(claims.take(&Kind::SystemWoke));
+        assert!(claims.wanted().is_empty());
+
+        let revived = claims.take(&Kind::SystemWoke);
+        assert_eq!(claims.wanted(), BTreeSet::from([Kind::SystemWoke]));
+        drop(revived);
+    }
+
+    #[test]
+    fn dropping_a_handle_tells_the_registry_to_look() {
+        let mut claims = Claims::default();
+        let watch = claims.take(&Kind::SystemWoke);
+        assert!(claims.moved(), "taking one is a change");
+        assert!(!claims.moved(), "and asking clears it");
+
+        drop(watch);
+        assert!(claims.moved(), "so is the last one going");
     }
 }

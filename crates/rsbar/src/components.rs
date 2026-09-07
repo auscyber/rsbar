@@ -123,6 +123,16 @@ impl Routine {
 #[derive(Component, Debug, Clone, Default, PartialEq, Eq)]
 pub struct Subscriptions(pub BTreeSet<Kind>);
 
+/// The claims this item holds on the sources behind its subscriptions.
+///
+/// Kept as a component rather than a list in the registry so that the ECS
+/// releases them: despawning the item drops this, and replacing it drops the
+/// claims it used to hold. A source outliving everything that wanted it is
+/// invisible — it just keeps observing — so the release is better made
+/// impossible to forget than remembered at every despawn.
+#[derive(Component, Debug, Default)]
+pub struct Watching(pub Vec<crate::sources::Watch>);
+
 /// Name to entity, so a request naming an item does not scan every one.
 ///
 /// Kept in step by the systems that spawn and despawn; nothing else writes it.
@@ -170,6 +180,7 @@ pub fn bundle(name: ItemName, position: Position) -> impl Bundle {
             elapsed: 0,
         },
         Subscriptions::default(),
+        Watching::default(),
     )
 }
 
