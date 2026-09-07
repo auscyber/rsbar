@@ -157,7 +157,11 @@ struct ItemOptions {
 enum QueryWhat {
     Bar,
     Items,
-    Item { name: ItemName },
+    Item {
+        name: ItemName,
+    },
+    /// Menu bar items that can be mirrored, as `Owner,Name`.
+    MenuItems,
 }
 
 fn parse_color(s: &str) -> Result<u32, String> {
@@ -241,6 +245,7 @@ fn main() -> ExitCode {
             QueryWhat::Bar => Query::Bar,
             QueryWhat::Items => Query::Items,
             QueryWhat::Item { name } => Query::Item(name),
+            QueryWhat::MenuItems => Query::MenuItems,
         }),
         Command::Trigger { event, info } => {
             let mut event = event.into_event();
@@ -284,6 +289,12 @@ fn main() -> ExitCode {
         }
         Ok(Response::Item(item)) => {
             println!("{item:#?}");
+            ExitCode::SUCCESS
+        }
+        Ok(Response::MenuItems(found)) => {
+            for item in found {
+                println!("{item}");
+            }
             ExitCode::SUCCESS
         }
         Err(err) => {

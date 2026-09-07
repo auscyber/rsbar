@@ -7,7 +7,9 @@
 
 use crate::alias::Captures;
 use crate::bar::{Panels, Settings, fill_rounded_rect};
-use crate::components::{Background, Drawing, Icon, Label, Offset, Padding, Placement};
+use crate::components::{
+    AliasContent, Background, Drawing, Icon, Label, Offset, Padding, Placement,
+};
 use crate::shaping::Cache;
 use bevy_ecs::prelude::*;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -418,8 +420,16 @@ fn paint_panels(
 
                     // An alias draws what it mirrors, and nothing else.
                     if let Some(captured) = captures.get(entity) {
+                        // Centred in the item rather than hung from its top
+                        // edge. A menu bar extra is captured at the menu bar's
+                        // height, which is not the bar's, so aligning the two
+                        // tops sits it visibly higher than the text beside it.
+                        let slack = (frame.size.height - captured.size.height) / 2.0;
                         let box_ = CGRect::new(
-                            CGPoint::new(frame.origin.x + padding.left, frame.origin.y + offset.0),
+                            CGPoint::new(
+                                frame.origin.x + padding.left,
+                                frame.origin.y + offset.0 + slack,
+                            ),
                             captured.size,
                         );
                         crate::bar::draw_image(ctx, box_, &captured.image);
@@ -477,6 +487,10 @@ type AnythingVisibleChanged<'w, 's> = Query<
         Changed<Offset>,
         Changed<Placement>,
         Changed<Drawing>,
+        // The digest of what an alias mirrors. Without this the capture
+        // refreshes and the component changes, but nothing asks for a
+        // repaint — a mirrored clock sits at the minute it was first drawn.
+        Changed<AliasContent>,
     )>,
 >;
 
@@ -495,6 +509,10 @@ pub type DirtyItems<'w, 's> = Query<
         Changed<Offset>,
         Changed<Placement>,
         Changed<Drawing>,
+        // The digest of what an alias mirrors. Without this the capture
+        // refreshes and the component changes, but nothing asks for a
+        // repaint — a mirrored clock sits at the minute it was first drawn.
+        Changed<AliasContent>,
     )>,
 >;
 

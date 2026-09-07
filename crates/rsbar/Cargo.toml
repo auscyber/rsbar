@@ -20,8 +20,8 @@ bitflags = { workspace = true }
 async-mach-ports = { workspace = true }
 rsbar-protocol = { workspace = true }
 skylight = { workspace = true }
-objc2-core-foundation = { workspace = true, features = ["CFArray", "CFAttributedString", "CFDictionary", "CFNumber", "CFString", "CFCGTypes", "CFRunLoop", "CFUUID", "CFURL"] }
-objc2-core-graphics = { workspace = true, features = ["CGContext", "CGColor", "CGColorSpace", "CGDirectDisplay", "CGDisplayConfiguration", "CGError", "CGEvent", "CGEventTypes", "CGPath", "CGGeometry", "CGImage", "CGWindow"] }
+objc2-core-foundation = { workspace = true, features = ["CFArray", "CFAttributedString", "CFDictionary", "CFNumber", "CFString", "CFCGTypes", "CFRunLoop", "CFUUID", "CFData", "CFURL"] }
+objc2-core-graphics = { workspace = true, features = ["CGContext", "CGColor", "CGColorSpace", "CGDirectDisplay", "CGDisplayConfiguration", "CGError", "CGEvent", "CGEventTypes", "CGPath", "CGGeometry", "CGImage", "CGDataProvider", "CGWindow"] }
 objc2-core-text = { workspace = true, features = ["CTFont", "CTFontDescriptor", "CTLine", "CTStringAttributes", "objc2-core-graphics"] }
 objc2-application-services = { version = "0.3", default-features = false, features = ["std", "HIServices", "AXError", "AXUIElement", "AXValue", "libc"] }
 bevy_app = { workspace = true }

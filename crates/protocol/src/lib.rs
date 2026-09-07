@@ -177,6 +177,9 @@ pub enum Query {
     Bar,
     Items,
     Item(ItemName),
+    /// Every menu bar item that can be mirrored, as `Owner,Name` — the form
+    /// an item's `alias` takes. There is no discovering these otherwise.
+    MenuItems,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -244,6 +247,8 @@ pub enum Response {
     Bar(Box<BarState>),
     Items(Vec<ItemState>),
     Item(Box<ItemState>),
+    /// Mirrorable menu bar items, as `Owner,Name`.
+    MenuItems(Vec<String>),
     /// The request was understood but could not be carried out.
     Error(String),
 }

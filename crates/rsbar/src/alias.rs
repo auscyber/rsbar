@@ -48,9 +48,10 @@ use objc2_core_foundation::{
     CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
 };
 use objc2_core_graphics::{
-    CGImage, CGPreflightScreenCaptureAccess, CGRectMakeWithDictionaryRepresentation,
-    CGRequestScreenCaptureAccess, CGWindowListCopyWindowInfo, CGWindowListOption, kCGWindowBounds,
-    kCGWindowLayer, kCGWindowName, kCGWindowNumber, kCGWindowOwnerName, kCGWindowOwnerPID,
+    CGDataProvider, CGImage, CGPreflightScreenCaptureAccess,
+    CGRectMakeWithDictionaryRepresentation, CGRequestScreenCaptureAccess,
+    CGWindowListCopyWindowInfo, CGWindowListOption, kCGWindowBounds, kCGWindowLayer, kCGWindowName,
+    kCGWindowNumber, kCGWindowOwnerName, kCGWindowOwnerPID,
 };
 use skylight::{Window, WindowId};
 use std::collections::HashMap;
@@ -653,5 +654,110 @@ mod ax {
         let position = attribute_point(element, "AXPosition")?;
         let size = attribute_size(element, "AXSize")?;
         Some(CGRect::new(position, size))
+    }
+}
+
+/// A captured menu bar item, ready to draw.
+pub struct Captured {
+    pub image: CFRetained<CGImage>,
+    pub size: CGSize,
+    /// A digest of the pixels, so an unchanged icon can be told from a changed
+    /// one. `SketchyBar` re-draws an alias whether or not it moved; a clock
+    /// that only changes once a minute should not cost a repaint every second.
+    pub digest: u64,
+}
+
+/// What each alias item is mirroring, and the last thing it captured.
+///
+/// Out of the ECS for the same reason the shaped text is: a `CGImage` is not
+/// `Send`, so it cannot be a component. Keyed by entity alongside it.
+#[derive(Default)]
+pub struct Captures(std::collections::HashMap<bevy_ecs::entity::Entity, Mirror>);
+
+struct Mirror {
+    alias: Alias,
+    /// The spec it was built from, so a changed spec rebuilds it.
+    spec: String,
+    captured: Option<Captured>,
+}
+
+/// Splits an `Owner,Name` spec. The name may itself contain commas, so only
+/// the first one separates.
+fn split_spec(spec: &str) -> Option<(&str, &str)> {
+    let (owner, name) = spec.split_once(',')?;
+    let (owner, name) = (owner.trim(), name.trim());
+    (!owner.is_empty() && !name.is_empty()).then_some((owner, name))
+}
+
+fn digest(image: &CGImage) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // The pixels, not the object: two captures of an unchanged item are
+    // different `CGImage`s with identical contents.
+    if let Some(data) = CGDataProvider::data(CGImage::data_provider(Some(image)).as_deref()) {
+        // SAFETY: a freshly copied `CFData` nothing else holds, so nothing can
+        // mutate it while the slice is alive.
+        unsafe { data.as_bytes_unchecked() }.hash(&mut hasher);
+    }
+    CGImage::width(Some(image)).hash(&mut hasher);
+    CGImage::height(Some(image)).hash(&mut hasher);
+    hasher.finish()
+}
+
+impl Captures {
+    /// Re-captures one item, reporting its digest if what it draws changed.
+    ///
+    /// `None` means nothing to redraw — either the capture failed, or it came
+    /// back identical, which is what most re-captures do.
+    pub fn refresh(&mut self, entity: bevy_ecs::entity::Entity, spec: &str) -> Option<u64> {
+        let Some((owner, name)) = split_spec(spec) else {
+            tracing::warn!(spec, "an alias is written `Owner,Name`");
+            return None;
+        };
+
+        let mirror = match self.0.get_mut(&entity) {
+            Some(mirror) if mirror.spec == spec => mirror,
+            _ => self
+                .0
+                .entry(entity)
+                .insert_entry(Mirror {
+                    alias: Alias::new(owner, name),
+                    spec: spec.to_owned(),
+                    captured: None,
+                })
+                .into_mut(),
+        };
+
+        let capture = match mirror.alias.capture() {
+            Ok(capture) => capture,
+            Err(err) => {
+                tracing::debug!(%err, spec, "could not capture the menu bar item");
+                return None;
+            }
+        };
+
+        let digest = digest(&capture.image);
+        if mirror
+            .captured
+            .as_ref()
+            .is_some_and(|held| held.digest == digest)
+        {
+            return None;
+        }
+        mirror.captured = Some(Captured {
+            image: capture.image,
+            size: capture.size,
+            digest,
+        });
+        Some(digest)
+    }
+
+    #[must_use]
+    pub fn get(&self, entity: bevy_ecs::entity::Entity) -> Option<&Captured> {
+        self.0.get(&entity)?.captured.as_ref()
+    }
+
+    pub fn forget(&mut self, entity: bevy_ecs::entity::Entity) {
+        self.0.remove(&entity);
     }
 }

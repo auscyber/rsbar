@@ -499,6 +499,15 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             Some(state) => Outcome::answer(Response::Item(Box::new(state))),
             None => no_such(&name),
         },
+        Request::Query(ProtocolQuery::MenuItems) => match crate::alias::list_menu_bar_items() {
+            Ok(found) => Outcome::answer(Response::MenuItems(
+                found
+                    .into_iter()
+                    .map(|item| format!("{},{}", item.owner, item.name))
+                    .collect(),
+            )),
+            Err(err) => Outcome::error(err.to_string()),
+        },
 
         Request::Reload => {
             tracing::info!("reload requested");

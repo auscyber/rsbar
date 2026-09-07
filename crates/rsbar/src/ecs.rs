@@ -47,6 +47,10 @@ use objc2_core_foundation::{CFRunLoop, CFRunLoopRunResult, kCFRunLoopDefaultMode
 use rsbar_protocol::{Event, Kind, Request};
 use std::time::Duration;
 
+/// How often a mirrored menu bar item is re-read. Fast enough that a clock
+/// looks live, slow enough not to be the busiest thing in the process.
+const ALIAS_POLL: Duration = Duration::from_millis(500);
+
 /// How long the runner will sleep with nothing to do — also the routine tick.
 /// Item update frequencies are whole seconds, so waking more often would only
 /// cost battery to do nothing.
@@ -241,9 +245,22 @@ fn settle_sources(mut sources: NonSendMut<Sources>) {
 /// the digest lands on a component, the damage tracker repaints just that
 /// item's rect.
 fn refresh_aliases(
+    time: Res<bevy_time::Time<bevy_time::Real>>,
+    mut since: Local<Duration>,
     mut captures: NonSendMut<crate::alias::Captures>,
     mut items: Query<(Entity, &AliasSpec, &mut AliasContent)>,
 ) {
+    // Throttled, because a pass happens on every wake — a per-second script
+    // alone is several — and each refresh asks the window server for a fresh
+    // image and hashes every pixel of it. Profiling put that at two fifths of
+    // all the on-CPU time this process spends, to learn that nothing had
+    // changed on almost every one.
+    *since += time.delta();
+    if *since < ALIAS_POLL {
+        return;
+    }
+    *since = Duration::ZERO;
+
     for (entity, spec, mut content) in &mut items {
         if let Some(digest) = captures.refresh(entity, &spec.0) {
             content.set_if_neq(AliasContent(digest));
@@ -278,8 +295,19 @@ fn apply_requests(
     mut exit: MessageWriter<bevy_app::AppExit>,
 ) {
     while let Ok(IpcRequest { request, reply }) = inbox.requests.try_recv() {
+        // Only a bar request may mark the settings changed. Handing out
+        // `&mut settings` is a `deref_mut`, which marks them whatever the
+        // request turns out to be — and a changed `Settings` means a whole-bar
+        // repaint, so setting one item's label was repainting every item on
+        // every display.
+        let touches_bar = matches!(*request, Request::SetBar(_));
+        let settings: &mut Settings = if touches_bar {
+            &mut settings
+        } else {
+            settings.bypass_change_detection()
+        };
         let mut ctx = Context {
-            settings: &mut settings,
+            settings,
             panels: &mut panels,
             cache: &mut cache,
             sources: &mut sources.0,

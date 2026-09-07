@@ -6,6 +6,7 @@
 use crate::display::{self, Display};
 use bevy_ecs::prelude::Resource;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_core_graphics::{CGContext, CGImage};
 use rsbar_protocol::style::Color;
 use rsbar_protocol::{BarPatch, BarState, Edge};
 use skylight::{Window, WindowTags, level};
@@ -362,4 +363,19 @@ pub fn fill_rounded_rect(
     CGContext::add_arc_to_point(Some(ctx), x, y, x + w, y, radius);
     CGContext::close_path(Some(ctx));
     CGContext::fill_path(Some(ctx));
+}
+
+/// Draws a captured image into a top-left oriented context.
+///
+/// The context is flipped so that a caller works in the same space as the
+/// frames it laid out, and `CGContext::draw_image` takes its rect in the
+/// context's own space — so the flip has to be undone around the image, or a
+/// mirrored menu bar item comes out upside down.
+pub fn draw_image(ctx: &CGContext, rect: CGRect, image: &CGImage) {
+    CGContext::save_g_state(Some(ctx));
+    CGContext::translate_ctm(Some(ctx), 0.0, rect.origin.y + rect.size.height);
+    CGContext::scale_ctm(Some(ctx), 1.0, -1.0);
+    let upright = CGRect::new(CGPoint::new(rect.origin.x, 0.0), rect.size);
+    CGContext::draw_image(Some(ctx), upright, Some(image));
+    CGContext::restore_g_state(Some(ctx));
 }
