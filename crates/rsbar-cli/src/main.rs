@@ -4,7 +4,7 @@ use async_mach_ports::{SendPort, Sender};
 use clap::{Args, Parser, Subcommand};
 use rsbar_protocol::style::Color;
 use rsbar_protocol::{
-    BarPatch, Edge, ItemName, ItemPatch, Position, Query, Request, Response, service_name,
+    BarPatch, Edge, Event, ItemName, ItemPatch, Position, Query, Request, Response, service_name,
 };
 use std::process::ExitCode;
 
@@ -32,6 +32,16 @@ enum Command {
         #[command(subcommand)]
         what: QueryWhat,
     },
+    /// Fire an event now, as a source would.
+    Trigger {
+        #[arg(value_parser = parse_event)]
+        event: Event,
+        /// Passed to scripts as `RSBAR_INFO`.
+        #[arg(long)]
+        info: Option<String>,
+    },
+    /// Run every item's script immediately, ignoring update frequency.
+    Update,
     /// Ask the daemon to exit.
     Shutdown,
 }
@@ -77,8 +87,17 @@ enum ItemAction {
     Remove {
         name: ItemName,
     },
+    /// Replace which events run this item's script.
+    Subscribe {
+        name: ItemName,
+        #[arg(required = true, value_parser = parse_event)]
+        events: Vec<Event>,
+    },
 }
 
+// Doc comments on these fields are clap's `--help` text, not rustdoc, so
+// backticks would show up verbatim in the terminal.
+#[allow(clippy::doc_markdown)]
 #[derive(Args)]
 struct ItemOptions {
     #[arg(long)]
@@ -108,6 +127,13 @@ struct ItemOptions {
     position: Option<Position>,
     #[arg(long)]
     drawing: Option<bool>,
+    /// Shell command run on every update, with RSBAR_NAME, RSBAR_SENDER and
+    /// RSBAR_INFO in its environment. Pass an empty string to clear it.
+    #[arg(long)]
+    script: Option<String>,
+    /// Seconds between routine updates; 0 means event-driven only.
+    #[arg(long)]
+    update_freq: Option<u32>,
 }
 
 #[derive(Subcommand)]
@@ -124,6 +150,11 @@ fn parse_color(s: &str) -> Result<u32, String> {
 fn parse_position(s: &str) -> Result<Position, String> {
     s.parse()
         .map_err(|e: rsbar_protocol::InvalidPosition| e.to_string())
+}
+
+fn parse_event(s: &str) -> Result<Event, String> {
+    s.parse()
+        .map_err(|e: rsbar_protocol::event::InvalidEvent| e.to_string())
 }
 
 fn parse_edge(s: &str) -> Result<Edge, String> {
@@ -165,6 +196,8 @@ impl From<ItemOptions> for ItemPatch {
             y_offset: o.y_offset,
             position: o.position,
             drawing: o.drawing,
+            script: o.script,
+            update_freq: o.update_freq,
         }
     }
 }
@@ -182,12 +215,15 @@ fn main() -> ExitCode {
                 patch: (*options).into(),
             },
             ItemAction::Remove { name } => Request::RemoveItem(name),
+            ItemAction::Subscribe { name, events } => Request::Subscribe { name, events },
         },
         Command::Query { what } => Request::Query(match what {
             QueryWhat::Bar => Query::Bar,
             QueryWhat::Items => Query::Items,
             QueryWhat::Item { name } => Query::Item(name),
         }),
+        Command::Trigger { event, info } => Request::Trigger { event, info },
+        Command::Update => Request::UpdateAll,
         Command::Shutdown => Request::Shutdown,
     };
 

@@ -3,6 +3,8 @@
 pub mod bar;
 pub mod item;
 pub mod runloop;
+pub mod script;
+pub mod sources;
 pub mod text;
 
 pub use rsbar_protocol::style;

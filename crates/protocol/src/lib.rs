@@ -5,7 +5,10 @@
 
 #![cfg(target_os = "macos")]
 
+pub mod event;
 pub mod style;
+
+pub use event::Event;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -146,6 +149,12 @@ pub struct ItemPatch {
     pub y_offset: Option<f64>,
     pub position: Option<Position>,
     pub drawing: Option<bool>,
+    /// Run on every update. Receives `RSBAR_NAME`, `RSBAR_SENDER` and,
+    /// where the event carries one, `RSBAR_INFO`.
+    pub script: Option<String>,
+    /// Seconds between routine updates. Zero means "only on subscribed
+    /// events", which is the right default for anything event-driven.
+    pub update_freq: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,9 +168,27 @@ pub enum Query {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Request {
     SetBar(BarPatch),
-    AddItem { name: ItemName, position: Position },
-    SetItem { name: ItemName, patch: ItemPatch },
+    AddItem {
+        name: ItemName,
+        position: Position,
+    },
+    SetItem {
+        name: ItemName,
+        patch: ItemPatch,
+    },
     RemoveItem(ItemName),
+    /// Replaces the item's subscriptions.
+    Subscribe {
+        name: ItemName,
+        events: Vec<Event>,
+    },
+    /// Fires an event now, as if a source had produced it.
+    Trigger {
+        event: Event,
+        info: Option<String>,
+    },
+    /// Runs every item's script immediately, ignoring update frequency.
+    UpdateAll,
     Query(Query),
     Shutdown,
 }
@@ -187,6 +214,9 @@ pub struct ItemState {
     pub icon: String,
     pub label: String,
     pub drawing: bool,
+    pub script: Option<String>,
+    pub update_freq: u32,
+    pub events: Vec<Event>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -9,17 +9,27 @@
 use async_mach_ports::{Receiver, RecvPort, Reply};
 use objc2_core_foundation::CFRunLoop;
 use rsbar::bar::Bar;
-use rsbar::runloop::Waker;
+use rsbar::runloop::{Timer, Waker};
+use rsbar::script::{Job, Runner};
+use rsbar::sources::Sources;
 use rsbar_protocol::{Query, Request, Response, service_name};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc;
 
 /// One request, with wherever its answer should go.
-struct Job {
+struct Incoming {
     request: Request,
     reply: Option<Reply>,
 }
+
+/// How many scripts may run at once. Enough that a slow one does not stall
+/// the rest, few enough that a misconfigured config cannot fork without bound.
+const SCRIPT_WORKERS: usize = 4;
+
+/// The routine tick. Item update frequencies are whole seconds, so a finer
+/// timer would only wake the machine more often to do nothing.
+const TICK_SECONDS: f64 = 1.0;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -47,19 +57,24 @@ fn main() {
     };
     bar.borrow_mut().redraw_if_dirty();
 
-    let (tx, rx) = mpsc::channel::<Job>();
+    let runner = Rc::new(Runner::start(SCRIPT_WORKERS));
+    let (tx, rx) = mpsc::channel::<Incoming>();
 
     // Signals coalesce, so the handler drains everything queued rather than
     // assuming one job per wakeup, and repaints once at the end instead of
     // once per request.
     let waker = {
         let bar = Rc::clone(&bar);
+        let runner = Rc::clone(&runner);
         Waker::install(move || {
             let mut bar = bar.borrow_mut();
             let mut shutdown = false;
-            while let Ok(job) = rx.try_recv() {
-                let response = handle(&mut bar, job.request, &mut shutdown);
-                if let Some(reply) = job.reply
+            while let Ok(incoming) = rx.try_recv() {
+                let (response, jobs) = handle(&mut bar, incoming.request, &mut shutdown);
+                for job in jobs {
+                    runner.run(job);
+                }
+                if let Some(reply) = incoming.reply
                     && let Err(err) = reply.send(&response)
                 {
                     tracing::debug!(%err, "client stopped waiting for its answer");
@@ -72,6 +87,31 @@ fn main() {
         })
     };
 
+    // Workspace notifications arrive on this thread already, so they act on
+    // the bar directly rather than going back through the run loop source.
+    // Held for the life of the process: dropping it deregisters the observers.
+    let _sources = {
+        let bar = Rc::clone(&bar);
+        let runner = Rc::clone(&runner);
+        Sources::install(move |event, info| {
+            let jobs = bar.borrow().jobs_for(&event, info.as_deref());
+            for job in jobs {
+                runner.run(job);
+            }
+        })
+    };
+
+    // Held for the life of the process: dropping it stops the tick.
+    let _tick = {
+        let bar = Rc::clone(&bar);
+        let runner = Rc::clone(&runner);
+        Timer::every(TICK_SECONDS, move || {
+            for job in bar.borrow_mut().tick() {
+                runner.run(job);
+            }
+        })
+    };
+
     std::thread::Builder::new()
         .name("rsbar-ipc".into())
         .spawn(move || {
@@ -79,11 +119,11 @@ fn main() {
                 loop {
                     match receiver.recv().await {
                         Ok(delivery) => {
-                            let job = Job {
+                            let incoming = Incoming {
                                 request: delivery.value,
                                 reply: delivery.reply,
                             };
-                            if tx.send(job).is_err() {
+                            if tx.send(incoming).is_err() {
                                 break;
                             }
                             waker.wake();
@@ -100,41 +140,59 @@ fn main() {
     CFRunLoop::run();
 }
 
-fn handle(bar: &mut Bar, request: Request, shutdown: &mut bool) -> Response {
+fn handle(bar: &mut Bar, request: Request, shutdown: &mut bool) -> (Response, Vec<Job>) {
+    let found = |ok: bool, name: &rsbar_protocol::ItemName| {
+        if ok {
+            Response::Ok
+        } else {
+            Response::Error(format!("no item named `{name}`"))
+        }
+    };
+
     match request {
-        Request::SetBar(patch) => match bar.apply(&patch) {
-            Ok(()) => Response::Ok,
-            Err(err) => Response::Error(err.to_string()),
-        },
+        Request::SetBar(patch) => (
+            match bar.apply(&patch) {
+                Ok(()) => Response::Ok,
+                Err(err) => Response::Error(err.to_string()),
+            },
+            Vec::new(),
+        ),
         Request::AddItem { name, position } => {
             bar.add_item(name, position);
-            Response::Ok
+            (Response::Ok, Vec::new())
         }
         Request::SetItem { name, patch } => {
-            if bar.set_item(&name, &patch) {
-                Response::Ok
-            } else {
-                Response::Error(format!("no item named `{name}`"))
-            }
+            let ok = bar.set_item(&name, &patch);
+            (found(ok, &name), Vec::new())
         }
         Request::RemoveItem(name) => {
-            if bar.remove_item(&name) {
-                Response::Ok
-            } else {
-                Response::Error(format!("no item named `{name}`"))
-            }
+            let ok = bar.remove_item(&name);
+            (found(ok, &name), Vec::new())
         }
-        Request::Query(Query::Bar) => Response::Bar(Box::new(bar.state())),
-        Request::Query(Query::Items) => {
-            Response::Items(bar.items().iter().map(rsbar::item::Item::state).collect())
+        Request::Subscribe { name, events } => {
+            let ok = bar.subscribe(&name, events);
+            (found(ok, &name), Vec::new())
         }
-        Request::Query(Query::Item(name)) => match bar.item(&name) {
-            Some(item) => Response::Item(Box::new(item.state())),
-            None => Response::Error(format!("no item named `{name}`")),
-        },
+        Request::Trigger { event, info } => {
+            let jobs = bar.jobs_for(&event, info.as_deref());
+            (Response::Ok, jobs)
+        }
+        Request::UpdateAll => (Response::Ok, bar.all_jobs()),
+        Request::Query(Query::Bar) => (Response::Bar(Box::new(bar.state())), Vec::new()),
+        Request::Query(Query::Items) => (
+            Response::Items(bar.items().iter().map(rsbar::item::Item::state).collect()),
+            Vec::new(),
+        ),
+        Request::Query(Query::Item(name)) => (
+            match bar.item(&name) {
+                Some(item) => Response::Item(Box::new(item.state())),
+                None => Response::Error(format!("no item named `{name}`")),
+            },
+            Vec::new(),
+        ),
         Request::Shutdown => {
             *shutdown = true;
-            Response::Ok
+            (Response::Ok, Vec::new())
         }
     }
 }

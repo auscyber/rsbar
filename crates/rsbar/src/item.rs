@@ -4,7 +4,8 @@ use crate::text::{Font, Text};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::CGContext;
 use rsbar_protocol::style::{Color, FontSpec};
-use rsbar_protocol::{ItemName, ItemPatch, ItemState, Position};
+use rsbar_protocol::{Event, ItemName, ItemPatch, ItemState, Position};
+use std::collections::BTreeSet;
 
 /// An item's icon and label are the same kind of thing, differing only in
 /// which defaults they start from.
@@ -45,6 +46,13 @@ pub struct Item {
     pub drawing: bool,
     /// Gap between icon and label, when both are present.
     pub spacing: f64,
+
+    pub script: Option<String>,
+    /// Seconds between routine updates; zero means event-driven only.
+    pub update_freq: u32,
+    /// Seconds since this item last ran on the routine tick.
+    elapsed: u32,
+    events: BTreeSet<Event>,
 }
 
 impl Item {
@@ -62,7 +70,35 @@ impl Item {
             y_offset: 0.0,
             drawing: true,
             spacing: 5.0,
+            script: None,
+            update_freq: 0,
+            elapsed: 0,
+            events: BTreeSet::new(),
         }
+    }
+
+    /// Whether this item asked to hear about `event`.
+    #[must_use]
+    pub fn wants(&self, event: &Event) -> bool {
+        self.events.contains(event)
+    }
+
+    pub fn subscribe(&mut self, events: impl IntoIterator<Item = Event>) {
+        self.events = events.into_iter().collect();
+    }
+
+    /// Advances the routine clock by a second, reporting whether this item is
+    /// due. An update frequency of zero never comes due.
+    pub fn tick(&mut self) -> bool {
+        if self.update_freq == 0 {
+            return false;
+        }
+        self.elapsed += 1;
+        if self.elapsed >= self.update_freq {
+            self.elapsed = 0;
+            return true;
+        }
+        false
     }
 
     /// Total horizontal space this item occupies, padding included.
@@ -121,6 +157,15 @@ impl Item {
         if let Some(d) = patch.drawing {
             self.drawing = d;
         }
+        if let Some(script) = &patch.script {
+            self.script = Some(script.clone()).filter(|s| !s.is_empty());
+        }
+        if let Some(freq) = patch.update_freq {
+            self.update_freq = freq;
+            // A changed frequency restarts the clock, so a config that sets it
+            // twice does not fire early on the second set.
+            self.elapsed = 0;
+        }
     }
 
     /// Draws into `frame`, which the layout has already sized to [`Self::width`].
@@ -157,6 +202,9 @@ impl Item {
             icon: self.icon.text.string().to_owned(),
             label: self.label.text.string().to_owned(),
             drawing: self.drawing,
+            script: self.script.clone(),
+            update_freq: self.update_freq,
+            events: self.events.iter().cloned().collect(),
         }
     }
 }

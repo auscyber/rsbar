@@ -1,10 +1,11 @@
 //! The bar itself: geometry, the item list, and the draw pass.
 
 use crate::item::Item;
+use crate::script::Job;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{CGContext, CGDisplayBounds, CGMainDisplayID};
 use rsbar_protocol::style::Color;
-use rsbar_protocol::{BarPatch, BarState, Edge, ItemName, ItemPatch, Position};
+use rsbar_protocol::{BarPatch, BarState, Edge, Event, ItemName, ItemPatch, Position};
 use skylight::{Window, WindowTags, level};
 
 /// Fills a rectangle whose corners are rounded, falling back to a plain fill
@@ -181,6 +182,63 @@ impl Bar {
         self.items.retain(|i| &i.name != name);
         self.dirty = self.dirty || self.items.len() != before;
         self.items.len() != before
+    }
+
+    /// Replaces an item's subscriptions. Returns whether the item existed.
+    pub fn subscribe(&mut self, name: &ItemName, events: Vec<Event>) -> bool {
+        let Some(item) = self.items.iter_mut().find(|i| &i.name == name) else {
+            return false;
+        };
+        item.subscribe(events);
+        true
+    }
+
+    /// The scripts to run for `event`. Items without a script are skipped:
+    /// subscribing a scriptless item is legal and simply does nothing.
+    #[must_use]
+    pub fn jobs_for(&self, event: &Event, info: Option<&str>) -> Vec<Job> {
+        self.items
+            .iter()
+            .filter(|item| item.wants(event))
+            .filter_map(|item| Self::job(item, event.clone(), info))
+            .collect()
+    }
+
+    /// Advances every item's routine clock and returns those now due.
+    #[must_use]
+    pub fn tick(&mut self) -> Vec<Job> {
+        let mut due = Vec::new();
+        for item in &mut self.items {
+            if item.tick()
+                && let Some(script) = item.script.clone()
+            {
+                due.push(Job {
+                    item: item.name.clone(),
+                    script,
+                    sender: Event::Routine,
+                    info: None,
+                });
+            }
+        }
+        due
+    }
+
+    /// Every item's script, regardless of frequency or subscription.
+    #[must_use]
+    pub fn all_jobs(&self) -> Vec<Job> {
+        self.items
+            .iter()
+            .filter_map(|item| Self::job(item, Event::Forced, None))
+            .collect()
+    }
+
+    fn job(item: &Item, sender: Event, info: Option<&str>) -> Option<Job> {
+        Some(Job {
+            item: item.name.clone(),
+            script: item.script.clone()?,
+            sender,
+            info: info.map(ToOwned::to_owned),
+        })
     }
 
     #[must_use]
