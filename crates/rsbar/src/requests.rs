@@ -7,13 +7,14 @@
 
 use crate::bar::{Changes, Panels, Settings};
 use crate::components::{
-    Background, ClickScript, Drawing, Icon, Index, Label, Name, Offset, Padding, Placement,
-    Routine, Run, Script, Stale, Subscriptions, Watching, bundle,
+    AliasSpec, Background, ClickScript, Drawing, Icon, Index, Label, Name, Offset, Padding,
+    Placement, Routine, Run, Script, Stale, Subscriptions, Watching, bundle,
 };
 use crate::script::Job;
 use crate::shaping::Cache;
 use crate::sources::{Registry, Target};
 use bevy_ecs::prelude::*;
+use bevy_ecs::query::QueryData;
 use bevy_ecs::system::SystemParam;
 use rsbar_protocol::style::{Color, FontSpec};
 use rsbar_protocol::{
@@ -22,34 +23,45 @@ use rsbar_protocol::{
 use std::collections::BTreeSet;
 
 /// Every component a request can write.
-type WriteComponents = (
-    &'static Name,
-    &'static mut Icon,
-    &'static mut Label,
-    &'static mut Background,
-    &'static mut Padding,
-    &'static mut Offset,
-    &'static mut Placement,
-    &'static mut Drawing,
-    &'static mut Routine,
-    &'static mut Subscriptions,
-    Option<&'static Script>,
-    Option<&'static ClickScript>,
-);
+///
+/// Named fields rather than a tuple. This has grown to a dozen columns, and a
+/// positional row is a bug waiting to happen at that size: inserting one
+/// silently rebinds everything after it, which is how the click script once
+/// ended up where the update script belonged and stopped every
+/// subscription-driven script with no error and no log line.
+#[derive(QueryData)]
+#[query_data(mutable)]
+pub struct ItemWrite {
+    pub name: &'static Name,
+    pub icon: &'static mut Icon,
+    pub label: &'static mut Label,
+    pub background: &'static mut Background,
+    pub padding: &'static mut Padding,
+    pub offset: &'static mut Offset,
+    pub placement: &'static mut Placement,
+    pub drawing: &'static mut Drawing,
+    pub routine: &'static mut Routine,
+    pub subscriptions: &'static mut Subscriptions,
+    pub script: Option<&'static Script>,
+    pub click: Option<&'static ClickScript>,
+    pub alias: Option<&'static AliasSpec>,
+}
 
 /// Every component a query or a dispatch reads.
-type ReadComponents = (
-    Entity,
-    &'static Name,
-    &'static Icon,
-    &'static Label,
-    &'static Placement,
-    &'static Drawing,
-    &'static Routine,
-    &'static Subscriptions,
-    Option<&'static Script>,
-    Option<&'static ClickScript>,
-);
+#[derive(QueryData)]
+pub struct ItemRead {
+    pub entity: Entity,
+    pub name: &'static Name,
+    pub icon: &'static Icon,
+    pub label: &'static Label,
+    pub placement: &'static Placement,
+    pub drawing: &'static Drawing,
+    pub routine: &'static Routine,
+    pub subscriptions: &'static Subscriptions,
+    pub script: Option<&'static Script>,
+    pub click: Option<&'static ClickScript>,
+    pub alias: Option<&'static AliasSpec>,
+}
 
 /// Everything a request may write to in the item world.
 ///
@@ -60,7 +72,7 @@ type ReadComponents = (
 pub struct Items<'w, 's> {
     pub commands: Commands<'w, 's>,
     pub index: ResMut<'w, Index>,
-    pub write: Query<'w, 's, WriteComponents>,
+    pub write: Query<'w, 's, ItemWrite>,
 }
 
 /// Reads only, for the systems that do not also write.
@@ -72,7 +84,7 @@ pub struct Items<'w, 's> {
 /// query.
 #[derive(SystemParam)]
 pub struct ItemsRead<'w, 's> {
-    pub read: Query<'w, 's, ReadComponents>,
+    pub read: Query<'w, 's, ItemRead>,
 }
 
 impl Items<'_, '_> {
@@ -88,8 +100,8 @@ impl Items<'_, '_> {
             .filter_map(|entity| {
                 let row = self.write.get(*entity).ok()?;
                 Some(Job {
-                    item: row.0.0.clone(),
-                    script: row.10?.0.clone(),
+                    item: row.name.0.clone(),
+                    script: row.script?.0.clone(),
                     event: event.clone(),
                 })
             })
@@ -103,8 +115,8 @@ impl Items<'_, '_> {
             .iter()
             .filter_map(|row| {
                 Some(Job {
-                    item: row.0.0.clone(),
-                    script: row.10?.0.clone(),
+                    item: row.name.0.clone(),
+                    script: row.script?.0.clone(),
                     event: Event::Forced(rsbar_protocol::event::Forced {}),
                 })
             })
@@ -113,49 +125,32 @@ impl Items<'_, '_> {
 
     #[must_use]
     pub fn states(&self) -> Vec<ItemState> {
-        self.write.iter().map(write_state).collect()
+        self.write.iter().map(|row| write_state(&row)).collect()
     }
 
     #[must_use]
     pub fn state(&self, name: &ItemName) -> Option<ItemState> {
         self.write
             .iter()
-            .find(|row| &row.0.0 == name)
-            .map(write_state)
+            .find(|row| &row.name.0 == name)
+            .map(|row| write_state(&row))
     }
 }
 
 /// The same projection as [`state_of`], off the read-only view of the write
 /// query — `iter()` on a mutable query yields plain references, not `Mut`.
-#[allow(clippy::type_complexity, reason = "this is the query's own row shape")]
-fn write_state(
-    row: (
-        &Name,
-        &Icon,
-        &Label,
-        &Background,
-        &Padding,
-        &Offset,
-        &Placement,
-        &Drawing,
-        &Routine,
-        &Subscriptions,
-        Option<&Script>,
-        Option<&ClickScript>,
-    ),
-) -> ItemState {
-    let (name, icon, label, _, _, _, placement, drawing, routine, subscriptions, script, click) =
-        row;
+fn write_state(row: &ItemWriteReadOnlyItem<'_, '_>) -> ItemState {
     ItemState {
-        name: name.0.clone(),
-        position: placement.0,
-        icon: icon.0.string.clone(),
-        label: label.0.string.clone(),
-        drawing: drawing.0,
-        script: script.map(|s| s.0.clone()),
-        click_script: click.map(|s| s.0.clone()),
-        update_freq: routine.every,
-        events: subscriptions.0.iter().cloned().collect(),
+        name: row.name.0.clone(),
+        position: row.placement.0,
+        icon: row.icon.0.string.clone(),
+        label: row.label.0.string.clone(),
+        drawing: row.drawing.0,
+        script: row.script.map(|s| s.0.clone()),
+        click_script: row.click.map(|s| s.0.clone()),
+        update_freq: row.routine.every,
+        events: row.subscriptions.0.iter().cloned().collect(),
+        alias: row.alias.map(|alias| alias.0.clone()),
     }
 }
 
@@ -172,7 +167,8 @@ impl ItemsRead<'_, '_> {
         let Ok(row) = self.read.get(entity) else {
             return Vec::new();
         };
-        let (_, name, .., subscriptions, script, click) = row;
+        let (name, subscriptions, script, click) =
+            (row.name, row.subscriptions, row.script, row.click);
 
         let mut jobs = Vec::new();
         if let Some(click) = click {
@@ -221,11 +217,11 @@ impl ItemsRead<'_, '_> {
             // pattern silently followed the row when a column was added,
             // binding the click script instead — which broke every
             // subscription-driven script and raised no error.
-            let Some(script) = row.8 else {
+            let Some(script) = row.script else {
                 continue;
             };
             into.push(Job {
-                item: row.1.0.clone(),
+                item: row.name.0.clone(),
                 script: script.0.clone(),
                 event: event.clone(),
             });
@@ -239,8 +235,8 @@ impl ItemsRead<'_, '_> {
             .iter()
             .filter_map(|row| {
                 Some(Job {
-                    item: row.1.0.clone(),
-                    script: row.8?.0.clone(),
+                    item: row.name.0.clone(),
+                    script: row.script?.0.clone(),
                     event: Event::Forced(rsbar_protocol::event::Forced {}),
                 })
             })
@@ -256,36 +252,23 @@ impl ItemsRead<'_, '_> {
     pub fn state(&self, name: &ItemName) -> Option<ItemState> {
         self.read
             .iter()
-            .find(|(_, n, ..)| &n.0 == name)
+            .find(|row| &row.name.0 == name)
             .map(|row| state_of(&row))
     }
 }
 
-type ReadRow<'a> = (
-    Entity,
-    &'a Name,
-    &'a Icon,
-    &'a Label,
-    &'a Placement,
-    &'a Drawing,
-    &'a Routine,
-    &'a Subscriptions,
-    Option<&'a Script>,
-    Option<&'a ClickScript>,
-);
-
-fn state_of(row: &ReadRow<'_>) -> ItemState {
-    let (_, name, icon, label, placement, drawing, routine, subscriptions, script, click) = row;
+fn state_of(row: &ItemReadItem<'_, '_>) -> ItemState {
     ItemState {
-        name: name.0.clone(),
-        position: placement.0,
-        icon: icon.0.string.clone(),
-        label: label.0.string.clone(),
-        drawing: drawing.0,
-        script: script.map(|s| s.0.clone()),
-        click_script: click.map(|s| s.0.clone()),
-        update_freq: routine.every,
-        events: subscriptions.0.iter().cloned().collect(),
+        name: row.name.0.clone(),
+        position: row.placement.0,
+        icon: row.icon.0.string.clone(),
+        label: row.label.0.string.clone(),
+        drawing: row.drawing.0,
+        script: row.script.map(|s| s.0.clone()),
+        click_script: row.click.map(|s| s.0.clone()),
+        update_freq: row.routine.every,
+        events: row.subscriptions.0.iter().cloned().collect(),
+        alias: row.alias.map(|alias| alias.0.clone()),
     }
 }
 
@@ -421,7 +404,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
                 // survives, so change detection sees only what actually
                 // changed rather than every item disappearing and coming back.
                 if let Ok(mut row) = items.write.get_mut(entity) {
-                    row.6.0 = position;
+                    row.placement.0 = position;
                 }
                 items.commands.entity(entity).remove::<Stale>();
                 return Outcome::ok();
@@ -436,12 +419,12 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             let Some(entity) = items.index.get(&name) else {
                 return no_such(&name);
             };
-            let Ok(row) = items.write.get_mut(entity) else {
+            let Ok(mut row) = items.write.get_mut(entity) else {
                 return no_such(&name);
             };
             let wants_clicks = patch.click_script.as_ref().is_some_and(|s| !s.is_empty());
-            let subscribed = wants_clicks.then(|| row.9.0.clone());
-            set_item(entity, row, &patch, &mut items.commands);
+            let subscribed = wants_clicks.then(|| row.subscriptions.0.clone());
+            set_item(entity, &mut row, &patch, &mut items.commands);
             // Touching an item during a reload is what keeps it: a config that
             // only sets an existing item, without re-adding it, must not have
             // it swept up as stale.
@@ -477,7 +460,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             // Subscribing is where a config decides what this process actually
             // observes, so it is what starts and stops a source.
             let subscribed: BTreeSet<Kind> = events.into_iter().collect();
-            let clickable = row.11.is_some_and(|script| !script.0.is_empty())
+            let clickable = row.click.is_some_and(|script| !script.0.is_empty())
                 || subscribed.iter().any(is_pointer);
             // Inserting replaces whatever it held before, and dropping those
             // releases exactly what this item stopped wanting.
@@ -486,7 +469,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             if clickable {
                 take_clicks(panels);
             }
-            row.9.0 = subscribed;
+            row.subscriptions.0 = subscribed;
             Outcome::ok()
         }
 
@@ -533,29 +516,27 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
     }
 }
 
-type WriteRow<'a> = (
-    &'a Name,
-    bevy_ecs::change_detection::Mut<'a, Icon>,
-    bevy_ecs::change_detection::Mut<'a, Label>,
-    bevy_ecs::change_detection::Mut<'a, Background>,
-    bevy_ecs::change_detection::Mut<'a, Padding>,
-    bevy_ecs::change_detection::Mut<'a, Offset>,
-    bevy_ecs::change_detection::Mut<'a, Placement>,
-    bevy_ecs::change_detection::Mut<'a, Drawing>,
-    bevy_ecs::change_detection::Mut<'a, Routine>,
-    bevy_ecs::change_detection::Mut<'a, Subscriptions>,
-    Option<&'a Script>,
-    Option<&'a ClickScript>,
-);
-
 /// Writes a patch onto one item.
 ///
 /// Every assignment goes through `set_if_neq` where the type allows, so a
 /// config that re-sets an unchanged value does not mark the component changed
 /// and trigger a repaint.
-fn set_item(entity: Entity, mut row: WriteRow<'_>, patch: &ItemPatch, commands: &mut Commands) {
-    let (_, icon, label, background, padding, offset, placement, drawing, routine, _, _, _) =
-        &mut row;
+fn set_item(
+    entity: Entity,
+    row: &mut ItemWriteItem<'_, '_>,
+    patch: &ItemPatch,
+    commands: &mut Commands,
+) {
+    let (icon, label, background, padding, offset, placement, drawing, routine) = (
+        &mut row.icon,
+        &mut row.label,
+        &mut row.background,
+        &mut row.padding,
+        &mut row.offset,
+        &mut row.placement,
+        &mut row.drawing,
+        &mut row.routine,
+    );
 
     apply_run(
         icon.as_mut(),
