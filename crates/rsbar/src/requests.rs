@@ -7,8 +7,8 @@
 
 use crate::bar::{Changes, Panels, Settings};
 use crate::components::{
-    AliasContent, AliasSpec, Background, ClickScript, Drawing, Icon, Index, Label, Name, Offset,
-    Padding, Placement, Routine, Run, Script, Stale, Subscriptions, Watching, bundle,
+    AliasContent, AliasSpec, Background, ClickScript, Drawing, Icon, Index, ItemHandle, Label,
+    Name, Offset, Padding, Placement, Routine, Run, Script, Stale, Subscriptions, Watching, bundle,
 };
 use crate::script::Job;
 use crate::shaping::Cache;
@@ -102,8 +102,7 @@ impl Items<'_, '_> {
             .filter_map(|entity| {
                 let row = self.write.get(*entity).ok()?;
                 Some(Job {
-                    entity: row.entity,
-                    item: row.name.0.clone(),
+                    item: ItemHandle::new(row.entity, row.name.0.clone()),
                     script: Arc::clone(&row.script?.0),
                     event: Arc::clone(event),
                 })
@@ -118,8 +117,7 @@ impl Items<'_, '_> {
             .iter()
             .filter_map(|row| {
                 Some(Job {
-                    entity: row.entity,
-                    item: row.name.0.clone(),
+                    item: ItemHandle::new(row.entity, row.name.0.clone()),
                     script: Arc::clone(&row.script?.0),
                     event: Arc::new(Event::Forced(rsbar_protocol::event::Forced {})),
                 })
@@ -177,8 +175,7 @@ impl ItemsRead<'_, '_> {
         let mut jobs = Vec::new();
         if let Some(click) = click {
             jobs.push(Job {
-                entity,
-                item: name.0.clone(),
+                item: ItemHandle::new(entity, name.0.clone()),
                 script: Arc::clone(&click.0),
                 event: Arc::clone(event),
             });
@@ -187,8 +184,7 @@ impl ItemsRead<'_, '_> {
             && let Some(script) = script
         {
             jobs.push(Job {
-                entity,
-                item: name.0.clone(),
+                item: ItemHandle::new(entity, name.0.clone()),
                 script: Arc::clone(&script.0),
                 event: Arc::clone(event),
             });
@@ -227,8 +223,7 @@ impl ItemsRead<'_, '_> {
                 continue;
             };
             into.push(Job {
-                entity: *entity,
-                item: row.name.0.clone(),
+                item: ItemHandle::new(*entity, row.name.0.clone()),
                 script: Arc::clone(&script.0),
                 event: Arc::clone(event),
             });
@@ -242,8 +237,7 @@ impl ItemsRead<'_, '_> {
             .iter()
             .filter_map(|row| {
                 Some(Job {
-                    entity: row.entity,
-                    item: row.name.0.clone(),
+                    item: ItemHandle::new(row.entity, row.name.0.clone()),
                     script: Arc::clone(&row.script?.0),
                     event: Arc::new(Event::Forced(rsbar_protocol::event::Forced {})),
                 })

@@ -123,6 +123,42 @@ impl Routine {
 #[derive(Component, Debug, Clone, Default, PartialEq, Eq)]
 pub struct Subscriptions(pub BTreeSet<Kind>);
 
+/// Which item something belongs to.
+///
+/// Both halves of an item's identity, because they answer different
+/// questions and neither does the other's job. The entity is how the daemon
+/// finds it again — stable across a reload, unlike a name, which a config can
+/// drop and re-add. The name is what a script reads and a client asks by, and
+/// is the only half that means anything outside this process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemHandle {
+    entity: Entity,
+    name: ItemName,
+}
+
+impl ItemHandle {
+    #[must_use]
+    pub fn new(entity: Entity, name: ItemName) -> Self {
+        Self { entity, name }
+    }
+
+    #[must_use]
+    pub fn entity(&self) -> Entity {
+        self.entity
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &ItemName {
+        &self.name
+    }
+}
+
+impl std::fmt::Display for ItemHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name)
+    }
+}
+
 /// The menu bar item this one mirrors, as `Owner,Name`.
 ///
 /// Only the spec lives here. The captured image is a `CGImage` and so cannot

@@ -33,7 +33,7 @@
 
 use crate::bar::{Panels, Settings};
 use crate::components::{
-    AliasContent, AliasSpec, Icon, Index, Item, Label, Name, Routine, Script, Stale,
+    AliasContent, AliasSpec, Icon, Index, Item, ItemHandle, Label, Name, Routine, Script, Stale,
 };
 use crate::config::Shared as SharedConfig;
 use crate::layout::{self, ForceRepaint, Hit, Placements};
@@ -414,9 +414,7 @@ fn route_pointer(
         };
         match placements.hit(objc2_core_foundation::CGPoint::new(x, y)) {
             Hit::Item { entity, .. } => {
-                queue
-                    .0
-                    .extend(read.jobs_for_item(entity, event));
+                queue.0.extend(read.jobs_for_item(entity, event));
             }
             // On the bar but not on an item. The `.global` events exist for
             // exactly this, and are matched the ordinary way.
@@ -464,8 +462,7 @@ fn tick(
             && let Some(script) = script
         {
             queue.0.push(Job {
-                entity,
-                item: name.0.clone(),
+                item: ItemHandle::new(entity, name.0.clone()),
                 script: std::sync::Arc::clone(&script.0),
                 event: std::sync::Arc::new(Event::Routine(rsbar_protocol::event::Routine {})),
             });

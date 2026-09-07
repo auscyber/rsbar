@@ -16,8 +16,8 @@
 //! the pipes produced is the truth, and a lost reap is logged at debug rather
 //! than reported as a failure.
 
-use bevy_ecs::entity::Entity;
-use rsbar_protocol::{Event, ItemName};
+use crate::components::ItemHandle;
+use rsbar_protocol::Event;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -25,12 +25,11 @@ use std::sync::{Arc, Mutex};
 
 /// One script to run, with the context its environment describes.
 pub struct Job {
-    /// Which item this belongs to. The entity rather than the name: a script's
-    /// result comes back addressed to something, and looking the name up again
-    /// can find a different item — or nothing — if a reload has been through in
-    /// the meantime.
-    pub entity: Entity,
-    pub item: ItemName,
+    /// Which item this belongs to, both halves of it: the entity to address a
+    /// result back to, and the name a script reads. Looking the name up again
+    /// afterwards can find a different item — or nothing — if a reload has
+    /// been through in between.
+    pub item: ItemHandle,
     /// Shared, not copied. One event dispatched to a dozen items used to clone
     /// the script text a dozen times; this is a reference count instead.
     pub script: Arc<str>,
@@ -124,7 +123,7 @@ fn run(job: &Job) {
     };
 
     let mut child = match command
-        .env("RSBAR_NAME", job.item.as_str())
+        .env("RSBAR_NAME", job.item.name().as_str())
         .envs(job.event.env())
         .env("RSBAR_SERVICE", rsbar_protocol::service_name())
         .stdin(Stdio::null())

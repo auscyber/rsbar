@@ -455,7 +455,7 @@ mod tests {
 
         let jobs = bar.jobs_for(&Event::VolumeChanged(VolumeChange { volume: 42 }));
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].item.as_str(), "listener");
+        assert_eq!(jobs[0].item.name().as_str(), "listener");
     }
 
     #[test]
