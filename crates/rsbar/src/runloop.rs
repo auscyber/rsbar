@@ -180,3 +180,43 @@ impl Drop for Timer {
         self.timer.invalidate();
     }
 }
+
+/// Drains the queues the run loop does not.
+///
+/// Two of them, and neither is served by `CFRunLoopRunInMode`.
+///
+/// `AppKit` keeps its own queue; a window server window's events arrive there and
+/// are only delivered once something dequeues them.
+///
+/// Carbon keeps a *separate* one, and this does **not** drain it — see
+/// [`crate::sources::mouse`] for why that is still unfinished. Draining it
+/// naively, by sending every received event to the dispatcher target, exits the
+/// process: some of what arrives is a system event that means quit.
+pub fn pump_platform_events() {
+    pump_cocoa();
+}
+
+fn pump_cocoa() {
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        return;
+    };
+    let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+    let distant_past = objc2_foundation::NSDate::distantPast();
+
+    // An autorelease pool per pass: dequeuing hands back autoreleased objects,
+    // and without one they accumulate for the life of the process.
+    objc2::rc::autoreleasepool(|_| {
+        // SAFETY: dequeuing and dispatching on the main thread, which the
+        // marker above proves we are on.
+        while let Some(event) = unsafe {
+            app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                objc2_app_kit::NSEventMask::Any,
+                Some(&distant_past),
+                objc2_foundation::NSDefaultRunLoopMode,
+                true,
+            )
+        } {
+            app.sendEvent(&event);
+        }
+    });
+}

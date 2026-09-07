@@ -144,6 +144,82 @@ fn place(items: &ItemQuery, cache: &Cache, size: CGSize) -> Vec<(Entity, CGRect)
         .collect()
 }
 
+/// Where each item ended up, per panel, from the last repaint.
+///
+/// Retained rather than recomputed: a click has to be answered against what is
+/// actually on screen, and re-running layout at click time could disagree with
+/// it — an item whose script has since changed its width would move under the
+/// cursor between the press and the lookup.
+#[derive(Resource, Default)]
+pub struct Placements(Vec<PanelPlacements>);
+
+struct PanelPlacements {
+    display: u32,
+    /// The panel's frame in global screen coordinates, so a click reported
+    /// against the desktop can be brought into the panel's own space.
+    frame: CGRect,
+    items: Vec<(Entity, CGRect)>,
+}
+
+impl Placements {
+    /// Builds a set directly, for tests.
+    #[cfg(test)]
+    fn from_parts(display: u32, frame: CGRect, items: Vec<(Entity, CGRect)>) -> Self {
+        Self(vec![PanelPlacements {
+            display,
+            frame,
+            items,
+        }])
+    }
+
+    /// The item at a point given in global screen coordinates.
+    ///
+    /// Returns the panel's display too, so a handler knows which bar was hit
+    /// even when the click landed on empty space.
+    #[must_use]
+    pub fn hit(&self, point: CGPoint) -> Hit {
+        let Some(panel) = self.0.iter().find(|panel| contains(panel.frame, point)) else {
+            return Hit::Nothing;
+        };
+        let local = CGPoint::new(
+            point.x - panel.frame.origin.x,
+            point.y - panel.frame.origin.y,
+        );
+        panel
+            .items
+            .iter()
+            .find(|(_, frame)| contains(*frame, local))
+            .map_or(
+                Hit::Bar {
+                    display: panel.display,
+                },
+                |(entity, _)| Hit::Item {
+                    entity: *entity,
+                    display: panel.display,
+                },
+            )
+    }
+}
+
+/// What a point landed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hit {
+    /// An item, which is what a click should be delivered to.
+    Item { entity: Entity, display: u32 },
+    /// The bar, but not an item — the empty space between them.
+    Bar { display: u32 },
+    /// Not the bar at all.
+    Nothing,
+}
+
+/// Half-open on the far edges, so two abutting items cannot both claim a point.
+fn contains(rect: CGRect, point: CGPoint) -> bool {
+    point.x >= rect.origin.x
+        && point.y >= rect.origin.y
+        && point.x < rect.origin.x + rect.size.width
+        && point.y < rect.origin.y + rect.size.height
+}
+
 /// Lays out and repaints every panel.
 ///
 /// Runs only when something changed — see [`needs_repaint`].
@@ -152,7 +228,9 @@ pub fn repaint(
     cache: NonSend<Cache>,
     panels: NonSend<Panels>,
     settings: Res<Settings>,
+    mut placements: ResMut<Placements>,
 ) {
+    placements.0.clear();
     if settings.hidden {
         return;
     }
@@ -160,7 +238,12 @@ pub fn repaint(
     for panel in panels.iter() {
         let size = panel.frame.size;
         // Layout depends on the panel's width, so it is per display.
-        let placements = place(&items, &cache, size);
+        let placed = place(&items, &cache, size);
+        placements.0.push(PanelPlacements {
+            display: panel.display.id,
+            frame: panel.frame,
+            items: placed.clone(),
+        });
 
         skylight::draw(panel.window.id(), size, |ctx| {
             fill_rounded_rect(
@@ -170,7 +253,7 @@ pub fn repaint(
                 settings.color,
             );
 
-            for (entity, frame) in placements {
+            for (entity, frame) in placed {
                 let Ok((_, icon, label, background, padding, offset, _, _)) = items.get(entity)
                 else {
                     continue;
@@ -348,5 +431,91 @@ mod tests {
     #[test]
     fn an_empty_bar_places_nothing() {
         assert!(arrange::<u8>(&[], 200.0).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod hit_tests {
+    use super::{Hit, Placements};
+    use bevy_ecs::prelude::Entity;
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+
+    fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
+        CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
+    }
+
+    fn entity(id: u32) -> Entity {
+        Entity::from_raw_u32(id).expect("valid entity id")
+    }
+
+    /// A bar 200 wide at the top of a display whose origin is (100, 0), with
+    /// two abutting items.
+    fn placements() -> Placements {
+        Placements::from_parts(
+            1,
+            rect(100.0, 0.0, 200.0, 30.0),
+            vec![
+                (entity(1), rect(0.0, 0.0, 50.0, 30.0)),
+                (entity(2), rect(50.0, 0.0, 50.0, 30.0)),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_click_lands_on_the_item_under_it() {
+        // Global (120, 10) is local (20, 10), inside the first item.
+        assert_eq!(
+            placements().hit(CGPoint::new(120.0, 10.0)),
+            Hit::Item {
+                entity: entity(1),
+                display: 1
+            }
+        );
+    }
+
+    #[test]
+    fn the_panel_origin_is_subtracted_before_looking_up() {
+        // The same local point on a panel that does not start at zero must not
+        // resolve to the same item as an unshifted one would.
+        assert_eq!(
+            placements().hit(CGPoint::new(20.0, 10.0)),
+            Hit::Nothing,
+            "a point left of the panel is not on the bar at all"
+        );
+    }
+
+    #[test]
+    fn abutting_items_do_not_both_claim_the_boundary() {
+        // Local x = 50 is the first item's far edge and the second's origin.
+        assert_eq!(
+            placements().hit(CGPoint::new(150.0, 10.0)),
+            Hit::Item {
+                entity: entity(2),
+                display: 1
+            },
+            "the far edge belongs to the next item, not both"
+        );
+    }
+
+    #[test]
+    fn empty_bar_space_is_the_bar_not_an_item() {
+        // Local x = 150 is past both items but still on the panel.
+        assert_eq!(
+            placements().hit(CGPoint::new(250.0, 10.0)),
+            Hit::Bar { display: 1 }
+        );
+    }
+
+    #[test]
+    fn below_the_bar_is_nothing() {
+        assert_eq!(placements().hit(CGPoint::new(120.0, 40.0)), Hit::Nothing);
+    }
+
+    #[test]
+    fn nothing_is_hit_when_the_bar_has_never_been_drawn() {
+        assert_eq!(
+            Placements::default().hit(CGPoint::new(0.0, 0.0)),
+            Hit::Nothing
+        );
     }
 }

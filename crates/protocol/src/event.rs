@@ -249,9 +249,26 @@ events! {
     MouseExited = "mouse.exited" => MouseExit {},
     MouseEnteredGlobal = "mouse.entered.global" => MouseEnterGlobal {},
     MouseExitedGlobal = "mouse.exited.global" => MouseExitGlobal {},
-    MouseClicked = "mouse.clicked" => MouseClick { button: MouseButton, modifiers: Modifiers },
-    MouseScrolled = "mouse.scrolled" => Scroll { scroll_delta: f64, modifiers: Modifiers },
-    MouseScrolledGlobal = "mouse.scrolled.global" => ScrollGlobal { scroll_delta: f64, modifiers: Modifiers },
+    // `x` and `y` are where it happened, in global screen coordinates. The
+    // daemon routes on them, and a script gets them for free.
+    MouseClicked = "mouse.clicked" => MouseClick {
+        button: MouseButton,
+        modifiers: Modifiers,
+        x: f64,
+        y: f64,
+    },
+    MouseScrolled = "mouse.scrolled" => Scroll {
+        scroll_delta: f64,
+        modifiers: Modifiers,
+        x: f64,
+        y: f64,
+    },
+    MouseScrolledGlobal = "mouse.scrolled.global" => ScrollGlobal {
+        scroll_delta: f64,
+        modifiers: Modifiers,
+        x: f64,
+        y: f64,
+    },
 }
 
 /// An event a config invented. Its payload is whatever the trigger passed.
@@ -456,6 +473,8 @@ mod tests {
         let click = Event::MouseClicked(MouseClick {
             button: MouseButton::Right,
             modifiers: Modifiers::CMD | Modifiers::SHIFT,
+            x: 100.0,
+            y: 8.0,
         });
         let env = click.env();
         assert!(env.contains(&("RSBAR_BUTTON".into(), "right".into())));

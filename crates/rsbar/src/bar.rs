@@ -125,21 +125,26 @@ pub struct Panel {
 /// Not one window stretched across the desktop: with "Displays have separate
 /// Spaces" a single window renders on only one of them.
 #[derive(Default)]
-pub struct Panels(Vec<Panel>);
+pub struct Panels {
+    panels: Vec<Panel>,
+    /// Whether the bar takes clicks. Remembered so a panel built for a newly
+    /// attached display comes up matching the others.
+    clickable: bool,
+}
 
 impl Panels {
     pub fn iter(&self) -> impl Iterator<Item = &Panel> {
-        self.0.iter()
+        self.panels.iter()
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.panels.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.panels.is_empty()
     }
 
     /// Rebuilds against the displays that exist now, reusing the window of a
@@ -155,9 +160,9 @@ impl Panels {
         let mut panels = Vec::new();
         for display in display::active() {
             let frame = settings.frame_for(&display);
-            let panel = match self.0.iter().position(|p| p.display.id == display.id) {
+            let panel = match self.panels.iter().position(|p| p.display.id == display.id) {
                 Some(index) => {
-                    let mut panel = self.0.remove(index);
+                    let mut panel = self.panels.remove(index);
                     panel.window.set_frame(frame)?;
                     if (panel.display.scale - display.scale).abs() > f64::EPSILON {
                         panel.window.set_scale(display.scale)?;
@@ -167,7 +172,7 @@ impl Panels {
                     panel
                 }
                 None => Panel {
-                    window: new_window(frame, &display, settings)?,
+                    window: new_window(frame, &display, settings, self.clickable)?,
                     display,
                     frame,
                 },
@@ -180,7 +185,7 @@ impl Panels {
             );
             panels.push(panel);
         }
-        self.0 = panels;
+        self.panels = panels;
         Ok(())
     }
 
@@ -194,12 +199,12 @@ impl Panels {
     /// Returns the window server's error if a window cannot be reshaped.
     pub fn reframe(&mut self, settings: &Settings) -> skylight::Result<()> {
         let frames: Vec<_> = self
-            .0
+            .panels
             .iter()
             .map(|p| settings.frame_for(&p.display))
             .collect();
         skylight::batched(|| -> skylight::Result<()> {
-            for (panel, frame) in self.0.iter_mut().zip(frames) {
+            for (panel, frame) in self.panels.iter_mut().zip(frames) {
                 panel.window.set_frame(frame)?;
                 panel.frame = frame;
             }
@@ -211,8 +216,31 @@ impl Panels {
     ///
     /// Returns the window server's error if a window rejects the change.
     pub fn set_blur(&self, radius: i32) -> skylight::Result<()> {
-        for panel in &self.0 {
+        for panel in &self.panels {
             panel.window.set_blur_radius(radius)?;
+        }
+        Ok(())
+    }
+
+    /// Makes the bar take clicks, or let them through.
+    ///
+    /// Off by default, and turned on only once something wants a click. A bar
+    /// that swallows every click in its strip when nothing is listening is a
+    /// worse default than one that is invisible to the pointer — `SketchyBar`
+    /// is always clickable, but it does not have to be.
+    ///
+    /// # Errors
+    ///
+    /// Returns the window server's error if a window rejects the change.
+    pub fn set_clickable(&self, clickable: bool) -> skylight::Result<()> {
+        let (set, clear) = if clickable {
+            (WindowTags::OPAQUE_FOR_EVENTS, WindowTags::IGNORE_FOR_EVENTS)
+        } else {
+            (WindowTags::IGNORE_FOR_EVENTS, WindowTags::OPAQUE_FOR_EVENTS)
+        };
+        for panel in &self.panels {
+            panel.window.clear_tags(clear)?;
+            panel.window.set_tags(set)?;
         }
         Ok(())
     }
@@ -221,7 +249,7 @@ impl Panels {
     ///
     /// Returns the window server's error if a window rejects the change.
     pub fn set_hidden(&self, hidden: bool) -> skylight::Result<()> {
-        for panel in &self.0 {
+        for panel in &self.panels {
             if hidden {
                 panel.window.order_out()?;
             } else {
@@ -232,13 +260,23 @@ impl Panels {
     }
 }
 
-fn new_window(frame: CGRect, display: &Display, settings: &Settings) -> skylight::Result<Window> {
+fn new_window(
+    frame: CGRect,
+    display: &Display,
+    settings: &Settings,
+    clickable: bool,
+) -> skylight::Result<Window> {
     let window = Window::new(frame)?;
     window.set_scale(display.scale)?;
     window.set_opaque(false)?;
     window.set_alpha(1.0)?;
     window.set_level(level::STATUS)?;
-    window.set_tags(WindowTags::BAR | WindowTags::IGNORE_FOR_EVENTS)?;
+    let pointer = if clickable {
+        WindowTags::OPAQUE_FOR_EVENTS
+    } else {
+        WindowTags::IGNORE_FOR_EVENTS
+    };
+    window.set_tags(WindowTags::BAR | pointer)?;
     if settings.blur_radius != 0 {
         window.set_blur_radius(settings.blur_radius)?;
     }

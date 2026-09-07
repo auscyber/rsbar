@@ -89,6 +89,14 @@ pub struct Drawing(pub bool);
 #[derive(Component, Debug, Clone, PartialEq, Eq)]
 pub struct Script(pub String);
 
+/// Run when this item is clicked, instead of the update script.
+///
+/// Separate from [`Script`] because the two answer different questions: one
+/// keeps the item's contents current, the other acts on the user. An item can
+/// have either, both, or neither.
+#[derive(Component, Debug, Clone, PartialEq, Eq)]
+pub struct ClickScript(pub String);
+
 /// A routine update, in whole seconds.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Routine {

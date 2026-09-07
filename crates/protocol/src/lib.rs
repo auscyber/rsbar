@@ -9,7 +9,7 @@ pub mod event;
 pub mod json;
 pub mod style;
 
-pub use event::{Event, Kind, PowerSource};
+pub use event::{Event, Kind, Modifiers, MouseButton, PowerSource};
 pub use json::Json;
 
 use serde::{Deserialize, Serialize};
@@ -151,9 +151,12 @@ pub struct ItemPatch {
     pub y_offset: Option<f64>,
     pub position: Option<Position>,
     pub drawing: Option<bool>,
-    /// Run on every update. Receives `RSBAR_NAME`, `RSBAR_SENDER` and,
-    /// where the event carries one, `RSBAR_INFO`.
+    /// Run on every update. Receives `RSBAR_NAME`, `RSBAR_SENDER` and the
+    /// event's payload as named variables.
     pub script: Option<String>,
+    /// Run when this item is clicked. Receives the same, plus `RSBAR_BUTTON`
+    /// and `RSBAR_MODIFIERS`.
+    pub click_script: Option<String>,
     /// Seconds between routine updates. Zero means "only on subscribed
     /// events", which is the right default for anything event-driven.
     pub update_freq: Option<u32>,
@@ -216,6 +219,7 @@ pub struct ItemState {
     pub label: String,
     pub drawing: bool,
     pub script: Option<String>,
+    pub click_script: Option<String>,
     pub update_freq: u32,
     pub events: Vec<Kind>,
 }

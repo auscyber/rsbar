@@ -34,7 +34,7 @@
 use crate::bar::{Panels, Settings};
 use crate::components::{Icon, Index, Item, Label, Name, Routine, Script, Stale};
 use crate::config::Shared as SharedConfig;
-use crate::layout::{self, ForceRepaint};
+use crate::layout::{self, ForceRepaint, Hit, Placements};
 use crate::requests::{Context, Items, ItemsRead};
 use crate::script::{Job, Runner};
 use crate::shaping::Cache;
@@ -124,6 +124,7 @@ pub fn build(
         .init_resource::<Queue>()
         .init_resource::<ReloadWatch>()
         .init_resource::<ForceRepaint>()
+        .init_resource::<Placements>()
         // Starts true, so the first tick runs the config. The bar comes up
         // empty and fills in a moment later, which is what a config run is.
         .insert_resource(Reloading(config_exists))
@@ -138,6 +139,7 @@ pub fn build(
         .add_systems(
             Update,
             (
+                route_pointer,
                 dispatch_events,
                 tick,
                 run_queued,
@@ -178,6 +180,11 @@ pub fn run(mut app: App) -> bevy_app::AppExit {
         ) {
             return bevy_app::AppExit::Success;
         }
+
+        // The run loop does not serve AppKit's or Carbon's event queues, and a
+        // click on the bar arrives through them. Non-blocking: the sleep
+        // already happened above, so this takes what is there and returns.
+        crate::runloop::pump_platform_events();
 
         app.update();
 
@@ -340,6 +347,42 @@ fn settle_reload(
         } else {
             commands.entity(entity).remove::<Stale>();
         }
+    }
+}
+
+/// Sends a pointer event to whatever is under it.
+///
+/// Runs before the general dispatch, and the two do not overlap: a pointer
+/// event is deliberately *not* broadcast to every subscriber, because a click
+/// belongs to one item. What is under the cursor comes from the retained
+/// layout, so the answer matches what is actually drawn.
+fn route_pointer(
+    mut events: MessageReader<EventMessage>,
+    placements: Res<Placements>,
+    read: ItemsRead,
+    mut queue: ResMut<Queue>,
+) {
+    for EventMessage(event) in events.read() {
+        let Some((x, y)) = pointer_location(event) else {
+            continue;
+        };
+        match placements.hit(objc2_core_foundation::CGPoint::new(x, y)) {
+            Hit::Item { entity, .. } => {
+                queue.0.extend(read.jobs_for_item(entity, event));
+            }
+            // On the bar but not on an item. The `.global` events exist for
+            // exactly this, and are matched the ordinary way.
+            Hit::Bar { .. } | Hit::Nothing => {}
+        }
+    }
+}
+
+/// Where a pointer event happened, if it is one.
+fn pointer_location(event: &Event) -> Option<(f64, f64)> {
+    match event {
+        Event::MouseClicked(click) => Some((click.x, click.y)),
+        Event::MouseScrolled(scroll) => Some((scroll.x, scroll.y)),
+        _ => None,
     }
 }
 

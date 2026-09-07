@@ -40,6 +40,7 @@
 
 pub mod config;
 pub mod displays;
+pub mod mouse;
 pub mod power;
 pub mod volume;
 pub mod workspace;
@@ -228,6 +229,9 @@ pub enum Cause {
     /// `IOKit` would not create the power notification source.
     #[error("IOKit refused a notification source")]
     IoKit,
+    /// Carbon refused the mouse event handler.
+    #[error("Carbon refused the event handler (status {0})")]
+    Carbon(i32),
 }
 
 /// A source that could not start, and which one.
@@ -420,6 +424,7 @@ impl Registry {
             Box::new(displays::Displays),
             Box::new(config::Watcher { config }),
             Box::new(power::Power),
+            Box::new(mouse::Mouse),
             Box::new(volume::Volume),
         ];
 

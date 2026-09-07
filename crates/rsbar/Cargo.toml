@@ -29,8 +29,8 @@ block2 = "0.6"
 futures-lite = { workspace = true }
 notify = { workspace = true }
 objc2 = { workspace = true }
-objc2-app-kit = { workspace = true, features = ["NSWorkspace", "NSRunningApplication", "NSApplication", "NSScreen", "NSGraphics", "objc2-core-foundation"] }
-objc2-foundation = { workspace = true, features = ["NSNotification", "NSString", "NSDictionary", "NSOperation", "NSValue", "NSObject", "NSArray", "block2"] }
+objc2-app-kit = { workspace = true, features = ["NSWorkspace", "NSRunningApplication", "NSApplication", "NSResponder", "NSScreen", "NSEvent", "NSGraphics", "objc2-core-foundation"] }
+objc2-foundation = { workspace = true, features = ["NSNotification", "NSString", "NSDictionary", "NSOperation", "NSValue", "NSObject", "NSArray", "NSDate", "NSRunLoop", "block2"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

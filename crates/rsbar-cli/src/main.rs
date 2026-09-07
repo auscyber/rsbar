@@ -138,6 +138,10 @@ struct ItemOptions {
     /// RSBAR_INFO in its environment. Pass an empty string to clear it.
     #[arg(long)]
     script: Option<String>,
+    /// Shell command run when the item is clicked, with RSBAR_BUTTON and
+    /// RSBAR_MODIFIERS in its environment. Pass an empty string to clear it.
+    #[arg(long)]
+    click_script: Option<String>,
     /// Seconds between routine updates; 0 means event-driven only.
     #[arg(long)]
     update_freq: Option<u32>,
@@ -204,6 +208,7 @@ impl From<ItemOptions> for ItemPatch {
             position: o.position,
             drawing: o.drawing,
             script: o.script,
+            click_script: o.click_script,
             update_freq: o.update_freq,
         }
     }
