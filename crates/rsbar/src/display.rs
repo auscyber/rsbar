@@ -3,10 +3,7 @@
 use objc2::MainThreadMarker;
 use objc2_app_kit::NSScreen;
 use objc2_core_foundation::CGRect;
-use objc2_core_graphics::{
-    CGDirectDisplayID, CGDisplayBounds, CGDisplayChangeSummaryFlags,
-    CGDisplayRegisterReconfigurationCallback, CGGetActiveDisplayList,
-};
+use objc2_core_graphics::{CGDirectDisplayID, CGDisplayBounds, CGGetActiveDisplayList};
 use objc2_foundation::NSString;
 
 /// A display the bar can sit on.
@@ -84,54 +81,4 @@ fn scale_for(id: CGDirectDisplayID) -> f64 {
         }
     }
     2.0
-}
-
-/// Watches for displays being added, removed, or rearranged.
-///
-/// `NSWorkspace` does not report this — its display notification fires when the
-/// *active* display changes, not when the set of them does. Plugging in a
-/// monitor only arrives here.
-pub struct ReconfigurationWatch {
-    _private: (),
-}
-
-thread_local! {
-    /// The callback is a bare C function pointer with no context argument that
-    /// survives, so the handler lives here. Thread-local rather than global
-    /// because CoreGraphics delivers on the thread that registered.
-    static ON_RECONFIGURE: std::cell::RefCell<Option<Box<dyn Fn()>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-impl ReconfigurationWatch {
-    /// Calls `handler` after a reconfiguration has taken effect.
-    ///
-    /// CoreGraphics announces a change twice: once up front carrying only
-    /// `BeginConfigurationFlag`, and again afterwards carrying what actually
-    /// happened. There is no matching "end" flag, so the first pass is
-    /// identified by that flag and skipped — acting on it would read the old
-    /// display layout.
-    pub fn install<F: Fn() + 'static>(handler: F) -> Self {
-        unsafe extern "C-unwind" fn callback(
-            _display: CGDirectDisplayID,
-            flags: CGDisplayChangeSummaryFlags,
-            _user_info: *mut std::ffi::c_void,
-        ) {
-            if flags.contains(CGDisplayChangeSummaryFlags::BeginConfigurationFlag) {
-                return;
-            }
-            ON_RECONFIGURE.with_borrow(|handler| {
-                if let Some(handler) = handler {
-                    handler();
-                }
-            });
-        }
-
-        ON_RECONFIGURE.with_borrow_mut(|slot| *slot = Some(Box::new(handler)));
-        // SAFETY: the callback reads only the thread-local set above.
-        unsafe {
-            CGDisplayRegisterReconfigurationCallback(Some(callback), std::ptr::null_mut());
-        }
-        Self { _private: () }
-    }
 }

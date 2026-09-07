@@ -22,6 +22,7 @@
 //! config never mentions `volume_changed` should not pay it, so the registry
 //! starts a source the first time an item subscribes to something it provides.
 
+pub mod displays;
 pub mod power;
 pub mod volume;
 pub mod workspace;
@@ -164,6 +165,7 @@ impl Registry {
 
         let sources: Vec<Box<dyn Source>> = vec![
             Box::new(workspace::Workspace),
+            Box::new(displays::Displays),
             Box::new(power::Power),
             Box::new(volume::Volume),
         ];
@@ -193,6 +195,10 @@ impl Registry {
     /// notification centre; nothing else is in that class.
     pub fn start_eager(&mut self) {
         self.ensure(&Event::FrontAppSwitched);
+        // Not because anything subscribed, but because the bar's own geometry
+        // depends on it: a monitor appearing has to reach the panels whether or
+        // not a config ever mentions `display_changed`.
+        self.ensure(&Event::DisplayChanged);
     }
 
     /// Starts whatever provides `event`, if it is not running already.

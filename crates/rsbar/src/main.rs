@@ -13,7 +13,7 @@
 //! their own. See [`rsbar::sources`].
 
 use async_mach_ports::{Receiver, RecvPort};
-use rsbar::bar::Bar;
+use rsbar::bar::{Panels, Settings};
 use rsbar::ecs::{self, Inbox, IpcRequest};
 use rsbar::runloop::Waker;
 use rsbar::script::Runner;
@@ -41,13 +41,12 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    let bar = match Bar::new() {
-        Ok(bar) => bar,
-        Err(err) => {
-            tracing::error!(%err, "could not create the bar window");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
+    let settings = Settings::default();
+    let mut panels = Panels::default();
+    if let Err(err) = panels.rebuild(&settings) {
+        tracing::error!(%err, "could not create the bar window");
+        return std::process::ExitCode::FAILURE;
+    }
 
     let (mut registry, events) = Registry::new();
     registry.start_eager();
@@ -61,7 +60,8 @@ fn main() -> std::process::ExitCode {
     tracing::info!(%service, "rsbar is up");
     let app = ecs::build(
         Inbox { requests, events },
-        bar,
+        settings,
+        panels,
         registry,
         Runner::start(SCRIPT_WORKERS),
     );

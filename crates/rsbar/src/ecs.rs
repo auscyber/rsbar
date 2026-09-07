@@ -15,46 +15,46 @@
 //! process is genuinely asleep between events, and the app is event-driven
 //! rather than frame-driven — which is what a bar actually is.
 //!
-//! `examples/pump_spike.rs` in the `skylight` crate is the evidence: still
-//! composited a minute later, 0.0% CPU, and twenty seconds of Time Profiler
-//! sampling caught it on-CPU zero times.
+//! `examples/pump_spike.rs` in the `skylight` crate is the evidence.
 //!
 //! # Why there is no task pool
 //!
 //! `bevy_ecs` is taken without its `multi_threaded` feature, so
 //! `default_executor()` is the single-threaded one and no task pool is built at
-//! all. That is deliberate: paneru measured the task-pool handoff at roughly
-//! 45% of main-thread time against 16% of real work, and found that even an
-//! empty schedule costs a scope per frame. This app is smaller still, and most
-//! of its systems touch `NonSend` platform objects pinned to this thread
-//! regardless — there is nothing to overlap.
+//! all. paneru measured the handoff at roughly 45% of main-thread time against
+//! 16% of real work, and found that even an empty schedule costs a scope per
+//! frame. Most systems here touch `NonSend` platform objects pinned to this
+//! thread regardless, so there is nothing to overlap.
 
 #![allow(
     clippy::needless_pass_by_value,
     reason = "Bevy system parameters are taken by value by contract"
 )]
 
-use crate::bar::Bar;
-use crate::script::Runner;
+use crate::bar::{Panels, Settings};
+use crate::components::{Icon, Index, Label, Name, Routine, Script};
+use crate::layout::{self, ForceRepaint};
+use crate::requests::{Context, Items, ItemsRead};
+use crate::script::{Job, Runner};
+use crate::shaping::Cache;
 use crate::sources::{Emission, Events, Registry};
-use bevy_app::{App, First, Last, PreUpdate, Update};
+use bevy_app::{App, First, Last, PostUpdate, PreUpdate, Update};
 use bevy_ecs::prelude::*;
 use objc2_core_foundation::{CFRunLoop, CFRunLoopRunResult, kCFRunLoopDefaultMode};
 use rsbar_protocol::Request;
 use std::time::Duration;
 
-/// How long the runner will sleep with nothing to do.
-///
-/// This is the routine tick: item update frequencies are whole seconds, so
-/// waking more often would only cost battery to do nothing.
+/// How long the runner will sleep with nothing to do — also the routine tick.
+/// Item update frequencies are whole seconds, so waking more often would only
+/// cost battery to do nothing.
 const TICK: Duration = Duration::from_secs(1);
 
 /// A request that arrived over the Mach port, with wherever its answer goes.
 ///
-/// Deliberately *not* a `Message`. A `Reply` is a send-once right and consuming
-/// it is what spends it, but messages are read by reference and may be read by
-/// several systems. A request has exactly one consumer, so the bus would buy
-/// nothing and cost the ability to answer.
+/// Deliberately not a `Message`: a `Reply` is a send-once right and answering
+/// consumes it, but messages are read by reference and may have many readers.
+/// A request has exactly one consumer, so the bus would cost the ability to
+/// answer and buy nothing.
 pub struct IpcRequest {
     pub request: Box<Request>,
     pub reply: Option<async_mach_ports::Reply>,
@@ -63,7 +63,7 @@ pub struct IpcRequest {
 /// An event, from a source or from this thread.
 ///
 /// This one *is* a message: an event legitimately has several readers, and a
-/// reader missing a frame is better than a backlog.
+/// reader missing a frame beats acting on a backlog.
 #[derive(Message)]
 pub struct EventMessage(pub Emission);
 
@@ -73,19 +73,23 @@ pub struct Inbox {
     pub events: Events,
 }
 
-/// The bar and its windows. `NonSend` because it owns window server handles.
-pub struct BarState(pub Bar);
-
-/// `NonSend` because a running source owns a handle to its thread's run loop,
-/// which may only be touched from a thread that is allowed to stop it.
 pub struct Sources(pub Registry);
+
+/// Scripts to run, queued by whichever system produced them and drained once.
+#[derive(Resource, Default)]
+pub struct Queue(pub Vec<Job>);
 
 #[derive(Resource)]
 pub struct Scripts(pub Runner);
 
-/// Builds the app. Split out so tests can drive the same schedules with the
-/// platform resources left out.
-pub fn build(inbox: Inbox, bar: Bar, registry: Registry, scripts: Runner) -> App {
+/// Builds the app.
+pub fn build(
+    inbox: Inbox,
+    settings: Settings,
+    panels: Panels,
+    registry: Registry,
+    scripts: Runner,
+) -> App {
     let mut app = App::new();
 
     app.add_plugins(bevy_time::TimePlugin)
@@ -94,16 +98,29 @@ pub fn build(inbox: Inbox, bar: Bar, registry: Registry, scripts: Runner) -> App
         // grows for the life of the process instead.
         .add_message::<EventMessage>()
         .insert_non_send(inbox)
-        .insert_non_send(BarState(bar))
+        .insert_non_send(panels)
         .insert_non_send(Sources(registry))
+        .insert_non_send(Cache::default())
+        .insert_resource(settings)
+        .init_resource::<Index>()
+        .init_resource::<Queue>()
+        .init_resource::<ForceRepaint>()
         .insert_resource(Scripts(scripts));
 
     // Explicit ordering rather than DAG tie-breaks, which reorder silently when
     // a system is added.
     app.add_systems(First, drain_events)
         .add_systems(PreUpdate, apply_requests)
-        .add_systems(Update, (dispatch_events, tick))
-        .add_systems(Last, redraw);
+        .add_systems(Update, (dispatch_events, tick, run_queued).chain())
+        .add_systems(PostUpdate, (rebuild_panels, reshape))
+        .add_systems(
+            Last,
+            (
+                layout::repaint.run_if(layout::needs_repaint),
+                layout::clear_force_repaint,
+            )
+                .chain(),
+        );
 
     app
 }
@@ -136,6 +153,29 @@ pub fn run(mut app: App) -> bevy_app::AppExit {
     }
 }
 
+/// Reacts to a display appearing, disappearing or moving.
+///
+/// The panels' geometry is derived from the display layout, so it has to be
+/// rebuilt before anything draws into them again.
+fn rebuild_panels(
+    mut events: MessageReader<EventMessage>,
+    mut panels: NonSendMut<Panels>,
+    settings: Res<Settings>,
+    mut repaint: ResMut<ForceRepaint>,
+) {
+    if !events
+        .read()
+        .any(|EventMessage(e)| e.event == rsbar_protocol::Event::DisplayChanged)
+    {
+        return;
+    }
+    if let Err(err) = panels.rebuild(&settings) {
+        tracing::error!(%err, "could not rebuild the bar after a display change");
+    }
+    // Nothing about the items moved, but their panels did.
+    repaint.0 = true;
+}
+
 fn drain_events(inbox: NonSend<Inbox>, mut out: MessageWriter<EventMessage>) {
     while let Ok(emission) = inbox.events.try_recv() {
         out.write(EventMessage(emission));
@@ -146,21 +186,31 @@ fn drain_events(inbox: NonSend<Inbox>, mut out: MessageWriter<EventMessage>) {
 ///
 /// Drains rather than taking one: run loop wakes coalesce, so a burst can
 /// arrive between two ticks — a config run is hundreds of sets.
+#[allow(clippy::too_many_arguments, reason = "a request can touch all of it")]
 fn apply_requests(
     inbox: NonSend<Inbox>,
-    mut bar: NonSendMut<BarState>,
+    mut items: Items,
+    mut settings: ResMut<Settings>,
+    mut panels: NonSendMut<Panels>,
+    mut cache: NonSendMut<Cache>,
     mut sources: NonSendMut<Sources>,
-    scripts: Res<Scripts>,
+    mut queue: ResMut<Queue>,
     mut exit: MessageWriter<bevy_app::AppExit>,
 ) {
     while let Ok(IpcRequest { request, reply }) = inbox.requests.try_recv() {
-        let (response, jobs) =
-            crate::handle::apply(&mut bar.0, &mut sources.0, *request, &mut exit);
-        for job in jobs {
-            scripts.0.run(job);
+        let mut ctx = Context {
+            settings: &mut settings,
+            panels: &mut panels,
+            cache: &mut cache,
+            sources: &mut sources.0,
+        };
+        let outcome = crate::requests::apply(*request, &mut items, &mut ctx);
+        queue.0.extend(outcome.jobs);
+        if outcome.exit {
+            exit.write(bevy_app::AppExit::Success);
         }
         if let Some(reply) = reply
-            && let Err(err) = reply.send(&response)
+            && let Err(err) = reply.send(&outcome.response)
         {
             tracing::debug!(%err, "client stopped waiting for its answer");
         }
@@ -169,19 +219,15 @@ fn apply_requests(
 
 fn dispatch_events(
     mut events: MessageReader<EventMessage>,
-    bar: NonSend<BarState>,
-    scripts: Res<Scripts>,
+    read: ItemsRead,
+    mut queue: ResMut<Queue>,
 ) {
     for EventMessage(emission) in events.read() {
         tracing::debug!(event = %emission.event, info = ?emission.info, "event");
-        for job in bar.0.jobs_for(&emission.event, emission.info.as_deref()) {
-            scripts.0.run(job);
-        }
+        queue
+            .0
+            .extend(read.jobs_for(&emission.event, emission.info.as_deref()));
     }
-}
-
-fn redraw(mut bar: NonSendMut<BarState>) {
-    bar.0.redraw_if_dirty();
 }
 
 /// Advances every item's routine clock, once per elapsed second.
@@ -192,13 +238,13 @@ fn redraw(mut bar: NonSendMut<BarState>) {
 ///
 /// `Time<Real>` specifically, not the default virtual clock. The virtual one
 /// clamps delta to 250 ms so a stalled frame cannot make a game jump, which
-/// here would quietly stretch a one-second update frequency to four. Wall
-/// clock is what an item asking for `--update-freq 10` means.
+/// here would quietly stretch a one-second update frequency to four. Wall clock
+/// is what an item asking for `--update-freq 10` means.
 fn tick(
     time: Res<bevy_time::Time<bevy_time::Real>>,
     mut since: Local<Duration>,
-    mut bar: NonSendMut<BarState>,
-    scripts: Res<Scripts>,
+    mut items: Query<(&Name, &mut Routine, Option<&Script>)>,
+    mut queue: ResMut<Queue>,
 ) {
     *since += time.delta();
     if *since < TICK {
@@ -207,7 +253,40 @@ fn tick(
     // Subtract rather than zero, so a late wake does not lose the remainder.
     *since -= TICK;
 
-    for job in bar.0.tick() {
+    for (name, mut routine, script) in &mut items {
+        // `bypass_change_detection`, because a routine clock ticking is not a
+        // reason to repaint — only what the script then sets is.
+        if routine.bypass_change_detection().tick()
+            && let Some(script) = script
+        {
+            queue.0.push(Job {
+                item: name.0.clone(),
+                script: script.0.clone(),
+                sender: rsbar_protocol::Event::Routine,
+                info: None,
+            });
+        }
+    }
+}
+
+/// Hands queued scripts to the worker pool. One place, so nothing can run a
+/// script twice by queueing it in two systems.
+fn run_queued(mut queue: ResMut<Queue>, scripts: Res<Scripts>) {
+    for job in queue.0.drain(..) {
         scripts.0.run(job);
+    }
+}
+
+/// The items whose shaped text is out of date.
+type Reshaped<'w, 's> =
+    Query<'w, 's, (Entity, &'static Icon, &'static Label), Or<(Changed<Icon>, Changed<Label>)>>;
+
+/// Rebuilds the shaped text of any item whose text or font moved.
+///
+/// This is the cache's whole invalidation strategy: `Changed` says which items
+/// need it, so it cannot go stale without someone having changed something.
+fn reshape(changed: Reshaped, mut cache: NonSendMut<Cache>) {
+    for (entity, icon, label) in &changed {
+        cache.refresh(entity, &icon.0, &label.0);
     }
 }

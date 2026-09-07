@@ -18,7 +18,10 @@ async-mach-ports = "0.1"
 async-executor = "1.14"
 async-lock = "3.4"
 bevy_app = { version = "0.19", default-features = false, features = ["std"] }
-bevy_ecs = { version = "0.19", default-features = false, features = ["std"] }
+# `debug` names the system and the components in a B0001 access-conflict
+# panic. Without it the message is six copies of "Enable the debug feature to
+# see the name", which is a bad afternoon.
+bevy_ecs = { version = "0.19", default-features = false, features = ["std", "debug"] }
 bevy_time = { version = "0.19", default-features = false, features = ["std"] }
 bitflags = "2.13"
 futures-lite = "2.6"
