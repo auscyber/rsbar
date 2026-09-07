@@ -48,19 +48,21 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
+    // Installed before anything that needs to wake the app. Signalling it is
+    // what interrupts the runner's sleep in the run loop, so an event is looked
+    // at when it happens rather than at the next routine tick.
+    let waker = Waker::install(|| {});
+
     let config = rsbar::config::shared();
-    let (mut registry, events) = Registry::new(rsbar::config::Shared::clone(&config));
+    let mut registry = Registry::new(rsbar::config::Shared::clone(&config), waker.clone());
     registry.start_eager();
 
     let (tx, requests) = mpsc::sync_channel::<IpcRequest>(REQUEST_QUEUE);
-    // Installed on this thread, so signalling it is what wakes the runner out
-    // of its sleep in the run loop.
-    let waker = Waker::install(|| {});
     spawn_ipc(receiver, tx, waker);
 
     tracing::info!(service = %service, "rsbar is up");
     let app = ecs::build(
-        Inbox { requests, events },
+        Inbox { requests },
         settings,
         panels,
         registry,

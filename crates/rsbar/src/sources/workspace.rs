@@ -1,6 +1,6 @@
 //! Workspace events: the front application, spaces, displays, sleep and wake.
 
-use crate::sources::{Emission, Emitter, Source, StartError};
+use crate::sources::{Emission, Emitter, Registration, Source, SourceId, StartError};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
@@ -45,7 +45,7 @@ impl Observers {
             let info = info(unsafe { note.as_ref() });
             // A full channel means the daemon is not keeping up. Dropping the
             // event beats blocking a system notification callback.
-            let _ = emit.try_send(Emission::new(event.clone(), info));
+            emit.send(Emission::new(event.clone(), info));
         });
 
         let token = unsafe {
@@ -87,8 +87,8 @@ fn app_name(note: &NSNotification) -> Option<String> {
 pub struct Workspace;
 
 impl Source for Workspace {
-    fn name(&self) -> &'static str {
-        "workspace"
+    fn id(&self) -> SourceId {
+        SourceId("workspace")
     }
 
     fn provides(&self) -> Vec<Event> {
@@ -101,14 +101,7 @@ impl Source for Workspace {
         ]
     }
 
-    /// `NSWorkspace`'s notification centre only delivers to an observer
-    /// registered on the main thread — register anywhere else and the block is
-    /// accepted and then never called.
-    fn needs_main_thread(&self) -> bool {
-        true
-    }
-
-    fn install(&mut self, emit: Emitter) -> Result<Box<dyn std::any::Any>, StartError> {
+    fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {
         let center = NSWorkspace::sharedWorkspace().notificationCenter();
         let mut observers = Observers::new(center);
 

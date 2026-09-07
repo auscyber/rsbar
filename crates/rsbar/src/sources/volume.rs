@@ -6,7 +6,7 @@
 //! So the device-change listener re-registers the volume listener on whatever
 //! became default.
 
-use crate::sources::{Emission, Emitter, Source, StartError};
+use crate::sources::{Emission, Emitter, Registration, Source, SourceId, StartError};
 use rsbar_protocol::Event;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -297,7 +297,7 @@ extern "C-unwind" fn changed(
 
     let emission = Emission::new(Event::VolumeChanged, Some(percent(scalar).to_string()));
     // Dropping beats blocking: this is a `CoreAudio` callback.
-    let _ = shared.emit.try_send(emission);
+    shared.emit.send(emission);
     0
 }
 
@@ -395,15 +395,15 @@ impl Drop for Listeners {
 pub struct Volume;
 
 impl Source for Volume {
-    fn name(&self) -> &'static str {
-        "volume"
+    fn id(&self) -> SourceId {
+        SourceId("volume")
     }
 
     fn provides(&self) -> Vec<Event> {
         vec![Event::VolumeChanged]
     }
 
-    fn install(&mut self, emit: Emitter) -> Result<Box<dyn std::any::Any>, StartError> {
+    fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {
         if default_output_device().is_none() {
             return Err(StartError {
                 name: "volume",

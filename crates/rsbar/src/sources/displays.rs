@@ -4,7 +4,7 @@
 //! *active* display changes, not when the set of them does. Plugging in a
 //! monitor arrives only here, and it invalidates every panel's geometry.
 
-use crate::sources::{Emission, Emitter, Source, StartError};
+use crate::sources::{Emission, Emitter, Registration, Source, SourceId, StartError};
 use objc2_core_graphics::{
     CGDirectDisplayID, CGDisplayChangeSummaryFlags, CGDisplayRegisterReconfigurationCallback,
     CGDisplayRemoveReconfigurationCallback,
@@ -39,14 +39,14 @@ extern "C-unwind" fn reconfigured(
     // SAFETY: the registration passes the leaked emitter.
     if let Some(emit) = unsafe { emitter_from(context) } {
         // Dropping beats blocking: this is a `CoreGraphics` callback.
-        let _ = emit.try_send(Emission::new(Event::DisplayChanged, None));
+        emit.send(Emission::new(Event::DisplayChanged, None));
     }
 }
 
 /// Deregisters on drop.
-struct Registration(&'static Emitter);
+struct Deregister(&'static Emitter);
 
-impl Drop for Registration {
+impl Drop for Deregister {
     fn drop(&mut self) {
         let context = std::ptr::from_ref(self.0).cast_mut().cast::<c_void>();
         // SAFETY: the same callback and context `install` registered.
@@ -57,21 +57,15 @@ impl Drop for Registration {
 pub struct Displays;
 
 impl Source for Displays {
-    fn name(&self) -> &'static str {
-        "displays"
+    fn id(&self) -> SourceId {
+        SourceId("displays")
     }
 
     fn provides(&self) -> Vec<Event> {
         vec![Event::DisplayChanged]
     }
 
-    /// Registered on the main thread so the callback lands there, where the
-    /// panels it invalidates are owned.
-    fn needs_main_thread(&self) -> bool {
-        true
-    }
-
-    fn install(&mut self, emit: Emitter) -> Result<Box<dyn std::any::Any>, StartError> {
+    fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {
         // Leaked, as in the other sources: the callback dereferences it and
         // nothing waits for one in flight. A source starts once per process.
         let emit: &'static Emitter = Box::leak(Box::new(emit));
@@ -85,6 +79,6 @@ impl Source for Displays {
                 reason: format!("CoreGraphics refused the callback ({status:?})"),
             });
         }
-        Ok(Box::new(Registration(emit)))
+        Ok(Box::new(Deregister(emit)))
     }
 }

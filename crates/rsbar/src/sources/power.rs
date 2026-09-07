@@ -1,6 +1,6 @@
 //! Power source changes, from `IOKit`.
 
-use crate::sources::{Emission, Emitter, Source, StartError};
+use crate::sources::{Emission, Emitter, Registration, Source, SourceId, StartError};
 use objc2_core_foundation::{CFRetained, CFRunLoop, CFRunLoopSource, CFString, CFType};
 use rsbar_protocol::Event;
 use std::ffi::c_void;
@@ -73,7 +73,7 @@ impl Watch {
             };
             let emission = Emission::new(Event::PowerSourceChanged, Some(providing_source()));
             // Dropping beats blocking: this is an `IOKit` callback.
-            let _ = emit.try_send(emission);
+            emit.send(emission);
         }
 
         // SAFETY: `emit` is leaked, so the context outlives the registration.
@@ -99,15 +99,15 @@ impl Watch {
 pub struct Power;
 
 impl Source for Power {
-    fn name(&self) -> &'static str {
-        "power"
+    fn id(&self) -> SourceId {
+        SourceId("power")
     }
 
     fn provides(&self) -> Vec<Event> {
         vec![Event::PowerSourceChanged]
     }
 
-    fn install(&mut self, emit: Emitter) -> Result<Box<dyn std::any::Any>, StartError> {
+    fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {
         // Leaked for the same reason the volume source leaks its state: the
         // callback dereferences this, and there is no call that waits for one
         // in flight to finish. A source starts at most once per process.

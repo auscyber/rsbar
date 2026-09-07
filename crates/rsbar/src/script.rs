@@ -82,10 +82,36 @@ impl Runner {
     }
 }
 
+/// Characters that mean the script needs a shell to interpret it.
+///
+/// A script without any of them is an argv we can exec directly, saving a
+/// whole process spawn — about half the cost of an event reaching the screen,
+/// since the shell only exists to hand straight over to the real command.
+const NEEDS_SHELL: &[char] = &[
+    '|', '&', ';', '<', '>', '(', ')', '$', '`', '\\', '"', '\'', '*', '?', '[', '#', '~', '=',
+];
+
+/// Splits a shell-free script into an argv.
+fn direct_argv(script: &str) -> Option<Vec<&str>> {
+    if script.contains(NEEDS_SHELL) {
+        return None;
+    }
+    let argv: Vec<&str> = script.split_whitespace().collect();
+    (!argv.is_empty()).then_some(argv)
+}
+
 fn run(job: &Job) {
-    let mut child = match Command::new("/bin/sh")
-        .arg("-c")
-        .arg(&job.script)
+    let mut command = if let Some(argv) = direct_argv(&job.script) {
+        let mut command = Command::new(argv[0]);
+        command.args(&argv[1..]);
+        command
+    } else {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(&job.script);
+        command
+    };
+
+    let mut child = match command
         .env("RSBAR_NAME", job.item.as_str())
         .env("RSBAR_SENDER", job.sender.name())
         .env("RSBAR_INFO", job.info.as_deref().unwrap_or(""))
@@ -122,5 +148,47 @@ fn run(job: &Job) {
         Err(err) => {
             tracing::debug!(item = %job.item, %err, "could not reap script; it still ran");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::direct_argv;
+
+    #[test]
+    fn a_plain_command_needs_no_shell() {
+        assert_eq!(
+            direct_argv("rsbar item set clock"),
+            Some(vec!["rsbar", "item", "set", "clock"])
+        );
+    }
+
+    #[test]
+    fn anything_a_shell_would_interpret_gets_a_shell() {
+        // Substitution, pipes, redirection, quoting and globs all change
+        // meaning if handed straight to exec.
+        for script in [
+            "echo $(date)",
+            "a | b",
+            "a && b",
+            "a; b",
+            "a > f",
+            "echo 'quoted'",
+            "echo \"quoted\"",
+            "ls *.txt",
+            "echo $HOME",
+            "FOO=1 cmd",
+        ] {
+            assert!(
+                direct_argv(script).is_none(),
+                "{script} must go through a shell"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_script_is_not_a_command() {
+        assert_eq!(direct_argv(""), None);
+        assert_eq!(direct_argv("   "), None);
     }
 }

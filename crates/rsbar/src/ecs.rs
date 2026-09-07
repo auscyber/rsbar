@@ -38,7 +38,7 @@ use crate::layout::{self, ForceRepaint};
 use crate::requests::{Context, Items, ItemsRead};
 use crate::script::{Job, Runner};
 use crate::shaping::Cache;
-use crate::sources::{Emission, Events, Registry};
+use crate::sources::{Emission, Registry};
 use bevy_app::{App, First, Last, PostUpdate, PreUpdate, Update};
 use bevy_ecs::prelude::*;
 use objc2_core_foundation::{CFRunLoop, CFRunLoopRunResult, kCFRunLoopDefaultMode};
@@ -68,10 +68,12 @@ pub struct IpcRequest {
 #[derive(Message)]
 pub struct EventMessage(pub Emission);
 
-/// The receiving ends, which are `!Sync` and so cannot be plain resources.
+/// The request queue, which is `!Sync` and so cannot be a plain resource.
+///
+/// Events do not come through here: each source owns its own feed and the
+/// registry drains them, so an emission arrives tagged with what produced it.
 pub struct Inbox {
     pub requests: std::sync::mpsc::Receiver<IpcRequest>,
-    pub events: Events,
 }
 
 pub struct Sources(pub Registry);
@@ -208,8 +210,10 @@ fn rebuild_panels(
     repaint.0 = true;
 }
 
-fn drain_events(inbox: NonSend<Inbox>, mut out: MessageWriter<EventMessage>) {
-    while let Ok(emission) = inbox.events.try_recv() {
+/// Takes everything queued across every running source.
+fn drain_events(mut sources: NonSendMut<Sources>, mut out: MessageWriter<EventMessage>) {
+    for (id, emission) in sources.0.drain() {
+        tracing::trace!(source = %id, event = %emission.event, "drained");
         out.write(EventMessage(emission));
     }
 }

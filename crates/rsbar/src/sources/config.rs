@@ -4,7 +4,7 @@
 //! stream everything else does.
 
 use crate::config::{self, Debounce, Shared};
-use crate::sources::{Emission, Emitter, Source, StartError};
+use crate::sources::{Emission, Emitter, Registration, Source, SourceId, StartError};
 use notify::{RecursiveMode, Watcher as _};
 use rsbar_protocol::Event;
 use std::time::Duration;
@@ -17,15 +17,15 @@ pub struct Watcher {
 }
 
 impl Source for Watcher {
-    fn name(&self) -> &'static str {
-        "config"
+    fn id(&self) -> SourceId {
+        SourceId("config")
     }
 
     fn provides(&self) -> Vec<Event> {
         vec![Event::ConfigReloaded]
     }
 
-    fn install(&mut self, emit: Emitter) -> Result<Box<dyn std::any::Any>, StartError> {
+    fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {
         let Some(path) = self.config.blocking_read().path.clone() else {
             return Err(StartError {
                 name: "config",
@@ -56,7 +56,7 @@ impl Source for Watcher {
                 if !debounce.admit() {
                     return;
                 }
-                let _ = emit.try_send(Emission::new(Event::ConfigReloaded, None));
+                emit.send(Emission::new(Event::ConfigReloaded, None));
             })
             .map_err(|err| StartError {
                 name: "config",
