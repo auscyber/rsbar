@@ -103,6 +103,7 @@ fn spawn_ipc(receiver: Receiver<Request>, tx: mpsc::SyncSender<IpcRequest>, wake
                             let request = IpcRequest {
                                 request: Box::new(delivery.value),
                                 reply: delivery.reply,
+                                subscriber: delivery.subscriber,
                             };
                             if tx.send(request).is_err() {
                                 break;

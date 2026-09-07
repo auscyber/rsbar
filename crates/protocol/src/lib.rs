@@ -207,6 +207,16 @@ pub enum Request {
     UpdateAll,
     /// Re-runs the config from scratch, as a file change does.
     Reload,
+    /// Marks every item as unclaimed, so a client can rebuild the bar without
+    /// first working out what it wants to remove.
+    ///
+    /// Whatever the client does not touch before [`Request::EndConfig`] is
+    /// what it no longer wants, and goes. Nothing is removed until then, so a
+    /// config that fails half way leaves the bar it had rather than an empty
+    /// one.
+    BeginConfig,
+    /// Sweeps every item untouched since [`Request::BeginConfig`].
+    EndConfig,
     Query(Query),
     Shutdown,
 }

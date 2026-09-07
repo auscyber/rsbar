@@ -13,6 +13,7 @@ use crate::components::{
 use crate::script::Job;
 use crate::shaping::Cache;
 use crate::sources::{Registry, Target};
+use crate::subscribers::Subscribers;
 use bevy_ecs::prelude::*;
 use bevy_ecs::query::QueryData;
 use bevy_ecs::system::SystemParam;
@@ -75,6 +76,9 @@ pub struct Items<'w, 's> {
     pub commands: Commands<'w, 's>,
     pub index: ResMut<'w, Index>,
     pub write: Query<'w, 's, ItemWrite>,
+    /// Items nothing has claimed since the config began. Read-only and
+    /// disjoint from what `write` mutates, so the two can share a system.
+    pub unclaimed: Query<'w, 's, (Entity, &'static Name), With<Stale>>,
 }
 
 /// Reads only, for the systems that do not also write.
@@ -359,6 +363,10 @@ pub struct Context<'a> {
     pub panels: &'a mut Panels,
     pub cache: &'a mut Cache,
     pub sources: &'a mut Registry,
+    pub subscribers: &'a mut Subscribers,
+    /// A port this request arrived with, if the client wants its events
+    /// pushed back rather than run as a script.
+    pub subscriber: Option<async_mach_ports::Subscriber>,
 }
 
 /// Applies one request.
@@ -372,6 +380,8 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
         panels,
         cache,
         sources,
+        subscribers,
+        subscriber,
     } = ctx;
     match request {
         Request::SetBar(patch) => {
@@ -445,6 +455,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
                 return no_such(&name);
             };
             cache.forget(entity);
+            subscribers.clear(entity);
             // The item's claims go with it: `Watching` is a component, so the
             // despawn drops them and the sources nothing wants any more stop.
             items.commands.entity(entity).despawn();
@@ -466,6 +477,13 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
                 || subscribed.iter().any(is_pointer);
             // Inserting replaces whatever it held before, and dropping those
             // releases exactly what this item stopped wanting.
+            // A port arriving with the subscription is the client saying it
+            // will handle these itself. Arriving without one is it saying the
+            // opposite, so the previous port goes — a subscription replaces.
+            match subscriber.take() {
+                Some(port) => subscribers.set(entity, port),
+                None => subscribers.clear(entity),
+            }
             let watches = sources.watch_all(entity, needs(&subscribed, clickable));
             items.commands.entity(entity).insert(Watching(watches));
             if clickable {
@@ -508,6 +526,33 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             )),
             Err(err) => Outcome::error(err.to_string()),
         },
+
+        Request::BeginConfig => {
+            tracing::debug!("config began");
+            for row in &items.write {
+                items.commands.entity(row.entity).insert(Stale);
+            }
+            Outcome::ok()
+        }
+
+        Request::EndConfig => {
+            // Whatever the client did not touch is what it stopped wanting.
+            // Adding or setting an item clears the mark, so this is exactly
+            // the set the new config left out.
+            let dropped: Vec<(Entity, ItemName)> = items
+                .unclaimed
+                .iter()
+                .map(|(entity, name)| (entity, name.0.clone()))
+                .collect();
+            tracing::debug!(count = dropped.len(), "config ended");
+            for (entity, name) in dropped {
+                cache.forget(entity);
+                subscribers.clear(entity);
+                items.index.remove(&name);
+                items.commands.entity(entity).despawn();
+            }
+            Outcome::ok()
+        }
 
         Request::Reload => {
             tracing::info!("reload requested");

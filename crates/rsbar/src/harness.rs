@@ -29,6 +29,7 @@ pub struct Harness {
     panels: Panels,
     cache: Cache,
     sources: Registry,
+    subscribers: crate::subscribers::Subscribers,
 }
 
 impl Harness {
@@ -47,6 +48,7 @@ impl Harness {
             panels: Panels::default(),
             cache: Cache::default(),
             sources: Registry::new(crate::config::shared(), waker),
+            subscribers: crate::subscribers::Subscribers::default(),
         }
     }
 
@@ -62,6 +64,8 @@ impl Harness {
                 panels: &mut self.panels,
                 cache: &mut self.cache,
                 sources: &mut self.sources,
+                subscribers: &mut self.subscribers,
+                subscriber: None,
             };
             crate::requests::apply(request, &mut items, &mut ctx)
         };
@@ -345,6 +349,42 @@ mod tests {
         bar.apply(Request::RemoveItem(sleep));
         assert!(bar.registered_for(WORKSPACE).is_empty());
         assert!(!bar.running(WORKSPACE));
+    }
+
+    #[test]
+    fn ending_a_config_drops_only_what_it_left_out() {
+        let mut bar = Harness::new();
+        let kept = bar.add("kept", Position::Left);
+        let dropped = bar.add("dropped", Position::Left);
+
+        bar.apply(Request::BeginConfig);
+        // The new config mentions one of them and not the other.
+        bar.apply(Request::SetItem {
+            name: kept.clone(),
+            patch: Box::new(ItemPatch {
+                label: Some("still here".into()),
+                ..patch()
+            }),
+        });
+        bar.apply(Request::EndConfig);
+
+        let names: Vec<String> = bar
+            .items()
+            .into_iter()
+            .map(|item| item.name.to_string())
+            .collect();
+        assert_eq!(names, vec![kept.to_string()]);
+        assert!(!names.contains(&dropped.to_string()));
+    }
+
+    #[test]
+    fn adding_items_without_a_config_block_drops_nothing() {
+        // Incremental use — a client adding one item at a time — must not
+        // sweep. Only what is between begin and end is a config.
+        let mut bar = Harness::new();
+        bar.add("first", Position::Left);
+        bar.add("second", Position::Left);
+        assert_eq!(bar.items().len(), 2);
     }
 
     #[test]

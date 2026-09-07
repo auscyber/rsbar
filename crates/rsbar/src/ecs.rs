@@ -65,6 +65,9 @@ const TICK: Duration = Duration::from_secs(1);
 pub struct IpcRequest {
     pub request: Box<Request>,
     pub reply: Option<async_mach_ports::Reply>,
+    /// A port the client attached, wanting its events pushed back rather than
+    /// turned into a forked script.
+    pub subscriber: Option<async_mach_ports::Subscriber>,
 }
 
 /// An event, from a source or from this thread.
@@ -126,6 +129,7 @@ pub fn build(
         .insert_non_send(Sources(registry))
         .insert_non_send(Cache::default())
         .insert_non_send(crate::alias::Captures::default())
+        .insert_non_send(crate::subscribers::Subscribers::default())
         .insert_resource(settings)
         .init_resource::<Index>()
         .init_resource::<Queue>()
@@ -290,11 +294,17 @@ fn apply_requests(
     mut panels: NonSendMut<Panels>,
     mut cache: NonSendMut<Cache>,
     mut sources: NonSendMut<Sources>,
+    mut subscribers: NonSendMut<crate::subscribers::Subscribers>,
     mut queue: ResMut<Queue>,
     mut reloading: ResMut<Reloading>,
     mut exit: MessageWriter<bevy_app::AppExit>,
 ) {
-    while let Ok(IpcRequest { request, reply }) = inbox.requests.try_recv() {
+    while let Ok(IpcRequest {
+        request,
+        reply,
+        subscriber,
+    }) = inbox.requests.try_recv()
+    {
         // Only a bar request may mark the settings changed. Handing out
         // `&mut settings` is a `deref_mut`, which marks them whatever the
         // request turns out to be — and a changed `Settings` means a whole-bar
@@ -311,6 +321,8 @@ fn apply_requests(
             panels: &mut panels,
             cache: &mut cache,
             sources: &mut sources.0,
+            subscribers: &mut subscribers,
+            subscriber,
         };
         let outcome = crate::requests::apply(*request, &mut items, &mut ctx);
         queue.0.extend(outcome.jobs);
@@ -334,6 +346,7 @@ fn dispatch_events(
     read: ItemsRead,
     mut queue: ResMut<Queue>,
     mut reloading: ResMut<Reloading>,
+    mut subscribers: NonSendMut<crate::subscribers::Subscribers>,
     // Kept between passes: the dependent list is rebuilt per event and would
     // otherwise be an allocation each time.
     mut dependents: Local<Vec<Entity>>,
@@ -349,6 +362,10 @@ fn dispatch_events(
         sources
             .0
             .dependents_into(event, &Target::All, &mut dependents);
+        // A client holding a port takes the event itself. It does not also
+        // get its script run, or a Lua config would fork a shell for every
+        // event it is already handling in process.
+        dependents.retain(|item| !subscribers.push(*item, event));
         read.push_jobs(event, &dependents, &mut queue.0);
     }
 }

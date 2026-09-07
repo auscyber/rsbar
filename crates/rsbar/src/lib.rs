@@ -15,6 +15,7 @@ pub mod runloop;
 pub mod script;
 pub mod shaping;
 pub mod sources;
+pub mod subscribers;
 pub mod text;
 
 pub use rsbar_protocol::style;
