@@ -167,6 +167,16 @@ impl std::fmt::Display for ItemHandle {
 #[derive(Component, Debug, Clone, PartialEq, Eq)]
 pub struct AliasSpec(pub String);
 
+/// The items this one draws behind, as one surface.
+///
+/// A bracket is an ordinary item with no content: it takes its frame from its
+/// members rather than from text, and draws before them so its background
+/// lands underneath. Membership is by name because that is what a config
+/// writes and what survives a reload — the members may not exist yet when the
+/// bracket is declared.
+#[derive(Component, Debug, Clone, Default, PartialEq, Eq)]
+pub struct Members(pub Vec<ItemName>);
+
 /// A digest of what the alias last drew.
 ///
 /// Its own component so that change detection sees a menu bar item whose icon

@@ -148,6 +148,9 @@ struct ItemOptions {
     /// Mirror a menu bar item, as `Owner,Name`. Empty stops mirroring.
     #[arg(long)]
     alias: Option<String>,
+    /// Draw this item's background across the named items, as one surface.
+    #[arg(long, value_delimiter = ',')]
+    members: Option<Vec<ItemName>>,
     /// Seconds between routine updates; 0 means event-driven only.
     #[arg(long)]
     update_freq: Option<u32>,
@@ -221,6 +224,7 @@ impl From<ItemOptions> for ItemPatch {
             script: o.script,
             click_script: o.click_script,
             alias: o.alias,
+            members: o.members,
             update_freq: o.update_freq,
         }
     }

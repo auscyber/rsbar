@@ -166,6 +166,13 @@ pub struct ItemPatch {
     /// A menu bar item to mirror, as `Owner,Name` — the form
     /// `--query menu-items` lists. An empty string stops mirroring.
     pub alias: Option<String>,
+    /// The items this one draws behind, as one surface. An empty list stops
+    /// it being a bracket.
+    ///
+    /// A bracket has no content of its own: it takes its frame from the items
+    /// it names and draws its background across them, which is how a group of
+    /// items gets one shared shape rather than several abutting ones.
+    pub members: Option<Vec<ItemName>>,
     /// Seconds between routine updates. Zero means "only on subscribed
     /// events", which is the right default for anything event-driven.
     pub update_freq: Option<u32>,
@@ -249,6 +256,8 @@ pub struct ItemState {
     pub events: Vec<Kind>,
     /// What this item mirrors, if it is an alias.
     pub alias: Option<String>,
+    /// What this item brackets, if it is a bracket.
+    pub members: Vec<ItemName>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

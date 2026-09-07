@@ -8,7 +8,7 @@
 use crate::alias::Captures;
 use crate::bar::{Panels, Settings, fill_rounded_rect};
 use crate::components::{
-    AliasContent, Background, Drawing, Icon, Label, Offset, Padding, Placement,
+    AliasContent, Background, Drawing, Icon, Label, Members, Name, Offset, Padding, Placement,
 };
 use crate::shaping::Cache;
 use bevy_ecs::prelude::*;
@@ -17,20 +17,28 @@ use rsbar_protocol::Position;
 use std::collections::{HashMap, HashSet};
 
 /// Everything laying out one item needs.
-pub type ItemQuery<'w, 's> = Query<
-    'w,
-    's,
-    (
-        Entity,
-        &'static Icon,
-        &'static Label,
-        &'static Background,
-        &'static Padding,
-        &'static Offset,
-        &'static Placement,
-        &'static Drawing,
-    ),
->;
+/// Everything laying out and drawing one item needs.
+///
+/// Named rather than positional. It is ten columns now, and a tuple at that
+/// size is a bug waiting to happen: adding one silently rebinds everything
+/// after it, which is exactly how the click script once ended up where the
+/// update script belonged.
+#[derive(bevy_ecs::query::QueryData)]
+pub struct Drawn {
+    pub entity: Entity,
+    pub icon: &'static Icon,
+    pub label: &'static Label,
+    pub background: &'static Background,
+    pub padding: &'static Padding,
+    pub offset: &'static Offset,
+    pub placement: &'static Placement,
+    pub drawing: &'static Drawing,
+    pub name: &'static Name,
+    /// Set only on a bracket: the items it draws across.
+    pub members: Option<&'static Members>,
+}
+
+pub type ItemQuery<'w, 's> = Query<'w, 's, Drawn>;
 
 /// How wide an alias's mirrored image is, or nothing if it is not an alias.
 fn alias_width(captures: &Captures, entity: Entity, padding: &Padding) -> Option<f64> {
@@ -142,20 +150,21 @@ fn place(
 ) -> Vec<(Entity, CGRect)> {
     let measured: Vec<Placed<Entity>> = items
         .iter()
-        .filter(|(.., drawing)| drawing.0)
-        .map(
-            |(entity, icon, label, _, padding, _, placement, _)| Placed {
-                id: entity,
-                position: placement.0,
-                // An alias is as wide as what it mirrors; its own text, if it
-                // has any, is not drawn.
-                width: alias_width(captures, entity, padding)
-                    .unwrap_or_else(|| width(cache, entity, icon, label, padding)),
-            },
-        )
+        // A bracket takes no space of its own — it is drawn across the items
+        // it names, so laying it out alongside them would push them apart by
+        // its own width.
+        .filter(|row| row.drawing.0 && row.members.is_none())
+        .map(|row| Placed {
+            id: row.entity,
+            position: row.placement.0,
+            // An alias is as wide as what it mirrors; its own text, if it has
+            // any, is not drawn.
+            width: alias_width(captures, row.entity, row.padding)
+                .unwrap_or_else(|| width(cache, row.entity, row.icon, row.label, row.padding)),
+        })
         .collect();
 
-    arrange(&measured, size.width)
+    let mut placed: Vec<(Entity, CGRect)> = arrange(&measured, size.width)
         .into_iter()
         .map(|(entity, x, w)| {
             (
@@ -163,7 +172,58 @@ fn place(
                 CGRect::new(CGPoint::new(x, 0.0), CGSize::new(w, size.height)),
             )
         })
-        .collect()
+        .collect();
+
+    // Brackets go first, so their background lands under the items they span.
+    let mut brackets = brackets_over(items, &placed, size);
+    brackets.append(&mut placed);
+    brackets
+}
+
+/// Each bracket's frame: the span of the members it names, or nothing when
+/// none of them is on screen.
+///
+/// Membership is by name rather than entity because a config names its members
+/// before they necessarily exist, and a reload replaces the items underneath a
+/// bracket that outlives them.
+fn brackets_over(
+    items: &ItemQuery,
+    placed: &[(Entity, CGRect)],
+    size: CGSize,
+) -> Vec<(Entity, CGRect)> {
+    let mut out = Vec::new();
+    for bracket in items.iter() {
+        let Some(members) = bracket.members else {
+            continue;
+        };
+        if !bracket.drawing.0 {
+            continue;
+        }
+        let mut span: Option<(f64, f64)> = None;
+        for (member, frame) in placed {
+            let Ok(row) = items.get(*member) else {
+                continue;
+            };
+            if !members.0.contains(&row.name.0) {
+                continue;
+            }
+            let (left, right) = (frame.origin.x, frame.origin.x + frame.size.width);
+            span = Some(match span {
+                Some((l, r)) => (l.min(left), r.max(right)),
+                None => (left, right),
+            });
+        }
+        if let Some((left, right)) = span {
+            out.push((
+                bracket.entity,
+                CGRect::new(
+                    CGPoint::new(left, 0.0),
+                    CGSize::new(right - left, size.height),
+                ),
+            ));
+        }
+    }
+    out
 }
 
 /// Where each item ended up, per panel, from the last repaint.
@@ -436,10 +496,17 @@ fn paint_panels(
                     {
                         continue;
                     }
-                    let Ok((_, icon, label, background, padding, offset, _, _)) = items.get(entity)
-                    else {
+                    let Ok(row) = items.get(entity) else {
                         continue;
                     };
+                    let (icon, label, background, padding, offset, members) = (
+                        row.icon,
+                        row.label,
+                        row.background,
+                        row.padding,
+                        row.offset,
+                        row.members,
+                    );
                     let Some(shaped) = cache.get(entity) else {
                         continue;
                     };
@@ -447,6 +514,13 @@ fn paint_panels(
 
                     if !background.color.is_invisible() {
                         fill_rounded_rect(ctx, frame, background.corner_radius, background.color);
+                    }
+
+                    // A bracket is its background and nothing else — it has
+                    // no text of its own, and drawing its members' is their
+                    // job.
+                    if members.is_some() {
+                        continue;
                     }
 
                     // An alias draws what it mirrors, and nothing else.

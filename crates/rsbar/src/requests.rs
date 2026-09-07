@@ -8,7 +8,8 @@
 use crate::bar::{Changes, Panels, Settings};
 use crate::components::{
     AliasContent, AliasSpec, Background, ClickScript, Drawing, Icon, Index, ItemHandle, Label,
-    Name, Offset, Padding, Placement, Routine, Run, Script, Stale, Subscriptions, Watching, bundle,
+    Members, Name, Offset, Padding, Placement, Routine, Run, Script, Stale, Subscriptions,
+    Watching, bundle,
 };
 use crate::script::Job;
 use crate::shaping::Cache;
@@ -48,6 +49,7 @@ pub struct ItemWrite {
     pub script: Option<&'static Script>,
     pub click: Option<&'static ClickScript>,
     pub alias: Option<&'static AliasSpec>,
+    pub members: Option<&'static Members>,
 }
 
 /// Every component a query or a dispatch reads.
@@ -64,6 +66,7 @@ pub struct ItemRead {
     pub script: Option<&'static Script>,
     pub click: Option<&'static ClickScript>,
     pub alias: Option<&'static AliasSpec>,
+    pub members: Option<&'static Members>,
 }
 
 /// Everything a request may write to in the item world.
@@ -157,6 +160,7 @@ fn write_state(row: &ItemWriteReadOnlyItem<'_, '_>) -> ItemState {
         update_freq: row.routine.every,
         events: row.subscriptions.0.iter().cloned().collect(),
         alias: row.alias.map(|alias| alias.0.clone()),
+        members: row.members.map(|m| m.0.clone()).unwrap_or_default(),
     }
 }
 
@@ -275,6 +279,7 @@ fn state_of(row: &ItemReadItem<'_, '_>) -> ItemState {
         update_freq: row.routine.every,
         events: row.subscriptions.0.iter().cloned().collect(),
         alias: row.alias.map(|alias| alias.0.clone()),
+        members: row.members.map(|m| m.0.clone()).unwrap_or_default(),
     }
 }
 
@@ -670,6 +675,13 @@ fn set_item(
             commands
                 .entity(entity)
                 .insert(ClickScript(script.as_str().into()));
+        }
+    }
+    if let Some(members) = &patch.members {
+        if members.is_empty() {
+            commands.entity(entity).remove::<Members>();
+        } else {
+            commands.entity(entity).insert(Members(members.clone()));
         }
     }
     if let Some(alias) = &patch.alias {
