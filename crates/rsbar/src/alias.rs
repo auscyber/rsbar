@@ -997,13 +997,6 @@ struct Mirror {
     /// Consecutive [`Captures::refresh`] calls in a row that captured the
     /// same digest as `captured`. See [`STALE_AFTER`].
     unchanged: u32,
-    /// Set once an AX notification has actually matched this item — never
-    /// on registration alone. Only once this is true does `refresh` trust
-    /// the push enough to poll it any slower than every tick.
-    confirmed: bool,
-    /// Real captures skipped since the last one, while `confirmed` and
-    /// nothing is dirty. See [`SLOW_FACTOR`].
-    skipped: u32,
 }
 
 /// After this many consecutive unchanged captures, [`Captures::refresh`]
@@ -1017,36 +1010,11 @@ struct Mirror {
 /// bytes forever with no error at any point. [`Alias::invalidate`] existed to
 /// handle exactly this, but nothing called it: this is that caller.
 ///
-/// A poll interval is the caller's business, not this module's (see
-/// `ecs::ALIAS_POLL`), so this counts calls rather than time. At the daemon's
-/// current 500ms poll, this is two minutes — long enough that a legitimately
-/// static icon eats only one extra window-list scan every couple of minutes,
-/// short enough that a genuinely stale mirror does not stay stale for long.
-///
-/// This counts real captures, not ticks, so a `confirmed` alias — one
-/// [`SLOW_FACTOR`] is already stretching to a real capture only once every
-/// twenty ticks — reaches this ceiling roughly twenty times slower in wall
-/// time than an unconfirmed one, with no extra state needed to make that so.
-/// That is a deliberate trade rather than an oversight: the bug this guards
-/// against is a window-server quirk unrelated to whether AX observation is
-/// working, so a confirmed item is not meaningfully less likely to hit it,
-/// only slower to notice it if it does. Accepting that is worth not having
-/// two different staleness policies to reason about. A pid actually dying —
-/// the owning app restarting under a new one — is also caught well before
-/// this ceiling regardless: the next scheduled real capture (at most
-/// [`SLOW_FACTOR`] ticks away) re-resolves the window, notices the pid
-/// changed, and re-points [`crate::alias_watch::AxWatch`] at the new one
-/// through [`crate::alias_watch::AxWatch::sync_one`].
+/// This counts real captures, which are now driven by a notification rather
+/// than a clock, so it is a count of times the owner said something changed
+/// and the pixels came back identical anyway -- exactly the shape of the bug
+/// it guards against.
 const STALE_AFTER: u32 = 240;
-
-/// How many [`Captures::refresh`] ticks a `confirmed` alias's real capture is
-/// stretched to once its AX push has actually matched it at least once —
-/// `SLOW_FACTOR * ecs::ALIAS_POLL`, so at the daemon's current 500ms poll,
-/// roughly ten seconds between real captures instead of one every tick.
-/// [`crate::alias_watch::AxWatch::take_dirty`] returning `true` resets this
-/// immediately: a real change is captured on the very next tick, not at the
-/// end of this window.
-const SLOW_FACTOR: u32 = 20;
 
 /// Splits an `Owner,Name` spec. The name may itself contain commas, so only
 /// the first one separates.
@@ -1182,10 +1150,9 @@ fn trim_rect(image: &CGImage, size: CGSize, trim_px: Option<CGRect>) -> CGRect {
 impl Captures {
     /// Re-captures one item, reporting its digest if what it draws changed.
     ///
-    /// `None` means nothing to redraw — either the capture failed, it came
-    /// back identical (most re-captures do), or this tick was skipped
-    /// because a confirmed AX push says nothing has changed (see
-    /// [`SLOW_FACTOR`]).
+    /// `None` means nothing to redraw -- the capture failed, it came back
+    /// identical, or nothing has said this item changed since it was last
+    /// read.
     pub fn refresh(&mut self, entity: bevy_ecs::entity::Entity, spec: &str) -> Option<u64> {
         let Some((owner, name)) = split_spec(spec) else {
             tracing::warn!(spec, "an alias is written `Owner,Name`");
@@ -1203,28 +1170,25 @@ impl Captures {
                         spec: spec.to_owned(),
                         captured: None,
                         unchanged: 0,
-                        confirmed: false,
-                        skipped: 0,
                     })
                     .into_mut()
             }
         };
 
-        if self.watch.take_dirty(entity) {
-            tracing::debug!(
-                spec,
-                "an AX notification marked this alias dirty; re-capturing now"
-            );
-            mirror.confirmed = true;
-            mirror.skipped = 0;
-        } else if mirror.confirmed {
-            if mirror.skipped < SLOW_FACTOR {
-                mirror.skipped += 1;
-                self.watch
-                    .sync_one(entity, mirror.alias.name(), mirror.alias.pid());
-                return None;
-            }
-            mirror.skipped = 0;
+        // Watched, not polled. A mirrored item is re-read when its owner
+        // says something changed, and the first time it is seen -- never on a
+        // timer. Capturing a window and hashing every pixel of it twice a
+        // second, forever, to learn that a static icon is still static, was
+        // the largest single cost in this process.
+        let first = mirror.captured.is_none();
+        let dirty = !first && self.watch.take_dirty(entity);
+        if dirty {
+            tracing::debug!(spec, "a notification says this alias changed; re-reading");
+        }
+        if !first && !dirty {
+            self.watch
+                .sync_one(entity, mirror.alias.name(), mirror.alias.pid());
+            return None;
         }
 
         if mirror.unchanged >= STALE_AFTER {

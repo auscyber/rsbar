@@ -23,7 +23,7 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::system::RunSystemOnce as _;
 use bevy_ecs::system::SystemState;
 use rsbar_protocol::event::SpaceChange;
-use rsbar_protocol::{Event, ItemName, Kind, Request, Selector};
+use rsbar_protocol::{Event, ItemName, Kind, Request};
 use std::num::NonZeroU64;
 
 /// What [`crate::ecs::recompute_space_selection`] needs from the world.

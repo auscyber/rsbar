@@ -1125,7 +1125,7 @@ fn set_item(
     // Kind-specific properties, written only where they differ so a script
     // re-setting one to what it already is repaints nothing.
     if let Some(percentage) = patch.percentage
-        && let Some(mut slider) = row.slider.as_mut()
+        && let Some(slider) = row.slider.as_mut()
     {
         let next = Slider {
             percentage: percentage.min(100),
@@ -1134,13 +1134,26 @@ fn set_item(
         slider.set_if_neq(next);
     }
     if let Some(space) = patch.associated_space
-        && let Some(mut current) = row.associated_space.as_mut()
+        && let Some(current) = row.associated_space.as_mut()
     {
         current.set_if_neq(AssociatedSpace(space));
     }
     if let Some(popup) = &patch.popup {
         apply_popup(entity, row.popup, popup, commands);
     }
+    set_item_components(entity, row, patch, commands);
+}
+
+/// The half of a patch that adds or removes whole components rather than
+/// writing fields, split out only because the two together outgrew what is
+/// readable in one function.
+fn set_item_components(
+    entity: Entity,
+    row: &mut ItemWriteItem<'_, '_>,
+    patch: &ItemPatch,
+    commands: &mut Commands,
+) {
+    let _ = row;
     if let Some(script) = &patch.script {
         if script.is_empty() {
             commands.entity(entity).remove::<Script>();

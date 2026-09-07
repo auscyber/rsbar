@@ -58,10 +58,6 @@ use std::time::Duration;
 /// the pass entirely.
 const COALESCE_LIMIT: usize = 64;
 
-/// How often a mirrored menu bar item is re-read. Fast enough that a clock
-/// looks live, slow enough not to be the busiest thing in the process.
-const ALIAS_POLL: Duration = Duration::from_millis(500);
-
 /// How long the runner will sleep with nothing to do — also the routine tick.
 /// Item update frequencies are whole seconds, so waking more often would only
 /// cost battery to do nothing.
@@ -298,22 +294,15 @@ fn settle_sources(mut sources: NonSendMut<Sources>) {
 /// the digest lands on a component, the damage tracker repaints just that
 /// item's rect.
 fn refresh_aliases(
-    time: Res<bevy_time::Time<bevy_time::Real>>,
-    mut since: Local<Duration>,
     mut captures: NonSendMut<crate::alias::Captures>,
     mut items: Query<(Entity, &AliasSpec, &mut AliasContent)>,
 ) {
-    // Throttled, because a pass happens on every wake — a per-second script
-    // alone is several — and each refresh asks the window server for a fresh
-    // image and hashes every pixel of it. Profiling put that at two fifths of
-    // all the on-CPU time this process spends, to learn that nothing had
-    // changed on almost every one.
-    *since += time.delta();
-    if *since < ALIAS_POLL {
-        return;
-    }
-    *since = Duration::ZERO;
-
+    // No throttle, because there is nothing to throttle: a capture only
+    // happens when the owning application's Accessibility notification says
+    // this item changed, or the first time it is seen. Asking the window
+    // server for a fresh image and hashing every pixel of it on a timer, to
+    // learn that a static icon is still static, was the largest single cost
+    // in this process.
     for (entity, spec, mut content) in &mut items {
         if let Some(digest) = captures.refresh(entity, &spec.0) {
             content.set_if_neq(AliasContent(digest));

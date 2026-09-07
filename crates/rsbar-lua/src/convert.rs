@@ -730,7 +730,7 @@ pub fn item_state_to_table(lua: &Lua, state: &ItemState) -> mlua::Result<Table> 
         events.set(index + 1, kind.name())?;
     }
     table.set("events", events)?;
-    booleans_as_on_off(lua, &table)?;
+    booleans_as_on_off(&table)?;
     Ok(table)
 }
 
@@ -743,13 +743,13 @@ pub fn item_state_to_table(lua: &Lua, state: &ItemState) -> mlua::Result<Table> 
 /// went wrong: `popup` was added to `ItemState` and the hand-written
 /// conversion simply never set it, so `overflow:query().popup` was nil and
 /// indexing it killed the callback.
-fn booleans_as_on_off(lua: &Lua, table: &Table) -> mlua::Result<()> {
+fn booleans_as_on_off(table: &Table) -> mlua::Result<()> {
     let mut rewrites = Vec::new();
     for pair in table.clone().pairs::<Value, Value>() {
         let (key, value) = pair?;
         match value {
             Value::Boolean(b) => rewrites.push((key, on_off(b))),
-            Value::Table(nested) => booleans_as_on_off(lua, &nested)?,
+            Value::Table(nested) => booleans_as_on_off(&nested)?,
             _ => {}
         }
     }
@@ -764,7 +764,7 @@ fn booleans_as_on_off(lua: &Lua, table: &Table) -> mlua::Result<()> {
 /// Returns a Lua error only if table creation itself fails.
 pub fn bar_state_to_table(lua: &Lua, state: &BarState) -> mlua::Result<Table> {
     let table = serde_table(lua, state)?;
-    booleans_as_on_off(lua, &table)?;
+    booleans_as_on_off(&table)?;
     Ok(table)
 }
 
