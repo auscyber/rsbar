@@ -106,6 +106,7 @@ const DOMAINS: &[&str] = &[
     "reload",
     "update",
     "exit",
+    "press",
 ];
 
 fn looks_like_a_domain(token: &str) -> bool {
@@ -602,11 +603,16 @@ fn parse_trigger(parser: &mut Parser) -> Result<Request, ParseError> {
 }
 
 fn parse_query(parser: &mut Parser) -> Result<Request, ParseError> {
-    let token = required_string(parser, "--query", "bar, items, menu-items or an item name")?;
+    let token = required_string(
+        parser,
+        "--query",
+        "bar, items, menu-items, app-menus or an item name",
+    )?;
     let query = match token.as_str() {
         "bar" => Query::Bar,
         "items" => Query::Items,
         "menu-items" | "menu_items" | "default_menu_items" => Query::MenuItems,
+        "app-menus" | "app_menus" => Query::AppMenus,
         "defaults" => {
             return Err(ParseError::KnownGap(
                 token,
@@ -628,6 +634,18 @@ fn parse_query(parser: &mut Parser) -> Result<Request, ParseError> {
         _ => Query::Item(ItemName::new(token.as_str())?),
     };
     Ok(Request::Query(query))
+}
+
+/// `--press <index>` opens one of the frontmost application's own menus;
+/// `--press <name>` opens the real menu behind a mirrored item. The two are
+/// told apart by shape, since an index is never a valid item name in the
+/// configs that use this — it is what the config's `menus -s <n>` helper took.
+fn parse_press(parser: &mut Parser) -> Result<Request, ParseError> {
+    let token = required_string(parser, "--press", "a menu index or an alias item name")?;
+    if let Ok(index) = token.parse::<usize>() {
+        return Ok(Request::PressAppMenu(index));
+    }
+    Ok(Request::PressAlias(ItemName::new(token.as_str())?))
 }
 
 fn parse_reload(parser: &mut Parser) -> Result<Request, ParseError> {
@@ -657,6 +675,7 @@ pub fn parse(args: &[String]) -> Result<Vec<Request>, ParseError> {
             Arg::Long("subscribe") => requests.push(parse_subscribe(&mut parser)?),
             Arg::Long("trigger") => requests.push(parse_trigger(&mut parser)?),
             Arg::Long("query") => requests.push(parse_query(&mut parser)?),
+            Arg::Long("press") => requests.push(parse_press(&mut parser)?),
             Arg::Long("reload") => requests.push(parse_reload(&mut parser)?),
             Arg::Long("update") => requests.push(Request::UpdateAll),
             // SketchyBar's own domain for quitting the running instance.
@@ -1001,6 +1020,24 @@ mod tests {
         assert_eq!(
             parse(&args(&["--query", "clock"])).unwrap(),
             vec![Request::Query(Query::Item(name("clock")))]
+        );
+        assert_eq!(
+            parse(&args(&["--query", "app-menus"])).unwrap(),
+            vec![Request::Query(Query::AppMenus)]
+        );
+    }
+
+    #[test]
+    fn press_tells_a_menu_index_from_an_alias_name() {
+        // The Apple menu is index 0, which is what the config's click script
+        // passed to its helper.
+        assert_eq!(
+            parse(&args(&["--press", "0"])).unwrap(),
+            vec![Request::PressAppMenu(0)]
+        );
+        assert_eq!(
+            parse(&args(&["--press", "Amphetamine,Amphetamine"])).unwrap(),
+            vec![Request::PressAlias(name("Amphetamine,Amphetamine"))]
         );
     }
 

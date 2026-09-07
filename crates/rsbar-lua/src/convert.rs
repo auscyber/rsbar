@@ -207,6 +207,7 @@ fn background_patch(table: &Table) -> mlua::Result<Option<rsbar_protocol::Backgr
     };
     warn_unknown_with(&sub, "background", KNOWN, BACKGROUND_UNSUPPORTED);
     Ok(Some(rsbar_protocol::BackgroundPatch {
+        drawing: None,
         color: opt_color(&sub, "color")?,
         corner_radius: opt(&sub, "corner_radius")?,
         height: opt(&sub, "height")?,
@@ -471,6 +472,9 @@ pub fn bar_patch_from_table(table: &Table) -> mlua::Result<BarPatch> {
             .transpose()?,
     };
     Ok(BarPatch {
+        padding_left: None,
+        padding_right: None,
+        display: None,
         height: opt(table, "height")?,
         edge,
         color: opt_color(table, "color")?,
@@ -532,6 +536,9 @@ pub fn item_patch_from_table(table: &Table) -> mlua::Result<ItemPatch> {
     let label = IconOrLabel::read(table, "label")?;
 
     Ok(ItemPatch {
+        updates: None,
+        width: None,
+        display: None,
         // `IconOrLabel::read` already covers both the bare-string and the
         // `{ text = ... }` spellings of `icon`/`label` — there is no separate
         // flat key left to fall back to, and `icon`/`label` themselves are

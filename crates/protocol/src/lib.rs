@@ -37,27 +37,28 @@ pub struct ItemName(std::sync::Arc<str>);
 pub enum InvalidName {
     #[error("an item name cannot be empty")]
     Empty,
-    #[error("`{0}` is not a valid item name: use letters, digits, `_`, `-` or `.`")]
+    #[error("`{0}` is not a valid item name: control characters are not allowed")]
     Character(String),
 }
 
 impl ItemName {
-    /// Names travel in env vars and are matched by clients, so the character
-    /// set is restricted rather than accepting anything a shell survives.
+    /// An alias names the menu bar item it mirrors — `Control Centre,Clock` —
+    /// so a name has to carry a comma and a space, and the character set is
+    /// only as narrow as the daemon's own handling requires. A name reaches a
+    /// script as the value of `RSBAR_NAME` and never as part of the command
+    /// string, so a shell never re-parses one; what it cannot survive is a
+    /// control character, which an env var cannot carry.
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidName`] for an empty name or one containing anything
-    /// outside letters, digits, `_`, `-` and `.`.
+    /// Returns [`InvalidName`] for an empty name or one containing a control
+    /// character.
     pub fn new(name: impl Into<String>) -> Result<Self, InvalidName> {
         let name = name.into();
         if name.is_empty() {
             return Err(InvalidName::Empty);
         }
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-        {
+        if name.chars().any(char::is_control) {
             return Err(InvalidName::Character(name));
         }
         Ok(Self(name.into()))
@@ -139,6 +140,13 @@ pub struct BarPatch {
     pub hidden: Option<bool>,
     /// Whether the bar sits above the system menu bar or below it.
     pub topmost: Option<bool>,
+    /// Space before the first item and after the last, which is not the same
+    /// as [`Self::margin`]: margin insets the bar from the screen edge, this
+    /// insets the items from the bar.
+    pub padding_left: Option<f64>,
+    pub padding_right: Option<f64>,
+    /// Which displays the bar appears on: `all`, or a 1-based index.
+    pub display: Option<String>,
 }
 
 /// A partial update to one item.
@@ -170,6 +178,18 @@ pub struct ItemPatch {
     /// Seconds between routine updates. Zero means "only on subscribed
     /// events".
     pub update_freq: Option<u32>,
+    /// Whether the item runs its script and receives events at all.
+    ///
+    /// Distinct from [`Self::drawing`], which only stops it being drawn: a
+    /// hidden item that still updates costs work nobody can see, and an item
+    /// that is drawn from a value someone else sets wants the opposite.
+    pub updates: Option<bool>,
+    /// A fixed width, overriding what the item's contents come to. `None`
+    /// leaves it measured; a config sets this for a spacer, or to stop an
+    /// item's width jittering as its text changes.
+    pub width: Option<f64>,
+    /// Which displays this item appears on: `all`, or a 1-based index.
+    pub display: Option<String>,
 }
 
 // `struct_patch::Patch` compares each field to decide what a patch changed.
@@ -226,6 +246,9 @@ mod parts {
         attribute(derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize))
     )]
     pub struct Background {
+        /// Whether the surface is drawn. Separate from the item's own
+        /// `drawing` so a config can turn a pill off and leave the text.
+        pub drawing: bool,
         /// ARGB.
         pub color: u32,
         pub corner_radius: f64,
@@ -243,6 +266,9 @@ mod parts {
 }
 
 pub use parts::{Background, BackgroundPatch, Run, RunPatch};
+/// Re-exported so the daemon can apply a patch without depending on
+/// `struct_patch` directly — the derive lives here, so the trait should too.
+pub use struct_patch::Patch;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -253,6 +279,10 @@ pub enum Query {
     /// Every menu bar item that can be mirrored, as `Owner,Name` — the form
     /// an item's `alias` takes. There is no discovering these otherwise.
     MenuItems,
+    /// The frontmost application's own menu titles, in on-screen order,
+    /// starting with the Apple menu. Not mirrorable, only listable: see
+    /// `rsbar::menus`.
+    AppMenus,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -291,6 +321,12 @@ pub enum Request {
     /// Sweeps every item untouched since [`Request::BeginConfig`].
     EndConfig,
     Query(Query),
+    /// Opens one of the frontmost application's own menus, by the index
+    /// [`Query::AppMenus`] reported.
+    PressAppMenu(usize),
+    /// Opens the real menu behind a mirrored menu bar item, so a click on an
+    /// alias does what a click on the thing it mirrors would.
+    PressAlias(ItemName),
     Shutdown,
 }
 
@@ -334,6 +370,8 @@ pub enum Response {
     Item(Box<ItemState>),
     /// Mirrorable menu bar items, as `Owner,Name`.
     MenuItems(Vec<String>),
+    /// The frontmost application's own menu titles, in on-screen order.
+    AppMenus(Vec<String>),
     /// The request was understood but could not be carried out.
     Error(String),
 }
@@ -347,13 +385,13 @@ mod tests {
         assert!(ItemName::new("clock").is_ok());
         assert!(ItemName::new("space.1").is_ok());
         assert!(ItemName::new("front-app_2").is_ok());
+        // An alias is named for what it mirrors, and those names have commas
+        // and spaces in them.
+        assert!(ItemName::new("Amphetamine,Amphetamine").is_ok());
+        assert!(ItemName::new("Control Centre,FocusModes").is_ok());
         assert_eq!(ItemName::new(""), Err(InvalidName::Empty));
         assert!(matches!(
-            ItemName::new("a b"),
-            Err(InvalidName::Character(_))
-        ));
-        assert!(matches!(
-            ItemName::new("rm -rf /"),
+            ItemName::new("two\nlines"),
             Err(InvalidName::Character(_))
         ));
     }

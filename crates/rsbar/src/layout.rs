@@ -502,10 +502,13 @@ fn draw_item(
     };
 
     let surface = background_rect(frame, background);
-    if !background.color.is_invisible() {
+    if background.drawing && !background.color.is_invisible() {
         fill_rounded_rect(ctx, surface, background.corner_radius, background.color);
     }
-    if background.border_width > 0.0 && !background.border_color.is_invisible() {
+    if background.drawing
+        && background.border_width > 0.0
+        && !background.border_color.is_invisible()
+    {
         stroke_rounded_rect(
             ctx,
             surface,

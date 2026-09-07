@@ -60,7 +60,7 @@ fn print_response(response: Response) -> bool {
             println!("{item:#?}");
             true
         }
-        Response::MenuItems(found) => {
+        Response::MenuItems(found) | Response::AppMenus(found) => {
             for item in found {
                 println!("{item}");
             }
