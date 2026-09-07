@@ -7,10 +7,12 @@
 //! process's life. That is fine for `SketchyBar`, which registers once at
 //! startup and never stops, but this registry starts and stops sources lazily
 //! as items subscribe and unsubscribe. So this source registers with `SkyLight`
-//! at most once ever — guarded by [`REGISTERED`] — and every later
-//! `register()` (an item re-subscribing after everything else had dropped it)
-//! just repoints [`CURRENT_EMITTER`] at the new sink. Nothing here is
-//! per-instance; it could not be, given the framework.
+//! at most once ever, and every later `register()` (an item re-subscribing
+//! after everything else had dropped it) writes its new sink into the [`Sink`]
+//! `SkyLight` was already given a pointer to. That sink lives on the source,
+//! which the registry owns for the life of the process — long enough for a
+//! callback that can never be unregistered, and without leaking one per
+//! restart the way a per-registration context would.
 //!
 //! # Event numbers
 //!
@@ -41,7 +43,9 @@
 //! themselves are unverified against a live event, even though the code they
 //! call into is.
 
-use crate::sources::{Cause, Registering, Registration, Source, SourceId, StartError};
+use crate::sources::{
+    CallbackState, Cause, Registering, Registration, Source, SourceId, StartError,
+};
 use objc2_core_foundation::{CFRetained, CFString, CFUUID};
 use objc2_core_graphics::{CGDirectDisplayID, CGError};
 use rsbar_protocol::event::{SpaceChange, SpaceWindowsChange};
@@ -50,7 +54,6 @@ use skylight::ConnectionId;
 use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// `WorkspaceDidChange`: the active space changed, on some display.
 const SPACE_CHANGED_EVENT: u32 = 1401;
@@ -73,25 +76,29 @@ unsafe extern "C" {
 /// callback already in flight when this changes must not read a freed
 /// `Emitter`, and the framework gives no way to wait for one to finish. See
 /// the module docs for why this exists instead of a per-registration context.
-static CURRENT_EMITTER: AtomicPtr<crate::sources::Emitter> = AtomicPtr::new(std::ptr::null_mut());
-/// Whether the `SkyLight` callbacks have been installed yet. Set at most once
-/// for the life of the process.
-static REGISTERED: AtomicBool = AtomicBool::new(false);
+/// Where a notification's event goes. One of these is made on the first
+/// registration and pointed at from `SkyLight` forever; later registrations
+/// write their new sink into it rather than allocating another.
+#[derive(Default)]
+pub struct Sink(tokio::sync::Mutex<Option<crate::sources::Emitter>>);
 
-fn set_emitter(emit: crate::sources::Emitter) {
-    let boxed = Box::into_raw(Box::new(emit));
-    // Deliberately leaked: see the module docs.
-    CURRENT_EMITTER.swap(boxed, Ordering::SeqCst);
-}
+impl Sink {
+    fn set(&self, emit: crate::sources::Emitter) {
+        *self.0.blocking_lock() = Some(emit);
+    }
 
-fn clear_emitter() {
-    CURRENT_EMITTER.swap(std::ptr::null_mut(), Ordering::SeqCst);
-}
+    fn clear(&self) {
+        *self.0.blocking_lock() = None;
+    }
 
-fn current_emitter() -> Option<&'static crate::sources::Emitter> {
-    // SAFETY: the pointer is either null or was leaked from a `Box` that is
-    // never freed, so a non-null read is always valid for `'static`.
-    unsafe { CURRENT_EMITTER.load(Ordering::SeqCst).as_ref() }
+    /// Called from a `SkyLight` notify proc, never from async code — a
+    /// blocking lock is the right tool and the only one available. Cloned
+    /// rather than borrowed: an `Emitter` is a sender and a waker, so a clone
+    /// is a couple of reference counts, and holding the lock across the send
+    /// would make a re-registration wait on whatever the callback is doing.
+    fn get(&self) -> Option<crate::sources::Emitter> {
+        self.0.blocking_lock().clone()
+    }
 }
 
 /// The display and space `SLSCopyActiveMenuBarDisplayIdentifier` currently
@@ -134,10 +141,13 @@ extern "C-unwind" fn space_changed(
     _event: u32,
     _data: *mut c_void,
     _len: usize,
-    _context: *mut c_void,
+    context: *mut c_void,
     cid: ConnectionId,
 ) {
-    let Some(emit) = current_emitter() else {
+    // SAFETY: the registration passed a `CallbackState<Sink>` pointer, and the
+    // source holding it outlives the process's use of this callback.
+    let Some(emit) = (unsafe { CallbackState::<Sink>::recover(context) }).and_then(Sink::get)
+    else {
         return;
     };
     let Some((display, space)) = active_display_and_space(cid) else {
@@ -150,10 +160,12 @@ extern "C-unwind" fn space_windows_changed(
     _event: u32,
     data: *mut c_void,
     len: usize,
-    _context: *mut c_void,
+    context: *mut c_void,
     _cid: ConnectionId,
 ) {
-    let Some(emit) = current_emitter() else {
+    // SAFETY: as above.
+    let Some(emit) = (unsafe { CallbackState::<Sink>::recover(context) }).and_then(Sink::get)
+    else {
         return;
     };
     let Some(space) = leading_space_id(data, len) else {
@@ -165,15 +177,28 @@ extern "C-unwind" fn space_windows_changed(
 /// Nothing to deregister; see the module docs. Only clears the sink so a
 /// callback firing after every subscriber has gone does not try to send into
 /// a channel nobody is draining.
-struct Watch;
+struct Watch(CallbackState<Sink>);
 
 impl Drop for Watch {
     fn drop(&mut self) {
-        clear_emitter();
+        self.0.get().clear();
     }
 }
 
-pub struct Spaces;
+/// The sink `SkyLight` is pointed at lives here, on the source itself.
+///
+/// It can never be freed — there is no unregister call, so a callback
+/// registered once may fire at any point for the rest of the process — and
+/// putting it in the registration therefore leaked one every time the source
+/// restarted. The registry owns this source for the life of the process, so
+/// one sink held here outlives every registration and leaks nothing.
+#[derive(Default)]
+pub struct Spaces {
+    sink: Option<CallbackState<Sink>>,
+    /// Whether `SkyLight` has been told about the callbacks yet. Once only,
+    /// for the same reason.
+    registered: bool,
+}
 
 impl Source for Spaces {
     fn id(&self) -> SourceId {
@@ -189,9 +214,13 @@ impl Source for Spaces {
         _wanted: &BTreeSet<Kind>,
         cx: &mut Registering<'_>,
     ) -> Result<Registration, StartError> {
-        set_emitter(cx.emitter());
+        let sink = self
+            .sink
+            .get_or_insert_with(|| CallbackState::new(Sink::default()));
+        sink.get().set(cx.emitter());
 
-        if !REGISTERED.swap(true, Ordering::SeqCst) {
+        if !self.registered {
+            self.registered = true;
             for (proc, event) in [
                 (
                     space_changed as skylight::ffi::NotifyProc,
@@ -201,18 +230,19 @@ impl Source for Spaces {
                 (space_windows_changed, SPACE_WINDOW_DESTROYED_EVENT),
                 (space_windows_changed, SPACE_WINDOW_BATCH_REASSOCIATED_EVENT),
             ] {
-                // SAFETY: `proc` matches `NotifyProc`'s signature; `SkyLight`
-                // is free to call back from here on, with no context needed —
-                // see the module docs for why this is process-global.
-                let status = unsafe {
-                    skylight::ffi::SLSRegisterNotifyProc(proc, event, std::ptr::null_mut())
-                };
+                // SAFETY: `proc` matches `NotifyProc`'s signature, and the
+                // context outlives every callback — the source holding it is
+                // owned by the registry for the life of the process, which is
+                // exactly as long as `SkyLight` may keep calling back.
+                let status = sink.with_ptr(|context| unsafe {
+                    skylight::ffi::SLSRegisterNotifyProc(proc, event, context)
+                });
                 if status != CGError::Success {
                     return Err(StartError::new(self.id(), Cause::CoreGraphics(status)));
                 }
             }
         }
 
-        Ok(Box::new(Watch))
+        Ok(Box::new(Watch(CallbackState::clone_of(sink))))
     }
 }

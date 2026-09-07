@@ -246,7 +246,11 @@ pub fn current_percentage() -> Option<u8> {
 /// a callback that stalls `CoreAudio`'s notification thread. Atomics also mean
 /// there is no guard to poison and nothing that can panic in a callback.
 struct Shared {
-    emit: Emitter,
+    /// Behind a lock because the one `Shared` outlives any single
+    /// registration: a source that stops and starts again writes its new sink
+    /// in here rather than allocating a second state for `CoreAudio` to be
+    /// pointed at.
+    emit: tokio::sync::Mutex<Option<Emitter>>,
     /// The device currently listened to, or [`NO_DEVICE`].
     listening_to: AtomicU32,
     /// The last scalar reported, as bits. `CoreAudio` fires several times for
@@ -285,9 +289,11 @@ extern "C-unwind" fn changed(
     shared.last.store(scalar.to_bits(), Ordering::Relaxed);
 
     // Dropping beats blocking: this is a `CoreAudio` callback.
-    shared.emit.send(Event::VolumeChanged(VolumeChange {
-        volume: percent(scalar),
-    }));
+    if let Some(emit) = shared.emit.blocking_lock().clone() {
+        emit.send(Event::VolumeChanged(VolumeChange {
+            volume: percent(scalar),
+        }));
+    }
     0
 }
 
@@ -389,7 +395,20 @@ impl Drop for Listeners {
     }
 }
 
-pub struct Volume;
+/// The state `CoreAudio` is pointed at lives here, on the source itself.
+///
+/// It cannot be freed at deregistration: `CoreAudio` delivers on a thread of
+/// its own and offers no call that waits for an in-flight callback to finish,
+/// so releasing it there would race a callback already running. Keeping it in
+/// the registration therefore meant leaking one per registration, and the
+/// source restarts every time an item stops and starts wanting the volume.
+///
+/// The registry owns this source for the life of the process, so one state
+/// held here outlives every registration without any of them leaking.
+#[derive(Default)]
+pub struct Volume {
+    state: Option<CallbackState<Shared>>,
+}
 
 impl Source for Volume {
     fn id(&self) -> SourceId {
@@ -410,11 +429,19 @@ impl Source for Volume {
             return Err(StartError::new(self.id(), Cause::NoOutputDevice));
         }
 
-        let state = CallbackState::new(Shared {
-            emit,
-            listening_to: AtomicU32::new(NO_DEVICE),
-            last: AtomicU32::new((-1.0f32).to_bits()),
+        // Made once, then repointed at each new sink.
+        let state = self.state.get_or_insert_with(|| {
+            CallbackState::new(Shared {
+                emit: tokio::sync::Mutex::const_new(None),
+                listening_to: AtomicU32::new(NO_DEVICE),
+                last: AtomicU32::new((-1.0f32).to_bits()),
+            })
         });
+        *state.get().emit.blocking_lock() = Some(emit);
+        state
+            .get()
+            .last
+            .store((-1.0f32).to_bits(), Ordering::Relaxed);
         state.get().relisten();
 
         let status = state.with_ptr(|context| {
@@ -432,13 +459,6 @@ impl Source for Volume {
             return Err(StartError::new(self.id(), Cause::CoreAudio(status)));
         }
 
-        // The state is deliberately never freed. `CoreAudio` delivers on a
-        // thread of its own and offers no call that waits for an in-flight
-        // callback to finish, so releasing it at deregistration races a
-        // callback already running — a use-after-free that would surface as a
-        // rare crash on quit. The other sources reclaim theirs; this one holds
-        // a second reference so dropping `Listeners` cannot free it.
-        CallbackState::leak(CallbackState::clone_of(&state));
-        Ok(Box::new(Listeners(state)))
+        Ok(Box::new(Listeners(CallbackState::clone_of(state))))
     }
 }

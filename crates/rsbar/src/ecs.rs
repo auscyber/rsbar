@@ -251,6 +251,19 @@ fn rebuild_panels(
 }
 
 /// Takes everything queued across every running source.
+/// Everything an item owns outside the ECS, which has to be released when it
+/// is despawned.
+///
+/// Grouped because forgetting one of them is the mistake: each is a map keyed
+/// by entity, and one left unpruned strands a shaped line, a captured image or
+/// a Mach port for the life of the process.
+#[derive(bevy_ecs::system::SystemParam)]
+pub struct Belongings<'w> {
+    cache: NonSendMut<'w, Cache>,
+    captures: NonSendMut<'w, crate::alias::Captures>,
+    subscribers: NonSendMut<'w, crate::subscribers::Subscribers>,
+}
+
 /// Starts and stops sources to match the claims items are holding.
 ///
 /// Separate from taking and dropping a claim because those happen anywhere —
@@ -434,12 +447,15 @@ fn settle_reload(
     mut watch: ResMut<ReloadWatch>,
     mut commands: Commands,
     mut index: ResMut<Index>,
-    mut cache: NonSendMut<Cache>,
-    mut captures: NonSendMut<crate::alias::Captures>,
-    mut subscribers: NonSendMut<crate::subscribers::Subscribers>,
+    mut belongings: Belongings,
     stale: Query<(Entity, &Name), With<Stale>>,
     config: Res<ConfigHandle>,
 ) {
+    let Belongings {
+        cache,
+        captures,
+        subscribers,
+    } = &mut belongings;
     if !watch.pending {
         return;
     }

@@ -499,6 +499,9 @@ pub(crate) mod sealed {
 impl sealed::Sealed for Emitter {}
 impl Payload for Emitter {}
 
+impl sealed::Sealed for spaces::Sink {}
+impl Payload for spaces::Sink {}
+
 impl<T: Payload> CallbackState<T> {
     pub fn new(value: T) -> Self {
         Self(std::sync::Arc::new(value))
@@ -852,10 +855,10 @@ impl Registry {
             Box::new(config::Watcher { config }),
             Box::new(power::Power),
             Box::new(mouse::Mouse),
-            Box::new(volume::Volume),
+            Box::new(volume::Volume::default()),
             Box::new(brightness::Brightness),
             Box::new(wifi::Wifi),
-            Box::new(spaces::Spaces),
+            Box::new(spaces::Spaces::default()),
             Box::new(media::Media),
         ];
 
