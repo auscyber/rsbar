@@ -43,14 +43,15 @@
 //!   silently finds nothing. [`accessibility_trusted`] reports this ahead of
 //!   time so a caller can tell "no items" from "no permission".
 //!
-//! # Push updates were investigated; neither route delivers
+//! # Push updates: one route delivers, scoped and filtered
 //!
-//! [`Captures::refresh`] is still a poll — a re-capture and a full pixel
-//! hash, called on a timer by `ecs::refresh_aliases` — because nothing this
-//! investigation tried actually pushes a change. Both routes were checked
-//! against real, live changes rather than trusted on registration succeeding
-//! (`skylight/examples/notify_probe.rs` and `rsbar/examples/ax_observer_probe.rs`
-//! are the evidence, cross-checked live on macOS 26.5.1):
+//! [`Captures::refresh`] is still called on a timer by `ecs::refresh_aliases`
+//! — nothing here replaces the poll — but it is no longer the only way a
+//! capture gets triggered. Two routes were checked against real, live
+//! changes rather than trusted on registration succeeding
+//! (`skylight/examples/notify_probe.rs` and
+//! `rsbar/examples/ax_observer_probe.rs` are the evidence, cross-checked live
+//! on macOS 26.5.1):
 //!
 //! - **`SkyLight`/CGS window notifications**, the mechanism `sources/spaces.rs`
 //!   uses for space events: registering every plausibly-relevant `kCGSEvent*`
@@ -66,37 +67,52 @@
 //!   `sketchybar.c`/`window.c` settles it further: the only content-adjacent
 //!   event it registers, `kCGSWindowTitleChanged` (1322), is used purely to
 //!   *pause* its capture poll for ~1s during a transition
-//!   (`g_disable_capture`) — never to trigger one. Even the reference
-//!   implementation this project cross-checks against only polls; this
-//!   mechanism looks non-functional on this machine besides, matching
+//!   (`g_disable_capture`) — never to trigger one. This route stays
+//!   unused: it looks non-functional on this machine, matching
 //!   `sources/spaces.rs`'s own note that its space-change event was never
 //!   observed firing live either.
-//! - **`AXObserver` on the item's own `AXUIElement`**: rejected immediately
-//!   with `kAXErrorNotificationUnsupported`, for `kAXValueChangedNotification`
-//!   and `kAXTitleChangedNotification` alike, on both a Control Center-native
-//!   item (Clock) and a genuinely separate-process one (Fantastical). The
-//!   `AXMenuBarItem` role does not participate in AX's notification system at
-//!   all — confirmed as a real rejection, not silence. Registering the same
-//!   notifications one level up, on the owning app or its `AXExtrasMenuBar`,
-//!   *is* accepted, and notifications do arrive (proving the plumbing itself
-//!   works) — but unscoped to the item asked for: what arrived was a
-//!   different app's still-mounted popover text, on an observer created for a
-//!   third pid entirely. It never reported the actual icon changing.
+//! - **`AXObserver`**, at two different scopes:
+//!   - On the item's own `AXUIElement`: rejected immediately with
+//!     `kAXErrorNotificationUnsupported`, for `kAXValueChangedNotification`
+//!     and `kAXTitleChangedNotification` alike, on both a Control Center-native
+//!     item (Clock) and a genuinely separate-process one (Fantastical). The
+//!     `AXMenuBarItem` role does not participate in AX's notification system
+//!     at all — confirmed as a real rejection, not silence. This scope stays
+//!     unused.
+//!   - On the *owning application's* top-level `AXUIElement`: accepted, and
+//!     it fires. `examples/ax_observer_probe.rs`, watched live across a
+//!     minute rollover, caught the Control Centre clock's own change —
+//!     `AXTitleChanged`/`AXValueChanged`, `owner_pid` matching Control
+//!     Centre's, `AXDescription` reading `"Clock"`, `AXValue` reading the new
+//!     time. Nothing about the item itself is scoped this broad, though:
+//!     watching an application's element also reports notifications from
+//!     anything else mounted under that pid — the same run confirmed an
+//!     unrelated app's still-visible popover text firing `AXValueChanged`
+//!     once a second. [`crate::alias_watch`] is what turns that into a usable
+//!     signal rather than a firehose: one observer per pid that an aliased
+//!     item currently resolves to, and every notification checked against
+//!     both the notified element's own pid (`AXUIElementGetPid`, which is
+//!     what actually rules the unrelated app's traffic out — it does not
+//!     share the aliased item's pid) and its `AXDescription`/`AXTitle`
+//!     against the alias's name, exactly. A miss is silently left to the
+//!     poll; see [`crate::alias_watch`]'s module doc for the full mechanism and its
+//!     honest limits (a disambiguated `(n)` name can never match, for one).
 //!
-//! So this module leans on [`STALE_AFTER`] instead: not a push, but a poll
-//! that also double-checks the window is still the right one whenever it
-//! looks suspiciously unchanging, closing the gap a plain capture-and-hash
-//! loop cannot see on its own (see its doc comment).
+//! [`STALE_AFTER`] is what makes leaning on either of these safe: a poll that
+//! also double-checks the window is still the right one whenever it looks
+//! suspiciously unchanging, closing the gap a plain capture-and-hash loop —
+//! or a plugged-in push notification whose scope has already turned out to
+//! carry noise — cannot see on its own (see its doc comment).
 
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{
     CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
 };
 use objc2_core_graphics::{
-    CGDataProvider, CGImage, CGPreflightScreenCaptureAccess,
-    CGRectMakeWithDictionaryRepresentation, CGRequestScreenCaptureAccess,
-    CGWindowListCopyWindowInfo, CGWindowListOption, kCGWindowBounds, kCGWindowLayer, kCGWindowName,
-    kCGWindowNumber, kCGWindowOwnerName, kCGWindowOwnerPID,
+    CGDataProvider, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo,
+    CGPreflightScreenCaptureAccess, CGRectMakeWithDictionaryRepresentation,
+    CGRequestScreenCaptureAccess, CGWindowListCopyWindowInfo, CGWindowListOption, kCGWindowBounds,
+    kCGWindowLayer, kCGWindowName, kCGWindowNumber, kCGWindowOwnerName, kCGWindowOwnerPID,
 };
 use skylight::{Window, WindowId};
 use std::collections::HashMap;
@@ -217,6 +233,13 @@ pub struct Alias {
     owner: String,
     name: String,
     window: Option<Window>,
+    /// The pid the item last resolved under, kept across an [`invalidate`]
+    /// so [`crate::alias_watch`] can keep watching the last-known owner while a
+    /// fresh resolve is pending, rather than tearing the observer down and
+    /// straight back up.
+    ///
+    /// [`invalidate`]: Alias::invalidate
+    pid: Option<i32>,
 }
 
 impl Alias {
@@ -226,6 +249,7 @@ impl Alias {
             owner: owner.into(),
             name: name.into(),
             window: None,
+            pid: None,
         }
     }
 
@@ -237,6 +261,12 @@ impl Alias {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The pid this item last resolved to, if it ever has.
+    #[must_use]
+    pub fn pid(&self) -> Option<i32> {
+        self.pid
     }
 
     /// Forces the next [`Alias::capture`] to re-resolve the window rather
@@ -278,12 +308,13 @@ impl Alias {
         }
     }
 
-    fn find_window(&self) -> Result<Window> {
-        raw_menu_bar_windows()?
+    fn find_window(&mut self) -> Result<Window> {
+        let found = raw_menu_bar_windows()?
             .into_iter()
             .find(|w| w.owner == self.owner && w.name == self.name)
-            .map(|w| Window::from_existing(w.id))
-            .ok_or(Error::NotFound)
+            .ok_or(Error::NotFound)?;
+        self.pid = Some(found.pid);
+        Ok(Window::from_existing(found.id))
     }
 }
 
@@ -549,19 +580,37 @@ mod ax {
                 if !attribute_bool(child, "AXEnabled").unwrap_or(true) {
                     continue;
                 }
-                let Some(title) = attribute_string(child, "AXTitle") else {
+                // Not an `AXRole == "AXButton"` filter here, deliberately,
+                // even though `alias_watch` uses exactly that to clear
+                // notification noise: measured live, several real,
+                // correctly-attributed items on this machine — OneDrive's,
+                // Spotlight's, Fantastical's own status items among them —
+                // do not report that role from their own `AXExtrasMenuBar`
+                // child, so requiring it here silently dropped them from the
+                // candidate list and collapsed their recovered owner back to
+                // plain "Control Center" for everything. `alias_watch`'s use
+                // is narrower and safe: it only ever discards notifications
+                // already known to share a *watched* pid, not a whole
+                // app's candidacy for owner recovery.
+                //
+                // Control Centre's own children have no `AXTitle` at all —
+                // their identifying string lives in `AXDescription` instead
+                // (confirmed live by `examples/ax_observer_probe.rs`, e.g.
+                // `"Clock"`). `AXDescription` is checked first to match
+                // `alias_watch`'s own precedence.
+                let description =
+                    attribute_string(child, "AXDescription").filter(|d| !d.is_empty());
+                let title = attribute_string(child, "AXTitle").filter(|t| !t.is_empty());
+                let Some(identity) = description.or(title) else {
                     continue;
                 };
-                if title.is_empty() {
-                    continue;
-                }
                 let Some(frame) = attribute_frame(child) else {
                     continue;
                 };
 
                 items.push(ExtrasMenuItem {
                     owner: owner.clone(),
-                    title,
+                    title: identity,
                     pid,
                     frame,
                 });
@@ -705,7 +754,27 @@ mod ax {
 /// A captured menu bar item, ready to draw.
 pub struct Captured {
     pub image: CFRetained<CGImage>,
+    /// The full captured window's size, in points. Most of it is margin —
+    /// measured on the Control Centre clock, 296x60 device px capture, only
+    /// 239x25 is actually inked (the rest is the system's own inter-item
+    /// spacing, baked into the window). Kept in full alongside [`Self::trim`]
+    /// because `image` is drawn at this size; only what a caller lays out
+    /// space for should shrink.
     pub size: CGSize,
+    /// The inked (non-transparent) sub-rectangle within `image`, in the same
+    /// point space as [`Self::size`] — origin measured from the image's own
+    /// top-left corner, y increasing downward. A layout wanting this item's
+    /// real on-screen footprint should use `trim.size`, not `size`, and a
+    /// caller drawing the full image at some destination rect should offset
+    /// that rect's origin by `-trim.origin` so the ink lands where the
+    /// (trimmed-width) layout put it, then clip to the trimmed rect so the
+    /// untrimmed margin does not spill onto a neighbour.
+    ///
+    /// Equal to `CGRect::new(CGPoint::ZERO, size)` — the untrimmed rect —
+    /// when the capture came back fully transparent (a legitimately blank
+    /// item, not zero-width) or in the one pixel format this module does not
+    /// know how to read alpha out of.
+    pub trim: CGRect,
     /// A digest of the pixels, so an unchanged icon can be told from a changed
     /// one. `SketchyBar` re-draws an alias whether or not it moved; a clock
     /// that only changes once a minute should not cost a repaint every second.
@@ -717,7 +786,12 @@ pub struct Captured {
 /// Out of the ECS for the same reason the shaped text is: a `CGImage` is not
 /// `Send`, so it cannot be a component. Keyed by entity alongside it.
 #[derive(Default)]
-pub struct Captures(std::collections::HashMap<bevy_ecs::entity::Entity, Mirror>);
+pub struct Captures {
+    mirrors: std::collections::HashMap<bevy_ecs::entity::Entity, Mirror>,
+    /// Every entity's live AX notification registration, if it has one. See
+    /// [`crate::alias_watch`].
+    watch: crate::alias_watch::AxWatch,
+}
 
 struct Mirror {
     alias: Alias,
@@ -727,6 +801,13 @@ struct Mirror {
     /// Consecutive [`Captures::refresh`] calls in a row that captured the
     /// same digest as `captured`. See [`STALE_AFTER`].
     unchanged: u32,
+    /// Set once an AX notification has actually matched this item — never
+    /// on registration alone. Only once this is true does `refresh` trust
+    /// the push enough to poll it any slower than every tick.
+    confirmed: bool,
+    /// Real captures skipped since the last one, while `confirmed` and
+    /// nothing is dirty. See [`SLOW_FACTOR`].
+    skipped: u32,
 }
 
 /// After this many consecutive unchanged captures, [`Captures::refresh`]
@@ -745,7 +826,31 @@ struct Mirror {
 /// current 500ms poll, this is two minutes — long enough that a legitimately
 /// static icon eats only one extra window-list scan every couple of minutes,
 /// short enough that a genuinely stale mirror does not stay stale for long.
+///
+/// This counts real captures, not ticks, so a `confirmed` alias — one
+/// [`SLOW_FACTOR`] is already stretching to a real capture only once every
+/// twenty ticks — reaches this ceiling roughly twenty times slower in wall
+/// time than an unconfirmed one, with no extra state needed to make that so.
+/// That is a deliberate trade rather than an oversight: the bug this guards
+/// against is a window-server quirk unrelated to whether AX observation is
+/// working, so a confirmed item is not meaningfully less likely to hit it,
+/// only slower to notice it if it does. Accepting that is worth not having
+/// two different staleness policies to reason about. A pid actually dying —
+/// the owning app restarting under a new one — is also caught well before
+/// this ceiling regardless: the next scheduled real capture (at most
+/// [`SLOW_FACTOR`] ticks away) re-resolves the window, notices the pid
+/// changed, and re-points [`crate::alias_watch::AxWatch`] at the new one
+/// through [`crate::alias_watch::AxWatch::sync_one`].
 const STALE_AFTER: u32 = 240;
+
+/// How many [`Captures::refresh`] ticks a `confirmed` alias's real capture is
+/// stretched to once its AX push has actually matched it at least once —
+/// `SLOW_FACTOR * ecs::ALIAS_POLL`, so at the daemon's current 500ms poll,
+/// roughly ten seconds between real captures instead of one every tick.
+/// [`crate::alias_watch::AxWatch::take_dirty`] returning `true` resets this
+/// immediately: a real change is captured on the very next tick, not at the
+/// end of this window.
+const SLOW_FACTOR: u32 = 20;
 
 /// Splits an `Owner,Name` spec. The name may itself contain commas, so only
 /// the first one separates.
@@ -755,45 +860,176 @@ fn split_spec(spec: &str) -> Option<(&str, &str)> {
     (!owner.is_empty() && !name.is_empty()).then_some((owner, name))
 }
 
-fn digest(image: &CGImage) -> u64 {
+/// The byte offset of alpha within one pixel, for the pixel formats this
+/// function actually recognizes — 32 bits per pixel, 8 bits per component,
+/// premultiplied or plain alpha either first or last. `None` for anything
+/// else (including no alpha channel at all, or an alpha-only image), so a
+/// caller falls back to the untrimmed rect rather than guess at a layout it
+/// cannot confirm.
+///
+/// Measured live on this machine: the window server's own screen capture
+/// (`Window::capture`) comes back `PremultipliedFirst` + `Order32Little`,
+/// which puts alpha in the *last* byte of each 4-byte pixel — conceptually
+/// "alpha first" in the 32-bit word, reversed by little-endian storage.
+fn alpha_byte_offset(image: &CGImage) -> Option<usize> {
+    if CGImage::bits_per_pixel(Some(image)) != 32 || CGImage::bits_per_component(Some(image)) != 8 {
+        return None;
+    }
+    let little = CGImage::byte_order_info(Some(image)) == CGImageByteOrderInfo::Order32Little;
+    match CGImage::alpha_info(Some(image)) {
+        CGImageAlphaInfo::PremultipliedFirst | CGImageAlphaInfo::First => {
+            Some(if little { 3 } else { 0 })
+        }
+        CGImageAlphaInfo::PremultipliedLast | CGImageAlphaInfo::Last => {
+            Some(if little { 0 } else { 3 })
+        }
+        _ => None,
+    }
+}
+
+/// What one pass over a capture's raw pixels measures.
+struct Analysis {
+    digest: u64,
+    /// The alpha bounding box, in device pixels, top-left-relative to the
+    /// image. `None` when every pixel was fully transparent, or the pixel
+    /// format wasn't one [`alpha_byte_offset`] recognizes.
+    trim_px: Option<CGRect>,
+}
+
+/// Hashes a capture's pixels and finds its alpha bounding box in the same
+/// pass — the hash already has to walk every byte, so measuring the ink
+/// alongside it costs one extra comparison per pixel rather than a second
+/// full traversal of the buffer.
+fn analyze(image: &CGImage) -> Analysis {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+    let width = CGImage::width(Some(image));
+    let height = CGImage::height(Some(image));
+    let bytes_per_row = CGImage::bytes_per_row(Some(image));
+    let bytes_per_pixel = CGImage::bits_per_pixel(Some(image)) / 8;
+    let alpha_offset = alpha_byte_offset(image);
+
+    let (mut min_x, mut max_x, mut min_y, mut max_y) = (usize::MAX, 0, usize::MAX, 0);
+
     // The pixels, not the object: two captures of an unchanged item are
     // different `CGImage`s with identical contents.
     if let Some(data) = CGDataProvider::data(CGImage::data_provider(Some(image)).as_deref()) {
         // SAFETY: a freshly copied `CFData` nothing else holds, so nothing can
         // mutate it while the slice is alive.
-        unsafe { data.as_bytes_unchecked() }.hash(&mut hasher);
+        let bytes = unsafe { data.as_bytes_unchecked() };
+        for row in 0..height {
+            let start = row * bytes_per_row;
+            let Some(row_bytes) = bytes.get(start..(start + bytes_per_row).min(bytes.len())) else {
+                break;
+            };
+            row_bytes.hash(&mut hasher);
+
+            if let Some(offset) = alpha_offset
+                && bytes_per_pixel > 0
+            {
+                for col in 0..width {
+                    let at = col * bytes_per_pixel + offset;
+                    if row_bytes.get(at).copied().unwrap_or(0) != 0 {
+                        min_x = min_x.min(col);
+                        max_x = max_x.max(col);
+                        min_y = min_y.min(row);
+                        max_y = max_y.max(row);
+                    }
+                }
+            }
+        }
     }
-    CGImage::width(Some(image)).hash(&mut hasher);
-    CGImage::height(Some(image)).hash(&mut hasher);
-    hasher.finish()
+    width.hash(&mut hasher);
+    height.hash(&mut hasher);
+
+    // A menu bar item is at most a few hundred pixels across — nowhere near
+    // f64's exact-integer range — so these are lossless in practice.
+    #[allow(clippy::cast_precision_loss)]
+    let trim_px = (min_x <= max_x && min_y <= max_y).then(|| {
+        CGRect::new(
+            CGPoint::new(min_x as f64, min_y as f64),
+            CGSize::new((max_x + 1 - min_x) as f64, (max_y + 1 - min_y) as f64),
+        )
+    });
+
+    Analysis {
+        digest: hasher.finish(),
+        trim_px,
+    }
+}
+
+/// Converts an alpha bounding box measured in device pixels (see
+/// [`analyze`]) into the point space `size` is already in, falling back to
+/// the full, untrimmed rect when there is nothing to trim to — a fully
+/// transparent capture, or an unrecognized pixel format. Either is a
+/// legitimate state, not a zero-width item that should vanish from the bar.
+fn trim_rect(image: &CGImage, size: CGSize, trim_px: Option<CGRect>) -> CGRect {
+    let full = CGRect::new(CGPoint::ZERO, size);
+    let Some(trim_px) = trim_px else {
+        return full;
+    };
+    let width_px = CGImage::width(Some(image));
+    let height_px = CGImage::height(Some(image));
+    if width_px == 0 || height_px == 0 {
+        return full;
+    }
+    // Same lossless-in-practice cast as `analyze`'s pixel bounds above.
+    #[allow(clippy::cast_precision_loss)]
+    let (scale_x, scale_y) = (size.width / width_px as f64, size.height / height_px as f64);
+    CGRect::new(
+        CGPoint::new(trim_px.origin.x * scale_x, trim_px.origin.y * scale_y),
+        CGSize::new(trim_px.size.width * scale_x, trim_px.size.height * scale_y),
+    )
 }
 
 impl Captures {
     /// Re-captures one item, reporting its digest if what it draws changed.
     ///
-    /// `None` means nothing to redraw — either the capture failed, or it came
-    /// back identical, which is what most re-captures do.
+    /// `None` means nothing to redraw — either the capture failed, it came
+    /// back identical (most re-captures do), or this tick was skipped
+    /// because a confirmed AX push says nothing has changed (see
+    /// [`SLOW_FACTOR`]).
     pub fn refresh(&mut self, entity: bevy_ecs::entity::Entity, spec: &str) -> Option<u64> {
         let Some((owner, name)) = split_spec(spec) else {
             tracing::warn!(spec, "an alias is written `Owner,Name`");
             return None;
         };
 
-        let mirror = match self.0.get_mut(&entity) {
+        let mirror = match self.mirrors.get_mut(&entity) {
             Some(mirror) if mirror.spec == spec => mirror,
-            _ => self
-                .0
-                .entry(entity)
-                .insert_entry(Mirror {
-                    alias: Alias::new(owner, name),
-                    spec: spec.to_owned(),
-                    captured: None,
-                    unchanged: 0,
-                })
-                .into_mut(),
+            _ => {
+                self.watch.forget(entity);
+                self.mirrors
+                    .entry(entity)
+                    .insert_entry(Mirror {
+                        alias: Alias::new(owner, name),
+                        spec: spec.to_owned(),
+                        captured: None,
+                        unchanged: 0,
+                        confirmed: false,
+                        skipped: 0,
+                    })
+                    .into_mut()
+            }
         };
+
+        if self.watch.take_dirty(entity) {
+            tracing::debug!(
+                spec,
+                "an AX notification marked this alias dirty; re-capturing now"
+            );
+            mirror.confirmed = true;
+            mirror.skipped = 0;
+        } else if mirror.confirmed {
+            if mirror.skipped < SLOW_FACTOR {
+                mirror.skipped += 1;
+                self.watch
+                    .sync_one(entity, mirror.alias.name(), mirror.alias.pid());
+                return None;
+            }
+            mirror.skipped = 0;
+        }
 
         if mirror.unchanged >= STALE_AFTER {
             mirror.alias.invalidate();
@@ -808,7 +1044,10 @@ impl Captures {
             }
         };
 
-        let digest = digest(&capture.image);
+        self.watch
+            .sync_one(entity, mirror.alias.name(), mirror.alias.pid());
+
+        let Analysis { digest, trim_px } = analyze(&capture.image);
         if mirror
             .captured
             .as_ref()
@@ -818,9 +1057,11 @@ impl Captures {
             return None;
         }
         mirror.unchanged = 0;
+        let trim = trim_rect(&capture.image, capture.size, trim_px);
         mirror.captured = Some(Captured {
             image: capture.image,
             size: capture.size,
+            trim,
             digest,
         });
         Some(digest)
@@ -828,10 +1069,11 @@ impl Captures {
 
     #[must_use]
     pub fn get(&self, entity: bevy_ecs::entity::Entity) -> Option<&Captured> {
-        self.0.get(&entity)?.captured.as_ref()
+        self.mirrors.get(&entity)?.captured.as_ref()
     }
 
     pub fn forget(&mut self, entity: bevy_ecs::entity::Entity) {
-        self.0.remove(&entity);
+        self.mirrors.remove(&entity);
+        self.watch.forget(entity);
     }
 }

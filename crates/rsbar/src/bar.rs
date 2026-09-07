@@ -371,6 +371,18 @@ pub fn fill_rounded_rect(
 /// frames it laid out, and `CGContext::draw_image` takes its rect in the
 /// context's own space — so the flip has to be undone around the image, or a
 /// mirrored menu bar item comes out upside down.
+/// The same, with the drawing confined to `visible`.
+///
+/// A captured menu bar item is mostly transparent margin, and `rect` is the
+/// whole capture — so without the clip the margin of one alias reaches across
+/// its neighbour.
+pub fn draw_image_clipped(ctx: &CGContext, rect: CGRect, visible: CGRect, image: &CGImage) {
+    CGContext::save_g_state(Some(ctx));
+    CGContext::clip_to_rect(Some(ctx), visible);
+    draw_image(ctx, rect, image);
+    CGContext::restore_g_state(Some(ctx));
+}
+
 pub fn draw_image(ctx: &CGContext, rect: CGRect, image: &CGImage) {
     CGContext::save_g_state(Some(ctx));
     CGContext::translate_ctm(Some(ctx), 0.0, rect.origin.y + rect.size.height);

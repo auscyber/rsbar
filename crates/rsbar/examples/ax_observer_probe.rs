@@ -5,10 +5,16 @@
 //!
 //! Usage: `cargo run -p rsbar --example ax_observer_probe -- <owner> <name>`,
 //! e.g. `ax_observer_probe "Control Centre" Clock`. Defaults to that.
+//! `NARROW=1` registers only `AXValueChanged`/`AXTitleChanged` instead of the
+//! full sweep of every `AXNotificationConstants.h` name below, to check
+//! whether the broad list was doing any work; it was not — the same two
+//! notifications fire either way, which is why `alias_watch` only asks for
+//! those two.
 //!
 //! # Result (macOS 26.5.1, this machine)
 //!
-//! **No.** Three things were checked, in order:
+//! **Yes, once scoped to the right pid and filtered by identity.** Four
+//! things were checked, in order:
 //!
 //! 1. Adding the notification directly to the extras item's own
 //!    `AXUIElement` (role `AXMenuBarItem`) is rejected outright with
@@ -19,27 +25,38 @@
 //!    all, not a registration that silently never fires.
 //! 2. Adding the *same* notifications to the owning application's top-level
 //!    element, or to its `AXExtrasMenuBar` container, is accepted
-//!    (`AXError::Success`). But watching through a full 130s run spanning a
-//!    minute rollover, the clock's own change never produces a callback.
-//! 3. What *does* fire at that broader scope is a firehose of unrelated
-//!    `AXValueChanged` notifications — observed once a second, sourced from
-//!    Amphetamine's still-mounted (but not currently visible) popover text,
-//!    confirmed via `AXUIElementGetPid` to actually belong to *Amphetamine's*
-//!    process, despite the observer having been created for Control Centre's
-//!    pid. AX observers on this system are not scoped to the pid they were
-//!    created for once a run loop source is added; they see notifications
-//!    system-wide from any element with live accessibility observers of its
-//!    own kind. That rules this scope out even as a noisy fallback — it does
-//!    not report the collapsed menu bar icon changing, only whatever full
-//!    controls happen to be mounted elsewhere.
+//!    (`AXError::Success`) — and it fires. Watched live across a minute
+//!    rollover, this exact run caught:
+//!    ```text
+//!    AX notification fired: AXTitleChanged owner_pid=762 (AXError(0)) role=Some("AXButton") title=None desc=Some("Clock") value=Some("Mon 7 Sep  4:20 pm")
+//!    AX notification fired: AXValueChanged owner_pid=762 (AXError(0)) role=Some("AXButton") title=None desc=Some("Clock") value=Some("Mon 7 Sep  4:20 pm")
+//!    ```
+//!    at the minute boundary itself — the Control Centre clock's own change,
+//!    identifiable by `AXDescription` reading `"Clock"`.
+//! 3. What *also* fires at that same broad scope is unrelated traffic: a
+//!    different app's still-mounted (but not currently visible) popover text,
+//!    `AXValueChanged` roughly once a second, `AXDescription` empty,
+//!    delivered to an observer that was created for Control Centre's pid.
+//!    `AXUIElementGetPid` on the *notified element* gives that element's own,
+//!    real pid, and it does not match the pid the observer was created for —
+//!    which is the check that throws this traffic out without throwing out
+//!    the clock's. A consumer has to make that check itself; nothing filters
+//!    it upstream.
+//! 4. The system-wide element and the item's own children were also tried,
+//!    for completeness: the former accepts no notification, the latter has
+//!    no children to add one to.
 //!
 //! Bonus finding along the way: Control Centre's own extras-bar children have
 //! no `AXTitle` at all (`None` for all 17 checked) — the identifying string
 //! lives in `AXDescription` instead (e.g. `"Clock"`), and `AXValue` already
 //! holds the live rendered text (`"Mon 7 Sep  3:59 pm"`). `alias.rs`'s
-//! `ax::enumerate_extras_menu_items` currently filters on `AXTitle` only, so
-//! it silently drops every genuinely Control Centre-native module from its
-//! candidate list before position-matching even runs.
+//! `ax::enumerate_extras_menu_items` used to filter on `AXTitle` only, silently
+//! dropping every genuinely Control Centre-native module from its candidate
+//! list before position-matching ever ran; it now accepts `AXDescription`
+//! too. `crate::alias_watch` is where the pid- and identity-filtered observer
+//! this result implies actually lives.
+
+#![allow(clippy::too_many_lines)]
 
 use objc2_app_kit::NSWorkspace;
 use objc2_application_services::{AXError, AXObserver, AXUIElement, AXValue, AXValueType};
@@ -144,12 +161,16 @@ fn find(owner: &str, name: &str) -> Option<(i32, CFRetained<AXUIElement>)> {
             let desc = attribute_string(child, "AXDescription");
             let frame = attribute_frame(child);
             let value = attribute_string(child, "AXValue");
+            let role = attribute_string(child, "AXRole");
             println!(
-                "    child[{i}] title={title:?} desc={desc:?} value={value:?} frame={frame:?}"
+                "    child[{i}] role={role:?} title={title:?} desc={desc:?} value={value:?} frame={frame:?}"
             );
             let identity = title.as_deref().or(desc.as_deref());
             if identity == Some(name) {
-                println!("found element: identity={identity:?} frame={frame:?}");
+                println!(
+                    "found element: identity={identity:?} role={:?} frame={frame:?}",
+                    attribute_string(child, "AXRole")
+                );
                 return Some((pid, child.retain()));
             }
         }
@@ -157,7 +178,52 @@ fn find(owner: &str, name: &str) -> Option<(i32, CFRetained<AXUIElement>)> {
     None
 }
 
-const NOTIFICATIONS: &[&str] = &["AXValueChanged", "AXTitleChanged", "AXUIElementDestroyed"];
+/// Every notification name in Apple's public `AXNotificationConstants.h`,
+/// not just the two or three that seemed relevant — tried against every
+/// element this probe can reach, per the request to be exhaustive rather
+/// than assume the rest would also be rejected.
+const NOTIFICATIONS: &[&str] = &[
+    "AXMainWindowChanged",
+    "AXFocusedWindowChanged",
+    "AXFocusedUIElementChanged",
+    "AXFocusedTabChanged",
+    "AXApplicationActivated",
+    "AXApplicationDeactivated",
+    "AXApplicationHidden",
+    "AXApplicationShown",
+    "AXWindowCreated",
+    "AXWindowMoved",
+    "AXWindowResized",
+    "AXWindowMiniaturized",
+    "AXWindowDeminiaturized",
+    "AXDrawerCreated",
+    "AXSheetCreated",
+    "AXUIElementDestroyed",
+    "AXValueChanged",
+    "AXTitleChanged",
+    "AXResized",
+    "AXMoved",
+    "AXCreated",
+    "AXMenuOpened",
+    "AXMenuClosed",
+    "AXMenuItemSelected",
+    "AXRowCountChanged",
+    "AXRowExpanded",
+    "AXRowCollapsed",
+    "AXSelectedCellsChanged",
+    "AXUnitsChanged",
+    "AXSelectedChildrenMoved",
+    "AXSelectedChildrenChanged",
+    "AXSelectedRowsChanged",
+    "AXSelectedColumnsChanged",
+    "AXSelectedTextChanged",
+    "AXLayoutChanged",
+    "AXAnnouncementRequested",
+    "AXHelpTagCreated",
+    "AXElementBusyChanged",
+    "AXPriorityChanged",
+    "AXLoadComplete",
+];
 
 extern "C-unwind" fn on_notification(
     _observer: NonNull<AXObserver>,
@@ -189,6 +255,14 @@ fn main() {
     } else {
         ("Control Centre".to_owned(), "Clock".to_owned())
     };
+    // NARROW=1: register only AXValueChanged/AXTitleChanged, to isolate
+    // whether the full 39-notification list was what made delivery work, or
+    // whether it would have worked with just the two relevant names anyway.
+    let notifications: &[&str] = if std::env::var("NARROW").as_deref() == Ok("1") {
+        &["AXValueChanged", "AXTitleChanged"]
+    } else {
+        NOTIFICATIONS
+    };
 
     println!(
         "accessibility_trusted = {}",
@@ -200,6 +274,30 @@ fn main() {
         std::process::exit(1);
     };
     println!("pid={pid}");
+
+    // Does the item itself have children (a sub-element that might accept a
+    // notification even though the AXMenuBarItem parent flatly refuses one)?
+    let children = copy_array(&element, "AXChildren");
+    println!(
+        "item AXChildren: {:?}",
+        children.as_ref().map(|c| c.count())
+    );
+    let mut child_elements: Vec<CFRetained<AXUIElement>> = Vec::new();
+    if let Some(children) = &children {
+        for i in 0..children.count() {
+            let Some(child) = (unsafe { array_element(children, i) }) else {
+                continue;
+            };
+            println!(
+                "  child[{i}] role={:?} title={:?} desc={:?} value={:?}",
+                attribute_string(child, "AXRole"),
+                attribute_string(child, "AXTitle"),
+                attribute_string(child, "AXDescription"),
+                attribute_string(child, "AXValue"),
+            );
+            child_elements.push(child.retain());
+        }
+    }
 
     let mut observer_ptr: *mut AXObserver = std::ptr::null_mut();
     // SAFETY: `pid` is live; `observer_ptr` is a valid out-pointer.
@@ -223,7 +321,7 @@ fn main() {
         }
     }
 
-    for notif_name in NOTIFICATIONS {
+    for notif_name in notifications {
         let notif = CFString::from_str(notif_name);
         // SAFETY: `element` and `notif` are both live for the call; refcon is
         // unused by this probe.
@@ -231,16 +329,25 @@ fn main() {
         println!("[on item] add_notification({notif_name}) -> {status:?}");
     }
 
+    for (i, child) in child_elements.iter().enumerate() {
+        for notif_name in notifications {
+            let notif = CFString::from_str(notif_name);
+            // SAFETY: `child` and `notif` are both live for the call.
+            let status = unsafe { observer.add_notification(child, &notif, std::ptr::null_mut()) };
+            println!("[on child[{i}]] add_notification({notif_name}) -> {status:?}");
+        }
+    }
+
     // SAFETY: pid is live.
     let app_element = unsafe { AXUIElement::new_application(pid) };
-    for notif_name in NOTIFICATIONS {
+    for notif_name in notifications {
         let notif = CFString::from_str(notif_name);
         let status =
             unsafe { observer.add_notification(&app_element, &notif, std::ptr::null_mut()) };
         println!("[on app] add_notification({notif_name}) -> {status:?}");
     }
     if let Some(extras) = copy_element(&app_element, "AXExtrasMenuBar") {
-        for notif_name in NOTIFICATIONS {
+        for notif_name in notifications {
             let notif = CFString::from_str(notif_name);
             let status =
                 unsafe { observer.add_notification(&extras, &notif, std::ptr::null_mut()) };
@@ -248,12 +355,22 @@ fn main() {
         }
     }
 
+    // SAFETY: takes no arguments.
+    let system_wide = unsafe { AXUIElement::new_system_wide() };
+    for notif_name in notifications {
+        let notif = CFString::from_str(notif_name);
+        let status =
+            unsafe { observer.add_notification(&system_wide, &notif, std::ptr::null_mut()) };
+        println!("[on system-wide] add_notification({notif_name}) -> {status:?}");
+    }
+
     println!(
-        "pumping for 130s (pid {}); wait for the clock to tick over a minute",
+        "pumping for 150s (pid {}); guarantees a real minute rollover no matter when this \
+         started — wait for the clock to tick over a minute",
         std::process::id()
     );
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(130) {
+    while start.elapsed() < Duration::from_secs(150) {
         // SAFETY: plain CoreFoundation call on this thread's run loop.
         unsafe {
             CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, 1.0, true);

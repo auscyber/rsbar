@@ -2,6 +2,7 @@
 //! drives them.
 
 pub mod alias;
+mod alias_watch;
 pub mod bar;
 pub mod components;
 pub mod config;

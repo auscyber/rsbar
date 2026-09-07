@@ -35,7 +35,11 @@ pub type ItemQuery<'w, 's> = Query<
 /// How wide an alias's mirrored image is, or nothing if it is not an alias.
 fn alias_width(captures: &Captures, entity: Entity, padding: &Padding) -> Option<f64> {
     let mirrored = captures.get(entity)?;
-    Some(padding.left + mirrored.size.width + padding.right)
+    // The inked width, not the captured window's. A menu bar extra's window
+    // carries the system's own inter-item spacing — on the clock, only 81% of
+    // it is ink — and laying that out put a visible gap either side of every
+    // alias, twice over between two of them.
+    Some(padding.left + mirrored.trim.size.width + padding.right)
 }
 
 /// How wide an item is, padding included.
@@ -447,19 +451,29 @@ fn paint_panels(
 
                     // An alias draws what it mirrors, and nothing else.
                     if let Some(captured) = captures.get(entity) {
-                        // Centred in the item rather than hung from its top
-                        // edge. A menu bar extra is captured at the menu bar's
-                        // height, which is not the bar's, so aligning the two
-                        // tops sits it visibly higher than the text beside it.
-                        let slack = (frame.size.height - captured.size.height) / 2.0;
-                        let box_ = CGRect::new(
+                        // Centred on the ink, not on the captured window, and
+                        // drawn offset by the trim so the ink lands at the
+                        // padded origin. The margin still exists in the image,
+                        // so the draw is clipped to the inked size to keep it
+                        // off the neighbour.
+                        let slack = (frame.size.height - captured.trim.size.height) / 2.0;
+                        let ink = CGPoint::new(
+                            frame.origin.x + padding.left,
+                            frame.origin.y + offset.0 + slack,
+                        );
+                        let whole = CGRect::new(
                             CGPoint::new(
-                                frame.origin.x + padding.left,
-                                frame.origin.y + offset.0 + slack,
+                                ink.x - captured.trim.origin.x,
+                                ink.y - captured.trim.origin.y,
                             ),
                             captured.size,
                         );
-                        crate::bar::draw_image(ctx, box_, &captured.image);
+                        crate::bar::draw_image_clipped(
+                            ctx,
+                            whole,
+                            CGRect::new(ink, captured.trim.size),
+                            &captured.image,
+                        );
                         continue;
                     }
 
