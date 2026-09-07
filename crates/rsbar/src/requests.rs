@@ -746,3 +746,82 @@ fn patched_background(current: &Background, patch: Option<&BackgroundPatch>) -> 
 }
 
 const _: fn(&Run) = |_| {};
+
+#[cfg(test)]
+mod patch_tests {
+    use super::{patched_background, patched_run};
+    use crate::components::{Background, Run};
+    use rsbar_protocol::style::Color;
+    use rsbar_protocol::{BackgroundPatch, RunPatch};
+
+    fn background() -> Background {
+        Background {
+            color: Color(0xff11_2233),
+            corner_radius: 4.0,
+            height: 20.0,
+            padding_left: 2.0,
+            padding_right: 3.0,
+            border_color: Color(0xff44_5566),
+            border_width: 1.5,
+        }
+    }
+
+    /// `Mut::as_mut` marks a component changed the moment it is touched,
+    /// whatever is then written — so re-applying the value a background
+    /// already has must be caught here, before the write, or every one of
+    /// these new fields would repaint the bar for as long as a script kept
+    /// re-setting them.
+    #[test]
+    fn a_background_patch_matching_every_current_field_changes_nothing() {
+        let current = background();
+        let patch = BackgroundPatch {
+            color: Some(current.color.0),
+            corner_radius: Some(current.corner_radius),
+            height: Some(current.height),
+            padding_left: Some(current.padding_left),
+            padding_right: Some(current.padding_right),
+            border_color: Some(current.border_color.0),
+            border_width: Some(current.border_width),
+        };
+        assert_eq!(patched_background(&current, Some(&patch)), None);
+    }
+
+    #[test]
+    fn a_background_patch_moving_one_new_field_is_reported() {
+        let current = background();
+        let patch = BackgroundPatch {
+            border_width: Some(current.border_width + 1.0),
+            ..BackgroundPatch::default()
+        };
+        let next = patched_background(&current, Some(&patch)).expect("border width moved");
+        assert!((next.border_width - (current.border_width + 1.0)).abs() < 1e-9);
+        assert!(
+            (next.height - current.height).abs() < 1e-9,
+            "nothing else should move"
+        );
+    }
+
+    #[test]
+    fn a_run_patch_matching_its_current_padding_changes_nothing() {
+        let mut current = Run::new("Menlo:Regular:13", Color::WHITE);
+        current.padding_left = 4.0;
+        current.padding_right = 6.0;
+        let patch = RunPatch {
+            padding_left: Some(current.padding_left),
+            padding_right: Some(current.padding_right),
+            ..RunPatch::default()
+        };
+        assert_eq!(patched_run(&current, Some(&patch)), None);
+    }
+
+    #[test]
+    fn a_run_patch_widening_its_padding_is_reported() {
+        let current = Run::new("Menlo:Regular:13", Color::WHITE);
+        let patch = RunPatch {
+            padding_left: Some(5.0),
+            ..RunPatch::default()
+        };
+        let next = patched_run(&current, Some(&patch)).expect("padding moved");
+        assert!((next.padding_left - 5.0).abs() < 1e-9);
+    }
+}

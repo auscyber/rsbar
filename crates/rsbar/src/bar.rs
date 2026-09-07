@@ -327,9 +327,33 @@ fn new_window(
     Ok(window)
 }
 
+/// Traces a rectangle whose corners are rounded, falling back to a plain
+/// rectangle when the radius is zero — building arcs for a square corner is
+/// wasted work on the repaint path. Leaves the path open for the caller to
+/// fill, stroke, or both.
+fn rounded_rect_path(ctx: &objc2_core_graphics::CGContext, rect: CGRect, radius: f64) {
+    use objc2_core_graphics::CGContext;
+    let radius = radius
+        .min(rect.size.width / 2.0)
+        .min(rect.size.height / 2.0);
+    CGContext::begin_path(Some(ctx));
+    if radius <= 0.0 {
+        CGContext::add_rect(Some(ctx), rect);
+        return;
+    }
+
+    let (x, y) = (rect.origin.x, rect.origin.y);
+    let (w, h) = (rect.size.width, rect.size.height);
+    CGContext::move_to_point(Some(ctx), x + radius, y);
+    CGContext::add_arc_to_point(Some(ctx), x + w, y, x + w, y + h, radius);
+    CGContext::add_arc_to_point(Some(ctx), x + w, y + h, x, y + h, radius);
+    CGContext::add_arc_to_point(Some(ctx), x, y + h, x, y, radius);
+    CGContext::add_arc_to_point(Some(ctx), x, y, x + w, y, radius);
+    CGContext::close_path(Some(ctx));
+}
+
 /// Fills a rectangle whose corners are rounded, falling back to a plain fill
-/// when the radius is zero — building a path for a square corner is wasted work
-/// on the repaint path.
+/// when the radius is zero.
 pub fn fill_rounded_rect(
     ctx: &objc2_core_graphics::CGContext,
     rect: CGRect,
@@ -344,25 +368,30 @@ pub fn fill_rounded_rect(
         color.blue(),
         color.alpha(),
     );
-
-    let radius = radius
-        .min(rect.size.width / 2.0)
-        .min(rect.size.height / 2.0);
-    if radius <= 0.0 {
-        CGContext::fill_rect(Some(ctx), rect);
-        return;
-    }
-
-    let (x, y) = (rect.origin.x, rect.origin.y);
-    let (w, h) = (rect.size.width, rect.size.height);
-    CGContext::begin_path(Some(ctx));
-    CGContext::move_to_point(Some(ctx), x + radius, y);
-    CGContext::add_arc_to_point(Some(ctx), x + w, y, x + w, y + h, radius);
-    CGContext::add_arc_to_point(Some(ctx), x + w, y + h, x, y + h, radius);
-    CGContext::add_arc_to_point(Some(ctx), x, y + h, x, y, radius);
-    CGContext::add_arc_to_point(Some(ctx), x, y, x + w, y, radius);
-    CGContext::close_path(Some(ctx));
+    rounded_rect_path(ctx, rect, radius);
     CGContext::fill_path(Some(ctx));
+}
+
+/// Strokes a rectangle whose corners are rounded, the same path
+/// [`fill_rounded_rect`] would fill.
+pub fn stroke_rounded_rect(
+    ctx: &objc2_core_graphics::CGContext,
+    rect: CGRect,
+    radius: f64,
+    color: Color,
+    width: f64,
+) {
+    use objc2_core_graphics::CGContext;
+    CGContext::set_rgb_stroke_color(
+        Some(ctx),
+        color.red(),
+        color.green(),
+        color.blue(),
+        color.alpha(),
+    );
+    CGContext::set_line_width(Some(ctx), width);
+    rounded_rect_path(ctx, rect, radius);
+    CGContext::stroke_path(Some(ctx));
 }
 
 /// Draws a captured image into a top-left oriented context.

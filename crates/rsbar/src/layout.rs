@@ -6,7 +6,7 @@
 )]
 
 use crate::alias::Captures;
-use crate::bar::{Panels, Settings, fill_rounded_rect};
+use crate::bar::{Panels, Settings, fill_rounded_rect, stroke_rounded_rect};
 use crate::components::{
     AliasContent, Background, Drawing, Icon, Label, Members, Name, Offset, Padding, Placement,
 };
@@ -51,6 +51,10 @@ fn alias_width(captures: &Captures, entity: Entity, padding: &Padding) -> Option
 }
 
 /// How wide an item is, padding included.
+///
+/// Mirrors the draw order in `paint_panels` exactly: each run's own padding is
+/// added on top of the item's, so an icon or label that sets it does not drift
+/// out of the background this same width sizes.
 fn width(cache: &Cache, entity: Entity, icon: &Icon, label: &Label, padding: &Padding) -> f64 {
     let Some(shaped) = cache.get(entity) else {
         return padding.left + padding.right;
@@ -58,12 +62,12 @@ fn width(cache: &Cache, entity: Entity, icon: &Icon, label: &Label, padding: &Pa
     let icon_w = if icon.0.is_empty() {
         0.0
     } else {
-        shaped.icon_metrics().width
+        icon.0.padding_left + shaped.icon_metrics().width + icon.0.padding_right
     };
     let label_w = if label.0.is_empty() {
         0.0
     } else {
-        shaped.label_metrics().width
+        label.0.padding_left + shaped.label_metrics().width + label.0.padding_right
     };
     let between = if icon_w > 0.0 && label_w > 0.0 {
         padding.between
@@ -71,6 +75,21 @@ fn width(cache: &Cache, entity: Entity, icon: &Icon, label: &Label, padding: &Pa
         0.0
     };
     padding.left + icon_w + between + label_w + padding.right
+}
+
+/// Where an item's background actually sits, `frame` inset by its own padding
+/// and, when it sets a fixed height, shrunk and centred within the frame —
+/// which is how a pill sits inside a taller bar with a margin above and below.
+fn background_rect(frame: CGRect, background: &Background) -> CGRect {
+    let height = if background.height > 0.0 {
+        background.height.min(frame.size.height)
+    } else {
+        frame.size.height
+    };
+    let y = frame.origin.y + (frame.size.height - height) / 2.0;
+    let width = (frame.size.width - background.padding_left - background.padding_right).max(0.0);
+    let x = frame.origin.x + background.padding_left;
+    CGRect::new(CGPoint::new(x, y), CGSize::new(width, height))
 }
 
 /// One item, reduced to what layout actually needs.
@@ -454,6 +473,103 @@ fn intersects(a: CGRect, b: CGRect) -> bool {
         && b.origin.y < a.origin.y + a.size.height
 }
 
+/// Draws one item's background, and then its content — an alias's mirrored
+/// image, a bracket's nothing, or its own icon and label.
+///
+/// Returns whether it found shaped text to draw against, so the caller can
+/// count what actually got painted.
+fn draw_item(
+    ctx: &objc2_core_graphics::CGContext,
+    cache: &Cache,
+    captures: &Captures,
+    items: &ItemQuery,
+    entity: Entity,
+    frame: CGRect,
+) -> bool {
+    let Ok(row) = items.get(entity) else {
+        return false;
+    };
+    let (icon, label, background, padding, offset, members) = (
+        row.icon,
+        row.label,
+        row.background,
+        row.padding,
+        row.offset,
+        row.members,
+    );
+    let Some(shaped) = cache.get(entity) else {
+        return false;
+    };
+
+    let surface = background_rect(frame, background);
+    if !background.color.is_invisible() {
+        fill_rounded_rect(ctx, surface, background.corner_radius, background.color);
+    }
+    if background.border_width > 0.0 && !background.border_color.is_invisible() {
+        stroke_rounded_rect(
+            ctx,
+            surface,
+            background.corner_radius,
+            background.border_color,
+            background.border_width,
+        );
+    }
+
+    // A bracket is its background and nothing else — it has no text of its
+    // own, and drawing its members' is their job.
+    if members.is_some() {
+        return true;
+    }
+
+    // An alias draws what it mirrors, and nothing else.
+    if let Some(captured) = captures.get(entity) {
+        // Centred on the ink, not on the captured window, and drawn offset by
+        // the trim so the ink lands at the padded origin. The margin still
+        // exists in the image, so the draw is clipped to the inked size to
+        // keep it off the neighbour.
+        let slack = (frame.size.height - captured.trim.size.height) / 2.0;
+        let ink = CGPoint::new(
+            frame.origin.x + padding.left,
+            frame.origin.y + offset.0 + slack,
+        );
+        let whole = CGRect::new(
+            CGPoint::new(
+                ink.x - captured.trim.origin.x,
+                ink.y - captured.trim.origin.y,
+            ),
+            captured.size,
+        );
+        crate::bar::draw_image_clipped(
+            ctx,
+            whole,
+            CGRect::new(ink, captured.trim.size),
+            &captured.image,
+        );
+        return true;
+    }
+
+    let mut x = frame.origin.x + padding.left;
+    let y = frame.origin.y + offset.0;
+    let both = !icon.0.is_empty() && !label.0.is_empty();
+    if !icon.0.is_empty() {
+        x += icon.0.padding_left;
+        let w = shaped.icon_metrics().width;
+        let box_ = CGRect::new(CGPoint::new(x, y), CGSize::new(w, frame.size.height));
+        shaped.draw_icon(ctx, box_, icon.0.color);
+        x += w + icon.0.padding_right;
+        if both {
+            x += padding.between;
+        }
+    }
+    if !label.0.is_empty() {
+        x += label.0.padding_left;
+        let w = shaped.label_metrics().width;
+        let box_ = CGRect::new(CGPoint::new(x, y), CGSize::new(w, frame.size.height));
+        shaped.draw_label(ctx, box_, label.0.color);
+    }
+    true
+}
+
 fn paint_panels(
     items: &ItemQuery,
     cache: &Cache,
@@ -496,75 +612,8 @@ fn paint_panels(
                     {
                         continue;
                     }
-                    let Ok(row) = items.get(entity) else {
-                        continue;
-                    };
-                    let (icon, label, background, padding, offset, members) = (
-                        row.icon,
-                        row.label,
-                        row.background,
-                        row.padding,
-                        row.offset,
-                        row.members,
-                    );
-                    let Some(shaped) = cache.get(entity) else {
-                        continue;
-                    };
-                    drawn += 1;
-
-                    if !background.color.is_invisible() {
-                        fill_rounded_rect(ctx, frame, background.corner_radius, background.color);
-                    }
-
-                    // A bracket is its background and nothing else — it has
-                    // no text of its own, and drawing its members' is their
-                    // job.
-                    if members.is_some() {
-                        continue;
-                    }
-
-                    // An alias draws what it mirrors, and nothing else.
-                    if let Some(captured) = captures.get(entity) {
-                        // Centred on the ink, not on the captured window, and
-                        // drawn offset by the trim so the ink lands at the
-                        // padded origin. The margin still exists in the image,
-                        // so the draw is clipped to the inked size to keep it
-                        // off the neighbour.
-                        let slack = (frame.size.height - captured.trim.size.height) / 2.0;
-                        let ink = CGPoint::new(
-                            frame.origin.x + padding.left,
-                            frame.origin.y + offset.0 + slack,
-                        );
-                        let whole = CGRect::new(
-                            CGPoint::new(
-                                ink.x - captured.trim.origin.x,
-                                ink.y - captured.trim.origin.y,
-                            ),
-                            captured.size,
-                        );
-                        crate::bar::draw_image_clipped(
-                            ctx,
-                            whole,
-                            CGRect::new(ink, captured.trim.size),
-                            &captured.image,
-                        );
-                        continue;
-                    }
-
-                    let mut x = frame.origin.x + padding.left;
-                    let y = frame.origin.y + offset.0;
-                    if !icon.0.is_empty() {
-                        let w = shaped.icon_metrics().width;
-                        let box_ =
-                            CGRect::new(CGPoint::new(x, y), CGSize::new(w, frame.size.height));
-                        shaped.draw_icon(ctx, box_, icon.0.color);
-                        x += w + padding.between;
-                    }
-                    if !label.0.is_empty() {
-                        let w = shaped.label_metrics().width;
-                        let box_ =
-                            CGRect::new(CGPoint::new(x, y), CGSize::new(w, frame.size.height));
-                        shaped.draw_label(ctx, box_, label.0.color);
+                    if draw_item(ctx, cache, captures, items, entity, frame) {
+                        drawn += 1;
                     }
                 }
             });
@@ -760,6 +809,77 @@ mod tests {
     #[test]
     fn an_empty_bar_places_nothing() {
         assert!(arrange::<u8>(&[], 200.0).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::width;
+    use crate::components::{Icon, Label, Padding, Run};
+    use crate::shaping::Cache;
+    use bevy_ecs::entity::Entity;
+    use rsbar_protocol::style::Color;
+
+    fn entity() -> Entity {
+        Entity::from_raw_u32(1).expect("a valid entity index")
+    }
+
+    fn padding() -> Padding {
+        Padding {
+            left: 0.0,
+            right: 0.0,
+            between: 0.0,
+        }
+    }
+
+    /// The draw path adds a run's own padding on top of its metrics; layout
+    /// must add exactly the same amount, or the background it sizes stops
+    /// wrapping the text it was sized for.
+    #[test]
+    fn a_runs_own_padding_widens_the_item_by_exactly_that_much() {
+        let mut cache = Cache::default();
+        let id = entity();
+        let icon = Icon(Run::new("Menlo:Regular:13", Color::WHITE));
+        let mut label = Label(Run::new("Menlo:Regular:13", Color::WHITE));
+        label.0.string = "hi".into();
+        cache.refresh(id, &icon.0, &label.0);
+        let bare = width(&cache, id, &icon, &label, &padding());
+
+        let mut padded_label = label.clone();
+        padded_label.0.padding_left = 4.0;
+        padded_label.0.padding_right = 6.0;
+        cache.refresh(id, &icon.0, &padded_label.0);
+        let padded = width(&cache, id, &icon, &padded_label, &padding());
+
+        assert!(
+            (padded - bare - 10.0).abs() < 1e-9,
+            "label padding must add exactly to the item's width"
+        );
+    }
+
+    /// [`Run::is_empty`] already takes a hidden or empty run out of layout —
+    /// its own padding must go with it, or an icon-only item gets a phantom
+    /// gap where a label with padding but no text would have sat.
+    #[test]
+    fn a_hidden_runs_own_padding_contributes_nothing() {
+        let mut cache = Cache::default();
+        let id = entity();
+        let mut icon = Icon(Run::new("Menlo:Regular:13", Color::WHITE));
+        icon.0.string = "A".into();
+        let label = Label(Run::new("Menlo:Regular:13", Color::WHITE));
+        cache.refresh(id, &icon.0, &label.0);
+        let base = width(&cache, id, &icon, &label, &padding());
+
+        let mut padded_label = label.clone();
+        padded_label.0.padding_left = 50.0;
+        padded_label.0.padding_right = 50.0;
+        cache.refresh(id, &icon.0, &padded_label.0);
+        let same = width(&cache, id, &icon, &padded_label, &padding());
+
+        assert!(
+            (same - base).abs() < 1e-9,
+            "an empty label takes no space no matter its own padding"
+        );
     }
 }
 
@@ -1022,6 +1142,44 @@ mod damage_tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn an_items_own_padding_growing_damages_both_its_old_and_new_rect() {
+        // A run's own padding (icon.padding_left, label.padding_right, …)
+        // widens the item itself via `width`, not a neighbour — this is the
+        // "resized in place" branch of `damage`, exercised without the entity
+        // needing to appear in `changed`: the geometry differing is what
+        // matters, whatever caused it.
+        let before = was(vec![(entity(1), rect(0.0, 100.0))]);
+        let nothing = HashSet::new();
+        let torn = damage(
+            &pass(&before, &nothing),
+            DISPLAY,
+            panel(),
+            &[(entity(1), rect(0.0, 108.0))],
+        )
+        .expect("a partial repaint");
+        assert!(torn.contains(&rect(0.0, 100.0)), "erase the old width");
+        assert!(torn.contains(&rect(0.0, 108.0)), "draw the new width");
+    }
+
+    #[test]
+    fn setting_a_background_property_to_its_current_value_damages_nothing() {
+        // `patched_background` (in `requests.rs`) refuses to write a patch
+        // that matches the component already there, so `Changed<Background>`
+        // never fires and the entity never lands in `changed`. None of
+        // height, padding or border affect an item's frame, so the geometry
+        // compare agrees: nothing to repaint.
+        let before = was(vec![(entity(1), rect(0.0, 100.0))]);
+        let nothing = HashSet::new();
+        let torn = damage(
+            &pass(&before, &nothing),
+            DISPLAY,
+            panel(),
+            &[(entity(1), rect(0.0, 100.0))],
+        );
+        assert_eq!(torn, Some(Vec::new()), "no rect should be repainted");
     }
 
     #[test]

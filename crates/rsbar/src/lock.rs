@@ -71,7 +71,8 @@ pub fn acquire(service: &str) -> Result<Lock, Error> {
         l_len: 0,
         l_pid: std::process::id().cast_signed(),
         l_type: libc::F_WRLCK,
-        l_whence: libc::SEEK_SET as i16,
+        //  is 0; the field is a short, and the cast is exact.
+        l_whence: i16::try_from(libc::SEEK_SET).unwrap_or(0),
     };
     // SAFETY: `file` is open for writing and outlives the call; `lock`
     // describes the whole file.
