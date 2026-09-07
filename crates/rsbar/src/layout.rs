@@ -8,9 +8,10 @@
 use crate::alias::Captures;
 use crate::bar::{Panels, Settings, fill_rounded_rect, stroke_rounded_rect};
 use crate::components::{
-    AliasContent, Background, Drawing, Icon, ItemDisplay, Label, Members, Name, Offset, Order,
-    Padding, Placement, Width,
+    AliasContent, Background, Drawing, Graph, Icon, ItemDisplay, Label, Members, Name, Offset,
+    Order, Padding, Placement, Slider, Width,
 };
+use crate::popup::PopupOf;
 use crate::shaping::Cache;
 use bevy_ecs::prelude::*;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -38,11 +39,40 @@ pub struct Drawn {
     pub width: &'static Width,
     pub display: &'static ItemDisplay,
     pub name: &'static Name,
+    /// Set only on a `--add graph` item.
+    pub graph: Option<&'static Graph>,
+    /// Set only on a `--add slider` item.
+    pub slider: Option<&'static Slider>,
     /// Set only on a bracket: the items it draws across.
     pub members: Option<&'static Members>,
+    /// Set only on an item living inside a popup, naming the item that hosts
+    /// it. Such an item takes no space in the bar's own layout — it is laid
+    /// out by [`crate::popup`] instead, against the popup's own surface.
+    pub popup_of: Option<&'static PopupOf>,
 }
 
 pub type ItemQuery<'w, 's> = Query<'w, 's, Drawn>;
+
+/// An alias's left inset and overall frame width, given its own padding and
+/// the width of the ink it is actually going to draw.
+///
+/// The ink is already trimmed to the window's real content, so the padding a
+/// config sets is on top of that, not on top of the window's full (mostly
+/// margin) size. A config written against real `SketchyBar`, which has no
+/// trimming and expects `padding_left`/`padding_right` to claw back its
+/// window's own margin, can therefore ask for a total more negative than the
+/// ink itself — measured live, `Control Centre,FocusModes`' `-15`/`-5` against
+/// an 18pt-wide trim comes to `-2`. Letting that through would draw the ink
+/// `padding.left` short of the frame `alias_width` sized to, spilling onto
+/// whatever sits to this item's left. Clamping the slack at zero keeps both
+/// numbers agreeing — the frame never shrinks past the ink, and the ink never
+/// starts outside the frame it was given — while a config with ordinary,
+/// non-negative padding is unaffected.
+fn alias_box(padding: &Padding, ink_width: f64) -> (f64, f64) {
+    let slack = (padding.left + padding.right).max(0.0);
+    let left = padding.left.clamp(0.0, slack);
+    (left, ink_width + slack)
+}
 
 /// How wide an alias's mirrored image is, or nothing if it is not an alias.
 fn alias_width(captures: &Captures, entity: Entity, padding: &Padding) -> Option<f64> {
@@ -51,15 +81,42 @@ fn alias_width(captures: &Captures, entity: Entity, padding: &Padding) -> Option
     // carries the system's own inter-item spacing — on the clock, only 81% of
     // it is ink — and laying that out put a visible gap either side of every
     // alias, twice over between two of them.
-    Some(padding.left + mirrored.trim.size.width + padding.right)
+    let (_, width) = alias_box(padding, mirrored.trim.size.width);
+    Some(width)
+}
+
+/// A graph's or a slider's own width, or nothing if the item is neither —
+/// `graph_get_length`/`slider_get_length` in `SketchyBar`'s own source. An
+/// item is never both, but nothing here enforces that; a config that manages
+/// it gets whichever the query happened to find.
+fn sandwich_width(graph: Option<&Graph>, slider: Option<&Slider>) -> f64 {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a graph's sample count is nowhere near f64's exact-integer range"
+    )]
+    graph
+        .map(|g| g.capacity as f64)
+        .or_else(|| slider.map(|s| s.width))
+        .unwrap_or(0.0)
 }
 
 /// How wide an item is, padding included.
 ///
 /// Mirrors the draw order in `paint_panels` exactly: each run's own padding is
 /// added on top of the item's, so an icon or label that sets it does not drift
-/// out of the background this same width sizes.
-fn width(cache: &Cache, entity: Entity, icon: &Icon, label: &Label, padding: &Padding) -> f64 {
+/// out of the background this same width sizes. `SketchyBar`'s own item
+/// order — icon, then a graph or slider, then label (`bar_item_get_length`,
+/// `label_position`) — is why the sandwich segment sits between the two runs
+/// rather than after both.
+pub(crate) fn width(
+    cache: &Cache,
+    entity: Entity,
+    icon: &Icon,
+    label: &Label,
+    padding: &Padding,
+    graph: Option<&Graph>,
+    slider: Option<&Slider>,
+) -> f64 {
     let Some(shaped) = cache.get(entity) else {
         return padding.left + padding.right;
     };
@@ -68,17 +125,23 @@ fn width(cache: &Cache, entity: Entity, icon: &Icon, label: &Label, padding: &Pa
     } else {
         icon.0.padding_left + shaped.icon_metrics().width + icon.0.padding_right
     };
+    let sandwich_w = sandwich_width(graph, slider);
     let label_w = if label.0.is_empty() {
         0.0
     } else {
         label.0.padding_left + shaped.label_metrics().width + label.0.padding_right
     };
-    let between = if icon_w > 0.0 && label_w > 0.0 {
+    let before_sandwich = if icon_w > 0.0 && sandwich_w > 0.0 {
         padding.between
     } else {
         0.0
     };
-    padding.left + icon_w + between + label_w + padding.right
+    let after_sandwich = if (icon_w > 0.0 || sandwich_w > 0.0) && label_w > 0.0 {
+        padding.between
+    } else {
+        0.0
+    };
+    padding.left + icon_w + before_sandwich + sandwich_w + after_sandwich + label_w + padding.right
 }
 
 /// Where an item's background actually sits, `frame` inset by its own padding
@@ -101,7 +164,7 @@ fn background_rect(frame: CGRect, background: &Background) -> CGRect {
 /// Layout is pure arithmetic over this, so it is testable without a World —
 /// which matters, because the bucket rules are the part most likely to be got
 /// subtly wrong and least likely to be noticed.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Placed<T> {
     pub id: T,
     pub position: Position,
@@ -205,16 +268,32 @@ fn place(
         .into_iter()
         // A bracket takes no space of its own — it is drawn across the items
         // it names, so laying it out alongside them would push them apart by
-        // its own width.
-        .filter(|row| row.drawing.0 && row.members.is_none() && row.display.0.matches(ordinal))
+        // its own width. An item living inside a popup takes no space here
+        // either — it is laid out against the popup's own surface, not the
+        // bar's.
+        .filter(|row| {
+            row.drawing.0
+                && row.members.is_none()
+                && row.popup_of.is_none()
+                && row.display.0.matches(ordinal)
+        })
         .map(|row| Placed {
             id: row.entity,
-            position: row.placement.0,
+            position: row.placement.0.clone(),
             // A fixed width overrides everything else a content measures to,
             // alias included — that is the whole point of a spacer.
             width: row.width.0.unwrap_or_else(|| {
-                alias_width(captures, row.entity, row.padding)
-                    .unwrap_or_else(|| width(cache, row.entity, row.icon, row.label, row.padding))
+                alias_width(captures, row.entity, row.padding).unwrap_or_else(|| {
+                    width(
+                        cache,
+                        row.entity,
+                        row.icon,
+                        row.label,
+                        row.padding,
+                        row.graph,
+                        row.slider,
+                    )
+                })
             }),
         })
         .collect();
@@ -252,7 +331,7 @@ fn brackets_over(
         let Some(members) = bracket.members else {
             continue;
         };
-        if !bracket.drawing.0 || !bracket.display.0.matches(ordinal) {
+        if !bracket.drawing.0 || bracket.popup_of.is_some() || !bracket.display.0.matches(ordinal) {
             continue;
         }
         let mut span: Option<(f64, f64)> = None;
@@ -291,23 +370,33 @@ fn brackets_over(
 #[derive(Resource, Default)]
 pub struct Placements(Vec<PanelPlacements>);
 
-struct PanelPlacements {
-    display: u32,
+/// Where one surface's items ended up: a bar panel's, or — reusing the exact
+/// same shape — a single popup's. [`damage`] only ever reads `frame` and
+/// `items`, so a popup's retained state is one of these too, keyed by its
+/// host entity rather than by display; see [`crate::popup`].
+pub(crate) struct PanelPlacements {
+    pub(crate) display: u32,
     /// The panel's frame in global screen coordinates, so a click reported
     /// against the desktop can be brought into the panel's own space.
-    frame: CGRect,
-    items: Vec<(Entity, CGRect)>,
+    pub(crate) frame: CGRect,
+    pub(crate) items: Vec<(Entity, CGRect)>,
+}
+
+impl PanelPlacements {
+    pub(crate) fn new(display: u32, frame: CGRect, items: Vec<(Entity, CGRect)>) -> Self {
+        Self {
+            display,
+            frame,
+            items,
+        }
+    }
 }
 
 impl Placements {
     /// Builds a set directly, for tests.
     #[cfg(test)]
     fn from_parts(display: u32, frame: CGRect, items: Vec<(Entity, CGRect)>) -> Self {
-        Self(vec![PanelPlacements {
-            display,
-            frame,
-            items,
-        }])
+        Self(vec![PanelPlacements::new(display, frame, items)])
     }
 
     /// The item at a point given in global screen coordinates.
@@ -336,6 +425,29 @@ impl Placements {
                     display: panel.display,
                 },
             )
+    }
+
+    /// Where one item last landed, in global screen coordinates, and which
+    /// display's panel it is on.
+    ///
+    /// What [`crate::popup`] anchors a popup against: a popup hangs off its
+    /// host item's own on-screen frame, which only the bar's own layout pass
+    /// knows.
+    #[must_use]
+    pub fn item_frame(&self, entity: Entity) -> Option<(CGRect, u32)> {
+        for panel in &self.0 {
+            if let Some((_, local)) = panel.items.iter().find(|(id, _)| *id == entity) {
+                let global = CGRect::new(
+                    CGPoint::new(
+                        panel.frame.origin.x + local.origin.x,
+                        panel.frame.origin.y + local.origin.y,
+                    ),
+                    local.size,
+                );
+                return Some((global, panel.display));
+            }
+        }
+        None
     }
 }
 
@@ -430,20 +542,27 @@ struct Repaint<'a> {
     everything: bool,
 }
 
-/// The rects of one panel that may look different this pass.
+/// The rects of one surface that may look different this pass.
 ///
-/// `None` means the whole panel: either something bar-wide changed, or this
-/// panel was not on screen last time and there is no before to compare with.
-fn damage(
-    panel: &Repaint,
-    display: u32,
+/// `None` means the whole surface: either something wide enough to move
+/// everything changed, or this surface was not on screen last time and there
+/// is no before to compare with.
+///
+/// Takes `before` directly rather than a display to look it up by, so the
+/// same function serves both the bar — which looks its previous panel up by
+/// display — and a popup, which has exactly one surface and no display to key
+/// it by; see [`crate::popup`].
+pub(crate) fn damage(
+    everything: bool,
+    changed: &HashSet<Entity>,
+    before: Option<&PanelPlacements>,
     frame: CGRect,
     placed: &[(Entity, CGRect)],
 ) -> Option<Vec<CGRect>> {
-    if panel.everything {
+    if everything {
         return None;
     }
-    let before = panel.previous.iter().find(|p| p.display == display)?;
+    let before = before?;
     // A panel that moved or resized invalidates every position in it.
     if before.frame != frame {
         return None;
@@ -464,7 +583,7 @@ fn damage(
         let mut rects = Vec::new();
         for ((entity, was), (_, now)) in before.items.iter().zip(placed) {
             if was == now {
-                if panel.changed.contains(entity) {
+                if changed.contains(entity) {
                     rects.push(*now);
                 }
             } else {
@@ -490,7 +609,7 @@ fn damage(
                 rects.push(*now);
             }
             // Sitting still, but repainted itself.
-            Some(_) if panel.changed.contains(entity) => rects.push(*now),
+            Some(_) if changed.contains(entity) => rects.push(*now),
             Some(_) => {}
         }
     }
@@ -503,7 +622,7 @@ fn damage(
     Some(rects)
 }
 
-fn intersects(a: CGRect, b: CGRect) -> bool {
+pub(crate) fn intersects(a: CGRect, b: CGRect) -> bool {
     a.origin.x < b.origin.x + b.size.width
         && b.origin.x < a.origin.x + a.size.width
         && a.origin.y < b.origin.y + b.size.height
@@ -515,7 +634,7 @@ fn intersects(a: CGRect, b: CGRect) -> bool {
 ///
 /// Returns whether it found shaped text to draw against, so the caller can
 /// count what actually got painted.
-fn draw_item(
+pub(crate) fn draw_item(
     ctx: &objc2_core_graphics::CGContext,
     cache: &Cache,
     captures: &Captures,
@@ -566,11 +685,15 @@ fn draw_item(
         // Centred on the ink, not on the captured window, and drawn offset by
         // the trim so the ink lands at the padded origin. The margin still
         // exists in the image, so the draw is clipped to the inked size to
-        // keep it off the neighbour.
-        let slack = (frame.size.height - captured.trim.size.height) / 2.0;
+        // keep it off the neighbour. The left inset is [`alias_box`]'s, the
+        // same one `alias_width` sized the frame with, so a padding too
+        // negative to fit is clamped here exactly as it was there — the ink
+        // never starts outside the frame it was laid out in.
+        let (left, _) = alias_box(padding, captured.trim.size.width);
+        let vertical_slack = (frame.size.height - captured.trim.size.height) / 2.0;
         let ink = CGPoint::new(
-            frame.origin.x + padding.left,
-            frame.origin.y + offset.0 + slack,
+            frame.origin.x + left,
+            frame.origin.y + offset.0 + vertical_slack,
         );
         let whole = CGRect::new(
             CGPoint::new(
@@ -590,24 +713,135 @@ fn draw_item(
 
     let mut x = frame.origin.x + padding.left;
     let y = frame.origin.y + offset.0;
-    let both = !icon.0.is_empty() && !label.0.is_empty();
-    if !icon.0.is_empty() {
+    let icon_present = !icon.0.is_empty();
+    let sandwich_w = sandwich_width(row.graph, row.slider);
+    let sandwich_present = sandwich_w > 0.0;
+    let label_present = !label.0.is_empty();
+    if icon_present {
         x += icon.0.padding_left;
         let w = shaped.icon_metrics().width;
         let box_ = CGRect::new(CGPoint::new(x, y), CGSize::new(w, frame.size.height));
         shaped.draw_icon(ctx, box_, icon.0.color);
         x += w + icon.0.padding_right;
-        if both {
+        if sandwich_present {
             x += padding.between;
         }
     }
-    if !label.0.is_empty() {
+    if let Some(graph) = row.graph {
+        let box_ = CGRect::new(
+            CGPoint::new(x, y),
+            CGSize::new(sandwich_w, frame.size.height),
+        );
+        draw_graph(ctx, box_, graph);
+        x += sandwich_w;
+    } else if let Some(slider) = row.slider {
+        let box_ = CGRect::new(
+            CGPoint::new(x, y),
+            CGSize::new(sandwich_w, frame.size.height),
+        );
+        draw_slider(ctx, box_, slider);
+        x += sandwich_w;
+    }
+    if (icon_present || sandwich_present) && label_present {
+        x += padding.between;
+    }
+    if label_present {
         x += label.0.padding_left;
         let w = shaped.label_metrics().width;
         let box_ = CGRect::new(CGPoint::new(x, y), CGSize::new(w, frame.size.height));
         shaped.draw_label(ctx, box_, label.0.color);
     }
     true
+}
+
+/// Strokes (and, if [`Graph::fill`], fills) `graph`'s samples across `rect`,
+/// oldest to newest, left to right — `graph_draw` in `SketchyBar`'s own
+/// `graph.c`. Each sample is a 0.0-1.0 fraction of `rect`'s own height, its
+/// own convention, with `1.0` at the top.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "a graph is at most a few hundred samples wide"
+)]
+fn draw_graph(ctx: &objc2_core_graphics::CGContext, rect: CGRect, graph: &Graph) {
+    use objc2_core_graphics::CGContext;
+
+    let n = graph.samples.len();
+    if n < 2 {
+        return;
+    }
+    let step = rect.size.width / (n - 1) as f64;
+    let point = |i: usize| {
+        let value = f64::from(graph.samples[i]).clamp(0.0, 1.0);
+        CGPoint::new(
+            rect.origin.x + step * i as f64,
+            rect.origin.y + rect.size.height * (1.0 - value),
+        )
+    };
+    let trace = || {
+        CGContext::begin_path(Some(ctx));
+        let first = point(0);
+        CGContext::move_to_point(Some(ctx), first.x, first.y);
+        for i in 1..n {
+            let p = point(i);
+            CGContext::add_line_to_point(Some(ctx), p.x, p.y);
+        }
+    };
+
+    CGContext::save_g_state(Some(ctx));
+    CGContext::set_line_width(Some(ctx), graph.line_width);
+    CGContext::set_rgb_stroke_color(
+        Some(ctx),
+        graph.line_color.red(),
+        graph.line_color.green(),
+        graph.line_color.blue(),
+        graph.line_color.alpha(),
+    );
+    trace();
+    CGContext::stroke_path(Some(ctx));
+
+    if graph.fill {
+        CGContext::set_rgb_fill_color(
+            Some(ctx),
+            graph.fill_color.red(),
+            graph.fill_color.green(),
+            graph.fill_color.blue(),
+            graph.fill_color.alpha(),
+        );
+        trace();
+        let base = rect.origin.y + rect.size.height;
+        let last = point(n - 1);
+        CGContext::add_line_to_point(Some(ctx), last.x, base);
+        CGContext::add_line_to_point(Some(ctx), point(0).x, base);
+        CGContext::close_path(Some(ctx));
+        CGContext::fill_path(Some(ctx));
+    }
+    CGContext::restore_g_state(Some(ctx));
+}
+
+/// Draws `slider`'s track, the portion of it filled to
+/// [`Slider::percentage`], and its knob — `slider_calculate_bounds`/
+/// `slider_draw` in `SketchyBar`'s own `slider.c`.
+fn draw_slider(ctx: &objc2_core_graphics::CGContext, rect: CGRect, slider: &Slider) {
+    fill_rounded_rect(ctx, rect, 0.0, slider.track_color);
+
+    let filled_w = rect.size.width * f64::from(slider.percentage) / 100.0;
+    if filled_w > 0.0 {
+        let filled = CGRect::new(rect.origin, CGSize::new(filled_w, rect.size.height));
+        fill_rounded_rect(ctx, filled, 0.0, slider.fill_color);
+    }
+
+    let knob = crate::text::Text::new(
+        slider.knob.string.clone(),
+        crate::text::Font::resolve(&slider.knob.font),
+    );
+    let knob_w = knob.metrics().width;
+    let raw_offset = filled_w - knob_w / 2.0;
+    let knob_offset = raw_offset.clamp(0.0, (rect.size.width - (knob_w + 1.0)).max(0.0));
+    let box_ = CGRect::new(
+        CGPoint::new(rect.origin.x + knob_offset, rect.origin.y),
+        CGSize::new(knob_w, rect.size.height),
+    );
+    knob.draw(ctx, box_, slider.knob.color);
 }
 
 fn paint_panels(
@@ -628,7 +862,8 @@ fn paint_panels(
         // Layout depends on the panel's width and which display it is, so
         // both are per-panel rather than computed once for the whole bar.
         let placed = place(items, cache, captures, size, padding, panel.ordinal);
-        let torn = damage(pass, panel.display.id, panel.frame, &placed);
+        let before = pass.previous.iter().find(|p| p.display == panel.display.id);
+        let torn = damage(pass.everything, pass.changed, before, panel.frame, &placed);
 
         // Nothing on this display looks different — the common case on a
         // multi-display bar, where one panel's clock ticks and the rest do
@@ -684,31 +919,46 @@ fn paint_panels(
 /// Any item whose on-screen appearance moved. Every component that layout or
 /// drawing reads is listed, so adding one to either without adding it here is
 /// the one way this can go quietly wrong.
+///
+/// `Without<PopupOf>`, unlike [`DirtyItems`]: an item living inside a popup
+/// never lands in the bar's own `placed` list, so nothing it does can ever
+/// damage a bar rect — counting its changes here would only wake this system
+/// up to compute an empty diff every time a popup's content ticked.
 type AnythingVisibleChanged<'w, 's> = Query<
     'w,
     's,
     (),
-    Or<(
-        Changed<Icon>,
-        Changed<Label>,
-        Changed<Background>,
-        Changed<Padding>,
-        Changed<Offset>,
-        Changed<Placement>,
-        Changed<Order>,
-        Changed<Drawing>,
-        Changed<Width>,
-        Changed<ItemDisplay>,
-        // The digest of what an alias mirrors. Without this the capture
-        // refreshes and the component changes, but nothing asks for a
-        // repaint — a mirrored clock sits at the minute it was first drawn.
-        Changed<AliasContent>,
-    )>,
+    (
+        Or<(
+            Changed<Icon>,
+            Changed<Label>,
+            Changed<Background>,
+            Changed<Padding>,
+            Changed<Offset>,
+            Changed<Placement>,
+            Changed<Order>,
+            Changed<Drawing>,
+            Changed<Width>,
+            Changed<ItemDisplay>,
+            Changed<Graph>,
+            Changed<Slider>,
+            // The digest of what an alias mirrors. Without this the capture
+            // refreshes and the component changes, but nothing asks for a
+            // repaint — a mirrored clock sits at the minute it was first drawn.
+            Changed<AliasContent>,
+        )>,
+        Without<PopupOf>,
+    ),
 >;
 
 /// The items that changed since the last repaint, as opposed to whether any
 /// did. Same components as [`AnythingVisibleChanged`], because a change that
 /// forces a repaint and a change that damages a rect are the same change.
+///
+/// Deliberately not filtered by [`PopupOf`] the way that query is: this feeds
+/// [`damage`]'s per-entity lookup, and [`crate::popup`] runs the very same
+/// `damage` against its own placements, so a popup item's change has to
+/// survive into this set for its popup to see it.
 pub type DirtyItems<'w, 's> = Query<
     'w,
     's,
@@ -724,6 +974,8 @@ pub type DirtyItems<'w, 's> = Query<
         Changed<Drawing>,
         Changed<Width>,
         Changed<ItemDisplay>,
+        Changed<Graph>,
+        Changed<Slider>,
         // The digest of what an alias mirrors. Without this the capture
         // refreshes and the component changes, but nothing asks for a
         // repaint — a mirrored clock sits at the minute it was first drawn.
@@ -913,7 +1165,7 @@ mod tests {
 #[cfg(test)]
 mod width_tests {
     use super::width;
-    use crate::components::{Icon, Label, Padding, Run};
+    use crate::components::{Graph, Icon, Label, Padding, Run};
     use crate::shaping::Cache;
     use bevy_ecs::entity::Entity;
     use rsbar_protocol::style::Color;
@@ -941,13 +1193,13 @@ mod width_tests {
         let mut label = Label(Run::new("Menlo:Regular:13", Color::WHITE));
         label.0.string = "hi".into();
         cache.refresh(id, &icon.0, &label.0);
-        let bare = width(&cache, id, &icon, &label, &padding());
+        let bare = width(&cache, id, &icon, &label, &padding(), None, None);
 
         let mut padded_label = label.clone();
         padded_label.0.padding_left = 4.0;
         padded_label.0.padding_right = 6.0;
         cache.refresh(id, &icon.0, &padded_label.0);
-        let padded = width(&cache, id, &icon, &padded_label, &padding());
+        let padded = width(&cache, id, &icon, &padded_label, &padding(), None, None);
 
         assert!(
             (padded - bare - 10.0).abs() < 1e-9,
@@ -966,17 +1218,131 @@ mod width_tests {
         icon.0.string = "A".into();
         let label = Label(Run::new("Menlo:Regular:13", Color::WHITE));
         cache.refresh(id, &icon.0, &label.0);
-        let base = width(&cache, id, &icon, &label, &padding());
+        let base = width(&cache, id, &icon, &label, &padding(), None, None);
 
         let mut padded_label = label.clone();
         padded_label.0.padding_left = 50.0;
         padded_label.0.padding_right = 50.0;
         cache.refresh(id, &icon.0, &padded_label.0);
-        let same = width(&cache, id, &icon, &padded_label, &padding());
+        let same = width(&cache, id, &icon, &padded_label, &padding(), None, None);
 
         assert!(
             (same - base).abs() < 1e-9,
             "an empty label takes no space no matter its own padding"
+        );
+    }
+
+    /// `SketchyBar`'s own item order — icon, then a graph or slider, then
+    /// label — so the sandwich segment adds its own width plus one more
+    /// `between` gap, on top of whatever the icon and label already claimed.
+    #[test]
+    fn a_graph_widens_the_item_between_icon_and_label() {
+        let mut cache = Cache::default();
+        let id = entity();
+        let mut icon = Icon(Run::new("Menlo:Regular:13", Color::WHITE));
+        icon.0.string = "A".into();
+        let mut label = Label(Run::new("Menlo:Regular:13", Color::WHITE));
+        label.0.string = "hi".into();
+        cache.refresh(id, &icon.0, &label.0);
+        let padding = Padding {
+            left: 0.0,
+            right: 0.0,
+            between: 3.0,
+        };
+
+        let without_graph = width(&cache, id, &icon, &label, &padding, None, None);
+        let graph = Graph::new(20);
+        let with_graph = width(&cache, id, &icon, &label, &padding, Some(&graph), None);
+
+        assert!(
+            (with_graph - without_graph - 20.0 - 3.0).abs() < 1e-9,
+            "the graph's own width plus one more `between` gap must be added"
+        );
+    }
+
+    /// A graph with nothing either side of it to gap against takes no
+    /// `between` space at all.
+    #[test]
+    fn a_graph_alone_takes_no_between_gap() {
+        let mut cache = Cache::default();
+        let id = entity();
+        let icon = Icon(Run::new("Menlo:Regular:13", Color::WHITE));
+        let label = Label(Run::new("Menlo:Regular:13", Color::WHITE));
+        cache.refresh(id, &icon.0, &label.0);
+        let padding = Padding {
+            left: 0.0,
+            right: 0.0,
+            between: 3.0,
+        };
+
+        let graph = Graph::new(20);
+        let w = width(&cache, id, &icon, &label, &padding, Some(&graph), None);
+
+        assert!((w - 20.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod alias_box_tests {
+    use super::{Padding, alias_box};
+
+    fn padding(left: f64, right: f64) -> Padding {
+        Padding {
+            left,
+            right,
+            between: 0.0,
+        }
+    }
+
+    /// Ordinary, non-negative padding must land exactly where it always has —
+    /// this is the case every alias without a compensating negative padding
+    /// hits, and it must not regress.
+    #[test]
+    fn ordinary_padding_insets_the_ink_by_its_own_amount() {
+        let (left, width) = alias_box(&padding(5.0, 5.0), 69.0);
+        assert!((left - 5.0).abs() < 1e-9);
+        assert!((width - 79.0).abs() < 1e-9);
+    }
+
+    /// `Control Centre,FocusModes`' own config, measured live: -15/-5 against
+    /// an 18pt-wide trim sums to -2, which would draw the ink 15pt to the left
+    /// of a frame only 18pt wide — spilling onto whatever sits to its left.
+    /// The frame must never shrink past the ink, and the ink must never start
+    /// outside the frame.
+    #[test]
+    fn padding_too_negative_for_the_ink_is_clamped_to_it_exactly() {
+        let (left, width) = alias_box(&padding(-15.0, -5.0), 18.0);
+        assert!((left - 0.0).abs() < 1e-9, "no room to inset from at all");
+        assert!(
+            (width - 18.0).abs() < 1e-9,
+            "the frame is exactly the ink, no smaller"
+        );
+    }
+
+    /// A total that is negative but still fits inside the ink's own width
+    /// is not clamped away outright — the frame shrinks, only never past
+    /// the ink.
+    #[test]
+    fn a_small_negative_total_only_shrinks_the_frame_to_the_ink() {
+        let (left, width) = alias_box(&padding(-2.0, -2.0), 30.0);
+        assert!((left - 0.0).abs() < 1e-9);
+        assert!((width - 30.0).abs() < 1e-9);
+    }
+
+    /// A very negative left offset, compensated by an equally generous right
+    /// one, still must not push the ink left of the frame it was given —
+    /// only the *sum* buys back slack, and the left inset itself is clamped
+    /// to what that slack actually is.
+    #[test]
+    fn a_negative_left_offset_never_starts_before_the_frame() {
+        let (left, width) = alias_box(&padding(-15.0, 50.0), 18.0);
+        assert!(
+            (left - 0.0).abs() < 1e-9,
+            "the ink starts at the frame origin"
+        );
+        assert!(
+            (width - 53.0).abs() < 1e-9,
+            "the sum still buys the frame room"
         );
     }
 }
@@ -1064,6 +1430,43 @@ mod place_tests {
 
         assert!(on_one.is_empty(), "not this panel's display");
         assert_eq!(on_two.len(), 1, "this one is");
+    }
+
+    #[test]
+    fn an_item_living_inside_a_popup_takes_no_space_in_the_bar() {
+        // The local stand-in for `position = "popup.<name>"` — see the module
+        // doc on `crate::popup`. Whatever the item's own `Placement` says, a
+        // popup item is not one of the bar's five buckets at all.
+        let mut world = World::new();
+        let host = world
+            .spawn(bundle(
+                ItemName::new("host").unwrap(),
+                Position::Left,
+                Order(0),
+            ))
+            .id();
+        let child = world
+            .spawn(bundle(
+                ItemName::new("in-popup").unwrap(),
+                Position::Left,
+                Order(1),
+            ))
+            .id();
+        world.entity_mut(child).insert(crate::popup::PopupOf(host));
+
+        let mut state: SystemState<ItemQuery> = SystemState::new(&mut world);
+        let query = state.get(&world).expect("query param is valid");
+        let placed = place(
+            &query,
+            &Cache::default(),
+            &Captures::default(),
+            size(),
+            BarPadding::default(),
+            1,
+        );
+
+        assert_eq!(placed.len(), 1, "only the host is laid out by the bar");
+        assert_eq!(placed[0].0, host);
     }
 }
 
@@ -1155,7 +1558,7 @@ mod hit_tests {
 
 #[cfg(test)]
 mod damage_tests {
-    use super::{PanelPlacements, Repaint, damage, intersects};
+    use super::{PanelPlacements, damage, intersects};
     use bevy_ecs::entity::Entity;
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use std::collections::HashSet;
@@ -1174,20 +1577,8 @@ mod damage_tests {
         CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1000.0, 32.0))
     }
 
-    fn was(items: Vec<(Entity, CGRect)>) -> Vec<PanelPlacements> {
-        vec![PanelPlacements {
-            display: DISPLAY,
-            frame: panel(),
-            items,
-        }]
-    }
-
-    fn pass<'a>(previous: &'a [PanelPlacements], changed: &'a HashSet<Entity>) -> Repaint<'a> {
-        Repaint {
-            previous,
-            changed,
-            everything: false,
-        }
+    fn was(items: Vec<(Entity, CGRect)>) -> PanelPlacements {
+        PanelPlacements::new(DISPLAY, panel(), items)
     }
 
     #[test]
@@ -1195,8 +1586,9 @@ mod damage_tests {
         let before = was(vec![(entity(1), rect(0.0, 100.0))]);
         let nothing = HashSet::new();
         let torn = damage(
-            &pass(&before, &nothing),
-            DISPLAY,
+            false,
+            &nothing,
+            Some(&before),
             panel(),
             &[(entity(1), rect(0.0, 100.0))],
         );
@@ -1211,8 +1603,9 @@ mod damage_tests {
         ]);
         let changed = HashSet::from([entity(2)]);
         let torn = damage(
-            &pass(&before, &changed),
-            DISPLAY,
+            false,
+            &changed,
+            Some(&before),
             panel(),
             &[
                 (entity(1), rect(0.0, 100.0)),
@@ -1234,8 +1627,9 @@ mod damage_tests {
         ]);
         let changed = HashSet::from([entity(1)]);
         let torn = damage(
-            &pass(&before, &changed),
-            DISPLAY,
+            false,
+            &changed,
+            Some(&before),
             panel(),
             &[
                 (entity(1), rect(0.0, 140.0)),
@@ -1258,8 +1652,9 @@ mod damage_tests {
         ]);
         let nothing = HashSet::new();
         let torn = damage(
-            &pass(&before, &nothing),
-            DISPLAY,
+            false,
+            &nothing,
+            Some(&before),
             panel(),
             &[(entity(1), rect(0.0, 100.0))],
         );
@@ -1271,8 +1666,9 @@ mod damage_tests {
         let before = was(vec![(entity(1), rect(0.0, 100.0))]);
         let nothing = HashSet::new();
         let torn = damage(
-            &pass(&before, &nothing),
-            DISPLAY,
+            false,
+            &nothing,
+            Some(&before),
             panel(),
             &[
                 (entity(1), rect(0.0, 100.0)),
@@ -1288,8 +1684,9 @@ mod damage_tests {
         let nothing = HashSet::new();
         let narrower = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(800.0, 32.0));
         let torn = damage(
-            &pass(&before, &nothing),
-            DISPLAY,
+            false,
+            &nothing,
+            Some(&before),
             narrower,
             &[(entity(1), rect(0.0, 100.0))],
         );
@@ -1300,8 +1697,9 @@ mod damage_tests {
     fn a_panel_with_nothing_before_it_is_repainted_whole() {
         let nothing = HashSet::new();
         let torn = damage(
-            &pass(&[], &nothing),
-            DISPLAY,
+            false,
+            &nothing,
+            None,
             panel(),
             &[(entity(1), rect(0.0, 100.0))],
         );
@@ -1312,15 +1710,11 @@ mod damage_tests {
     fn a_bar_wide_change_is_repainted_whole() {
         let before = was(vec![(entity(1), rect(0.0, 100.0))]);
         let nothing = HashSet::new();
-        let everything = Repaint {
-            previous: &before,
-            changed: &nothing,
-            everything: true,
-        };
         assert_eq!(
             damage(
-                &everything,
-                DISPLAY,
+                true,
+                &nothing,
+                Some(&before),
                 panel(),
                 &[(entity(1), rect(0.0, 100.0))]
             ),
@@ -1338,8 +1732,9 @@ mod damage_tests {
         let before = was(vec![(entity(1), rect(0.0, 100.0))]);
         let nothing = HashSet::new();
         let torn = damage(
-            &pass(&before, &nothing),
-            DISPLAY,
+            false,
+            &nothing,
+            Some(&before),
             panel(),
             &[(entity(1), rect(0.0, 108.0))],
         )
@@ -1358,8 +1753,9 @@ mod damage_tests {
         let before = was(vec![(entity(1), rect(0.0, 100.0))]);
         let nothing = HashSet::new();
         let torn = damage(
-            &pass(&before, &nothing),
-            DISPLAY,
+            false,
+            &nothing,
+            Some(&before),
             panel(),
             &[(entity(1), rect(0.0, 100.0))],
         );

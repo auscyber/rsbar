@@ -819,6 +819,51 @@ pub(crate) mod ax {
     /// different item.
     const PRESS_MATCH_RADIUS: f64 = 20.0;
 
+    /// How many levels of `AXChildren`/`AXVisibleChildren` [`find_extras_child`]
+    /// descends into looking for a pressable icon. Control Centre groups
+    /// several of its own modules (Wi-Fi, Bluetooth, `AirDrop`, ...) into one
+    /// compact "`BentoBox`" element that draws as several separate windows at
+    /// the window-server level — which is what [`super::disambiguate_duplicates`]
+    /// numbers as distinct `Item-0(n)`s — but exposes them as *grandchildren*
+    /// of `AXExtrasMenuBar`, one level below its own `AXVisibleChildren`.
+    /// Measured live: pressing a `BentoBox`-hosted item with a flat,
+    /// one-level walk found no candidate anywhere near its window (the
+    /// nearest real, top-level child sat 189pt away, well outside
+    /// [`PRESS_MATCH_RADIUS`]), while its actual `AXButton` element was one
+    /// level down inside the box. One level is enough for every case seen so
+    /// far; nothing here rules out a deeper nesting existing.
+    const MAX_DEPTH: u32 = 1;
+
+    /// Collects every candidate in `children`, recursing into any child that
+    /// is itself a container (own `AXChildren`/`AXVisibleChildren`) up to
+    /// [`MAX_DEPTH`] further levels — see its doc comment for why a flat walk
+    /// misses `BentoBox`-hosted icons.
+    fn collect_candidates(
+        children: &CFArray,
+        depth: u32,
+        out: &mut Vec<(CFRetained<AXUIElement>, Option<String>, Option<CGRect>)>,
+    ) {
+        for i in 0..children.count() {
+            // SAFETY: `i` is in bounds; every element is an `AXUIElement`,
+            // per `array_element`'s own contract.
+            let Some(child) = (unsafe { array_element(children, i) }) else {
+                continue;
+            };
+            let identity = attribute_string(child, "AXDescription")
+                .filter(|d| !d.is_empty())
+                .or_else(|| attribute_string(child, "AXTitle").filter(|t| !t.is_empty()));
+            let frame = attribute_frame(child);
+            out.push((child.retain(), identity, frame));
+
+            if depth > 0
+                && let Some(grandchildren) = copy_array(child, "AXVisibleChildren")
+                    .or_else(|| copy_array(child, "AXChildren"))
+            {
+                collect_candidates(&grandchildren, depth - 1, out);
+            }
+        }
+    }
+
     /// Finds the `AXExtrasMenuBar` child behind an already-resolved window,
     /// for [`super::press_item`]. Unlike [`resolve`], the pid is already
     /// known, so only that one application's extras are walked rather than
@@ -828,7 +873,8 @@ pub(crate) mod ax {
     /// [`enumerate_extras_menu_items`]), then falls back to the nearest
     /// candidate by frame within [`PRESS_MATCH_RADIUS`] — what a disambiguated
     /// `(n)` name always needs, since the real identity string never carries
-    /// that suffix.
+    /// that suffix. Candidates come from [`collect_candidates`], so a
+    /// `BentoBox`-nested icon is found the same way a top-level one is.
     pub(crate) fn find_extras_child(
         pid: i32,
         name_hint: &str,
@@ -841,25 +887,20 @@ pub(crate) mod ax {
         let children = copy_array(&extras, "AXVisibleChildren")
             .or_else(|| copy_array(&extras, "AXChildren"))?;
 
+        let mut candidates = Vec::new();
+        collect_candidates(&children, MAX_DEPTH, &mut candidates);
+
         let mut nearest: Option<(CFRetained<AXUIElement>, f64)> = None;
-        for i in 0..children.count() {
-            // SAFETY: `i` is in bounds; every element is an `AXUIElement`,
-            // per `array_element`'s own contract.
-            let Some(child) = (unsafe { array_element(&children, i) }) else {
-                continue;
-            };
-            let identity = attribute_string(child, "AXDescription")
-                .filter(|d| !d.is_empty())
-                .or_else(|| attribute_string(child, "AXTitle").filter(|t| !t.is_empty()));
+        for (child, identity, frame) in candidates {
             if identity.as_deref() == Some(name_hint) {
-                return Some(child.retain());
+                return Some(child);
             }
-            let Some(frame) = attribute_frame(child) else {
+            let Some(frame) = frame else {
                 continue;
             };
             let distance = point_distance(rect_center(frame), rect_center(frame_hint));
             if nearest.as_ref().is_none_or(|(_, best)| distance < *best) {
-                nearest = Some((child.retain(), distance));
+                nearest = Some((child, distance));
             }
         }
 

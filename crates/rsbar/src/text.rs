@@ -10,8 +10,8 @@ use objc2_core_foundation::{
 };
 use objc2_core_graphics::CGContext;
 use objc2_core_text::{
-    CTFont, CTFontDescriptor, CTLine, kCTFontAttributeName,
-    kCTForegroundColorFromContextAttributeName,
+    CTFont, CTFontDescriptor, CTLine, kCTFontAttributeName, kCTFontFamilyNameAttribute,
+    kCTFontStyleNameAttribute, kCTForegroundColorFromContextAttributeName,
 };
 use rsbar_protocol::style::{Color, FontSpec};
 use std::ptr;
@@ -65,12 +65,7 @@ impl Font {
             if let Some(font) = resolved.get(&key) {
                 return font.clone();
             }
-            let name = if spec.style.is_empty() {
-                spec.family.clone()
-            } else {
-                format!("{}-{}", spec.family, spec.style)
-            };
-            let font = Self::create(&name, &spec.family, spec.size)
+            let font = Self::create(&spec.family, &spec.style, spec.size)
                 .unwrap_or_else(|| Self::system(spec.size));
             resolved.insert(key, font.clone());
             font
@@ -81,11 +76,41 @@ impl Font {
         }
     }
 
-    /// `CoreText` substitutes silently when a name does not resolve, so the
-    /// family that came back is compared against the one asked for.
-    fn create(name: &str, family: &str, size: f64) -> Option<CFRetained<CTFont>> {
-        let descriptor =
-            unsafe { CTFontDescriptor::with_name_and_size(&CFString::from_str(name), size) };
+    /// Resolves by family (and, if given, style) *attributes* rather than a
+    /// guessed PostScript name.
+    ///
+    /// `CTFontDescriptorCreateWithNameAndSize` matches a single string against
+    /// a font's PostScript/full name, which a config never supplies —
+    /// `sketchybar`'s font spec is always family + style, e.g. `"Hack Nerd
+    /// Font"` + `"Regular"`. Concatenating those as `"Hack Nerd Font-Regular"`
+    /// is not that font's PostScript name (`HackNF-Regular`, measured via
+    /// `fc-list`/`system_profiler`), so the old lookup missed and silently
+    /// substituted a font with none of the family's glyphs — every nerd-font
+    /// icon in the config drew as a tofu box even though the family really was
+    /// installed. Matching on `kCTFontFamilyNameAttribute` (+
+    /// `kCTFontStyleNameAttribute` when a style is given) is what `NSFont`'s
+    /// own family/style API does under the hood, and finds the font by the
+    /// same two fields a config actually sets, however its internal
+    /// PostScript name is spelled.
+    ///
+    /// `CoreText` substitutes silently when nothing matches, so the family
+    /// that came back is compared against the one asked for.
+    fn create(family: &str, style: &str, size: f64) -> Option<CFRetained<CTFont>> {
+        let family_key = unsafe { kCTFontFamilyNameAttribute };
+        let family_value = CFString::from_str(family);
+        let descriptor = if style.is_empty() {
+            let keys: [&CFString; 1] = [family_key];
+            let values: [&CFType; 1] = [family_value.as_ref()];
+            let attributes = CFDictionary::from_slices(&keys, &values);
+            unsafe { CTFontDescriptor::with_attributes(attributes.as_opaque()) }
+        } else {
+            let style_key = unsafe { kCTFontStyleNameAttribute };
+            let style_value = CFString::from_str(style);
+            let keys: [&CFString; 2] = [family_key, style_key];
+            let values: [&CFType; 2] = [family_value.as_ref(), style_value.as_ref()];
+            let attributes = CFDictionary::from_slices(&keys, &values);
+            unsafe { CTFontDescriptor::with_attributes(attributes.as_opaque()) }
+        };
         let font = unsafe { CTFont::with_font_descriptor(&descriptor, size, ptr::null()) };
         unsafe { font.family_name() }
             .to_string()
