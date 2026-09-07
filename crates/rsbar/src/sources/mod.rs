@@ -44,7 +44,7 @@ pub mod power;
 pub mod volume;
 pub mod workspace;
 
-use rsbar_protocol::{Event, Info};
+use rsbar_protocol::{Event, Kind};
 use std::ffi::c_void;
 
 /// How many events may be queued before the oldest producer starts losing
@@ -52,33 +52,8 @@ use std::ffi::c_void;
 /// rather than a backlog to absorb.
 const QUEUE_DEPTH: usize = 256;
 
-/// Something happened.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Emission {
-    pub event: Event,
-    /// What the event carries. Typed, so the daemon can hand a script named
-    /// variables rather than one string every config has to re-parse.
-    pub info: Info,
-}
-
-impl Emission {
-    #[must_use]
-    pub fn new(event: Event, info: Info) -> Self {
-        Self { event, info }
-    }
-
-    /// An event that carries nothing but the fact that it happened.
-    #[must_use]
-    pub fn bare(event: Event) -> Self {
-        Self {
-            event,
-            info: Info::None,
-        }
-    }
-}
-
-/// Names a source. Carried on every event it produces, so a stray emission can
-/// be traced back to what made it.
+/// Names a source. Carried alongside every event it produces, so a stray
+/// emission can be traced back to what made it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SourceId(pub &'static str);
 
@@ -109,7 +84,7 @@ impl std::fmt::Display for SourceId {
 /// making every producer identical is worth more than saving a signal.
 #[derive(Clone)]
 pub struct Emitter {
-    queue: tokio::sync::mpsc::Sender<Emission>,
+    queue: tokio::sync::mpsc::Sender<Event>,
     waker: crate::runloop::Waker,
 }
 
@@ -119,8 +94,8 @@ impl Emitter {
     /// Never blocks and never fails loudly: a full queue means the daemon is
     /// not draining, which is a bug to see in the log rather than a reason to
     /// stall a system callback.
-    pub fn send(&self, emission: Emission) {
-        match self.queue.try_send(emission) {
+    pub fn send(&self, event: Event) {
+        match self.queue.try_send(event) {
             Ok(()) => self.waker.wake(),
             Err(err) => tracing::warn!(%err, "dropping an event; the queue is full"),
         }
@@ -147,7 +122,7 @@ pub type Registration = Box<dyn std::any::Any>;
 /// with a side effect and an opaque token to file away somewhere.
 pub struct Feed {
     id: SourceId,
-    events: tokio::sync::mpsc::Receiver<Emission>,
+    events: tokio::sync::mpsc::Receiver<Event>,
     /// Dropped on whichever thread owns this feed, which is the thread that
     /// registered. Never read.
     _registration: Registration,
@@ -157,7 +132,7 @@ impl Feed {
     /// Wraps a registration and its receiver.
     fn new(
         id: SourceId,
-        events: tokio::sync::mpsc::Receiver<Emission>,
+        events: tokio::sync::mpsc::Receiver<Event>,
         registration: Registration,
     ) -> Self {
         Self {
@@ -190,7 +165,7 @@ impl Feed {
     ///
     /// What the `CFRunLoop`-driven runner uses: it drains on each wake rather
     /// than awaiting.
-    pub fn try_next(&mut self) -> Option<Emission> {
+    pub fn try_next(&mut self) -> Option<Event> {
         self.events.try_recv().ok()
     }
 
@@ -199,18 +174,18 @@ impl Feed {
     /// Unused by the current runner, but this is what makes the producers'
     /// `try_send` a wakeup rather than a write into a void — and it is the
     /// shape an executor would poll.
-    pub async fn next(&mut self) -> Option<Emission> {
+    pub async fn next(&mut self) -> Option<Event> {
         self.events.recv().await
     }
 }
 
 impl futures_lite::Stream for Feed {
-    type Item = Emission;
+    type Item = Event;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Emission>> {
+    ) -> std::task::Poll<Option<Event>> {
         self.events.poll_recv(cx)
     }
 }
@@ -278,7 +253,7 @@ pub trait Source: Send {
 
     /// The events this source can produce. The registry matches a subscription
     /// against this to decide what to start.
-    fn provides(&self) -> Vec<Event>;
+    fn provides(&self) -> Vec<Kind>;
 
     /// Registers observers that write into `emit`.
     ///
@@ -431,7 +406,7 @@ pub struct Registry {
 
 struct Entry {
     source: Option<Box<dyn Source>>,
-    provides: Vec<Event>,
+    provides: Vec<Kind>,
     id: SourceId,
     feed: Option<Feed>,
 }
@@ -479,18 +454,18 @@ impl Registry {
     /// centre. Displays and the config are here not because anything subscribed
     /// but because the bar's own geometry and contents depend on them.
     pub fn start_eager(&mut self) {
-        self.ensure(&Event::FrontAppSwitched);
-        self.ensure(&Event::DisplayChanged);
-        self.ensure(&Event::ConfigReloaded);
+        self.ensure(&Kind::FrontAppSwitched);
+        self.ensure(&Kind::DisplayChanged);
+        self.ensure(&Kind::ConfigReloaded);
     }
 
     /// Starts whatever provides `event`, if it is not running already.
     ///
     /// Cheap to call repeatedly: a subscription change runs this over every
     /// event an item asked for.
-    pub fn ensure(&mut self, event: &Event) {
+    pub fn ensure(&mut self, kind: &Kind) {
         for entry in &mut self.entries {
-            if entry.feed.is_some() || !entry.provides.contains(event) {
+            if entry.feed.is_some() || !entry.provides.contains(kind) {
                 continue;
             }
             let Some(source) = entry.source.take() else {
@@ -498,7 +473,7 @@ impl Registry {
             };
             match start(source, &self.waker) {
                 Ok(feed) => {
-                    tracing::debug!(source = %entry.id, %event, "started event source");
+                    tracing::debug!(source = %entry.id, %kind, "started event source");
                     entry.feed = Some(feed);
                 }
                 Err(err) => tracing::warn!(%err, "event source unavailable"),
@@ -507,9 +482,9 @@ impl Registry {
     }
 
     /// Starts everything needed for a set of subscriptions at once.
-    pub fn ensure_all<'a>(&mut self, events: impl IntoIterator<Item = &'a Event>) {
-        for event in events {
-            self.ensure(event);
+    pub fn ensure_all<'a>(&mut self, kinds: impl IntoIterator<Item = &'a Kind>) {
+        for kind in kinds {
+            self.ensure(kind);
         }
     }
 
@@ -517,13 +492,13 @@ impl Registry {
     ///
     /// Each emission is tagged with the source that produced it, so an event
     /// arriving from somewhere unexpected is traceable rather than anonymous.
-    pub fn drain(&mut self) -> Vec<(SourceId, Emission)> {
+    pub fn drain(&mut self) -> Vec<(SourceId, Event)> {
         let mut drained = Vec::new();
         let feeds = self.entries.iter_mut().filter_map(|e| e.feed.as_mut());
         for feed in feeds.chain(std::iter::once(&mut self.manual)) {
             let id = feed.id();
-            while let Some(emission) = feed.try_next() {
-                drained.push((id, emission));
+            while let Some(event) = feed.try_next() {
+                drained.push((id, event));
             }
         }
         drained

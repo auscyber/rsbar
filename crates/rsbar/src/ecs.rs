@@ -38,11 +38,11 @@ use crate::layout::{self, ForceRepaint};
 use crate::requests::{Context, Items, ItemsRead};
 use crate::script::{Job, Runner};
 use crate::shaping::Cache;
-use crate::sources::{Emission, Registry};
+use crate::sources::Registry;
 use bevy_app::{App, First, Last, PostUpdate, PreUpdate, Update};
 use bevy_ecs::prelude::*;
 use objc2_core_foundation::{CFRunLoop, CFRunLoopRunResult, kCFRunLoopDefaultMode};
-use rsbar_protocol::Request;
+use rsbar_protocol::{Event, Kind, Request};
 use std::time::Duration;
 
 /// How long the runner will sleep with nothing to do — also the routine tick.
@@ -66,7 +66,7 @@ pub struct IpcRequest {
 /// This one *is* a message: an event legitimately has several readers, and a
 /// reader missing a frame beats acting on a backlog.
 #[derive(Message)]
-pub struct EventMessage(pub Emission);
+pub struct EventMessage(pub Event);
 
 /// The request queue, which is `!Sync` and so cannot be a plain resource.
 ///
@@ -199,7 +199,7 @@ fn rebuild_panels(
 ) {
     if !events
         .read()
-        .any(|EventMessage(e)| e.event == rsbar_protocol::Event::DisplayChanged)
+        .any(|EventMessage(event)| Kind::DisplayChanged.matches(event))
     {
         return;
     }
@@ -212,9 +212,9 @@ fn rebuild_panels(
 
 /// Takes everything queued across every running source.
 fn drain_events(mut sources: NonSendMut<Sources>, mut out: MessageWriter<EventMessage>) {
-    for (id, emission) in sources.0.drain() {
-        tracing::trace!(source = %id, event = %emission.event, "drained");
-        out.write(EventMessage(emission));
+    for (id, event) in sources.0.drain() {
+        tracing::trace!(source = %id, kind = %event.kind(), "drained");
+        out.write(EventMessage(event));
     }
 }
 
@@ -263,16 +263,14 @@ fn dispatch_events(
     mut queue: ResMut<Queue>,
     mut reloading: ResMut<Reloading>,
 ) {
-    for EventMessage(emission) in events.read() {
-        tracing::debug!(event = %emission.event, info = ?emission.info, "event");
-        if emission.event == rsbar_protocol::Event::ConfigReloaded {
+    for EventMessage(event) in events.read() {
+        tracing::debug!(kind = %event.kind(), "event");
+        if Kind::ConfigReloaded.matches(event) {
             reloading.0 = true;
         }
         // Dispatched as well as acted on, so a config can subscribe to its own
         // reload the same way it subscribes to anything else.
-        queue
-            .0
-            .extend(read.jobs_for(&emission.event, &emission.info));
+        queue.0.extend(read.jobs_for(event));
     }
 }
 
@@ -377,8 +375,7 @@ fn tick(
             queue.0.push(Job {
                 item: name.0.clone(),
                 script: script.0.clone(),
-                sender: rsbar_protocol::Event::Routine,
-                info: rsbar_protocol::Info::None,
+                event: Event::Routine(rsbar_protocol::event::Routine {}),
             });
         }
     }

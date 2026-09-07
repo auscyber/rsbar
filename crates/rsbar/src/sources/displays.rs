@@ -4,14 +4,13 @@
 //! *active* display changes, not when the set of them does. Plugging in a
 //! monitor arrives only here, and it invalidates every panel's geometry.
 
-use crate::sources::{
-    CallbackState, Cause, Emission, Emitter, Registration, Source, SourceId, StartError,
-};
+use crate::sources::{CallbackState, Cause, Emitter, Registration, Source, SourceId, StartError};
 use objc2_core_graphics::{
     CGDirectDisplayID, CGDisplayChangeSummaryFlags, CGDisplayRegisterReconfigurationCallback,
     CGDisplayRemoveReconfigurationCallback,
 };
-use rsbar_protocol::Event;
+use rsbar_protocol::event::DisplayChange;
+use rsbar_protocol::{Event, Kind};
 use std::ffi::c_void;
 
 extern "C-unwind" fn reconfigured(
@@ -30,7 +29,7 @@ extern "C-unwind" fn reconfigured(
     // SAFETY: the registration passed a `CallbackState<Emitter>` pointer.
     if let Some(emit) = unsafe { CallbackState::<Emitter>::recover(context) } {
         // Dropping beats blocking: this is a `CoreGraphics` callback.
-        emit.send(Emission::bare(Event::DisplayChanged));
+        emit.send(Event::DisplayChanged(DisplayChange {}));
     }
 }
 
@@ -53,8 +52,8 @@ impl Source for Displays {
         SourceId("displays")
     }
 
-    fn provides(&self) -> Vec<Event> {
-        vec![Event::DisplayChanged]
+    fn provides(&self) -> Vec<Kind> {
+        vec![Kind::DisplayChanged]
     }
 
     fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {

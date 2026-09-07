@@ -1,10 +1,9 @@
 //! Power source changes, from `IOKit`.
 
-use crate::sources::{
-    CallbackState, Cause, Emission, Emitter, Registration, Source, SourceId, StartError,
-};
+use crate::sources::{CallbackState, Cause, Emitter, Registration, Source, SourceId, StartError};
 use objc2_core_foundation::{CFRetained, CFRunLoop, CFRunLoopSource, CFString, CFType};
-use rsbar_protocol::{Event, Info, PowerSource};
+use rsbar_protocol::event::PowerChange;
+use rsbar_protocol::{Event, Kind, PowerSource};
 use std::ffi::c_void;
 
 #[link(name = "IOKit", kind = "framework")]
@@ -59,14 +58,11 @@ impl Watch {
             let Some(emit) = (unsafe { CallbackState::<Emitter>::recover(context) }) else {
                 return;
             };
-            let emission = Emission::new(
-                Event::PowerSourceChanged,
-                Info::Power {
-                    source: providing_source(),
-                },
-            );
+            let event = Event::PowerSourceChanged(PowerChange {
+                power_source: providing_source(),
+            });
             // Dropping beats blocking: this is an `IOKit` callback.
-            emit.send(emission);
+            emit.send(event);
         }
 
         let source = state.with_ptr(|context| {
@@ -94,8 +90,8 @@ impl Source for Power {
         SourceId("power")
     }
 
-    fn provides(&self) -> Vec<Event> {
-        vec![Event::PowerSourceChanged]
+    fn provides(&self) -> Vec<Kind> {
+        vec![Kind::PowerSourceChanged]
     }
 
     fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {

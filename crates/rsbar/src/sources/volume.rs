@@ -6,10 +6,9 @@
 //! So the device-change listener re-registers the volume listener on whatever
 //! became default.
 
-use crate::sources::{
-    CallbackState, Cause, Emission, Emitter, Registration, Source, SourceId, StartError,
-};
-use rsbar_protocol::{Event, Info};
+use crate::sources::{CallbackState, Cause, Emitter, Registration, Source, SourceId, StartError};
+use rsbar_protocol::event::VolumeChange;
+use rsbar_protocol::{Event, Kind};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 type AudioObjectId = u32;
@@ -282,14 +281,10 @@ extern "C-unwind" fn changed(
     }
     shared.last.store(scalar.to_bits(), Ordering::Relaxed);
 
-    let emission = Emission::new(
-        Event::VolumeChanged,
-        Info::Volume {
-            percent: percent(scalar),
-        },
-    );
     // Dropping beats blocking: this is a `CoreAudio` callback.
-    shared.emit.send(emission);
+    shared.emit.send(Event::VolumeChanged(VolumeChange {
+        volume: percent(scalar),
+    }));
     0
 }
 
@@ -398,8 +393,8 @@ impl Source for Volume {
         SourceId("volume")
     }
 
-    fn provides(&self) -> Vec<Event> {
-        vec![Event::VolumeChanged]
+    fn provides(&self) -> Vec<Kind> {
+        vec![Kind::VolumeChanged]
     }
 
     fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {

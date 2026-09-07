@@ -4,7 +4,7 @@ use async_mach_ports::{SendPort, Sender};
 use clap::{Args, Parser, Subcommand};
 use rsbar_protocol::style::Color;
 use rsbar_protocol::{
-    BarPatch, Edge, Event, Info, ItemName, ItemPatch, Json, Position, Query, Request, Response,
+    BarPatch, Edge, ItemName, ItemPatch, Json, Kind, Position, Query, Request, Response,
     service_name,
 };
 use std::process::ExitCode;
@@ -39,7 +39,7 @@ enum Command {
     /// Fire an event now, as a source would.
     Trigger {
         #[arg(value_parser = parse_event)]
-        event: Event,
+        event: Kind,
         /// Passed to scripts as RSBAR_INFO. JSON if it parses as JSON,
         /// otherwise a plain string.
         #[arg(long)]
@@ -98,7 +98,7 @@ enum ItemAction {
     Subscribe {
         name: ItemName,
         #[arg(required = true, value_parser = parse_event)]
-        events: Vec<Event>,
+        events: Vec<Kind>,
     },
 }
 
@@ -159,7 +159,7 @@ fn parse_position(s: &str) -> Result<Position, String> {
         .map_err(|e: rsbar_protocol::InvalidPosition| e.to_string())
 }
 
-fn parse_event(s: &str) -> Result<Event, String> {
+fn parse_event(s: &str) -> Result<Kind, String> {
     s.parse()
         .map_err(|e: rsbar_protocol::event::InvalidEvent| e.to_string())
 }
@@ -229,14 +229,15 @@ fn main() -> ExitCode {
             QueryWhat::Items => Query::Items,
             QueryWhat::Item { name } => Query::Item(name),
         }),
-        // A triggered event carries free text: the daemon cannot know what a
-        // config invented, only what it said.
-        Command::Trigger { event, info } => Request::Trigger {
-            event,
-            info: info.map_or(Info::None, |text| {
-                Info::Custom(Json::parse_or_string(&text))
-            }),
-        },
+        Command::Trigger { event, info } => {
+            let mut event = event.into_event();
+            // Only a custom event has somewhere to put free-form data; a
+            // built-in's payload is the source's to fill in.
+            if let (rsbar_protocol::Event::Custom(custom), Some(text)) = (&mut event, info) {
+                custom.data = Json::parse_or_string(&text);
+            }
+            Request::Trigger(event)
+        }
         Command::Update => Request::UpdateAll,
         Command::Reload => Request::Reload,
         Command::Shutdown => Request::Shutdown,

@@ -17,7 +17,7 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::system::SystemParam;
 use rsbar_protocol::style::{Color, FontSpec};
 use rsbar_protocol::{
-    Event, Info, ItemName, ItemPatch, ItemState, Query as ProtocolQuery, Request, Response,
+    Event, ItemName, ItemPatch, ItemState, Query as ProtocolQuery, Request, Response,
 };
 
 /// Every component a request can write.
@@ -75,16 +75,15 @@ pub struct ItemsRead<'w, 's> {
 impl Items<'_, '_> {
     /// The scripts to run for `event`, read through the write query.
     #[must_use]
-    pub fn jobs_for(&self, event: &Event, info: &Info) -> Vec<Job> {
+    pub fn jobs_for(&self, event: &Event) -> Vec<Job> {
         self.write
             .iter()
-            .filter(|row| row.9.0.contains(event))
+            .filter(|row| row.9.0.iter().any(|kind| kind.matches(event)))
             .filter_map(|row| {
                 Some(Job {
                     item: row.0.0.clone(),
                     script: row.10?.0.clone(),
-                    sender: event.clone(),
-                    info: info.clone(),
+                    event: event.clone(),
                 })
             })
             .collect()
@@ -99,8 +98,7 @@ impl Items<'_, '_> {
                 Some(Job {
                     item: row.0.0.clone(),
                     script: row.10?.0.clone(),
-                    sender: Event::Forced,
-                    info: Info::None,
+                    event: Event::Forced(rsbar_protocol::event::Forced {}),
                 })
             })
             .collect()
@@ -155,16 +153,15 @@ impl ItemsRead<'_, '_> {
     /// The scripts to run for `event`. Items without a script are skipped:
     /// subscribing a scriptless item is legal and simply does nothing.
     #[must_use]
-    pub fn jobs_for(&self, event: &Event, info: &Info) -> Vec<Job> {
+    pub fn jobs_for(&self, event: &Event) -> Vec<Job> {
         self.read
             .iter()
-            .filter(|(.., subscriptions, _)| subscriptions.0.contains(event))
+            .filter(|(.., subscriptions, _)| subscriptions.0.iter().any(|kind| kind.matches(event)))
             .filter_map(|(_, name, .., script)| {
                 Some(Job {
                     item: name.0.clone(),
                     script: script?.0.clone(),
-                    sender: event.clone(),
-                    info: info.clone(),
+                    event: event.clone(),
                 })
             })
             .collect()
@@ -179,8 +176,7 @@ impl ItemsRead<'_, '_> {
                 Some(Job {
                     item: name.0.clone(),
                     script: script?.0.clone(),
-                    sender: Event::Forced,
-                    info: Info::None,
+                    event: Event::Forced(rsbar_protocol::event::Forced {}),
                 })
             })
             .collect()
@@ -365,10 +361,10 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             Outcome::ok()
         }
 
-        Request::Trigger { event, info } => {
-            tracing::debug!(%event, ?info, "trigger");
+        Request::Trigger(event) => {
+            tracing::debug!(kind = %event.kind(), "trigger");
             Outcome {
-                jobs: items.jobs_for(&event, &info),
+                jobs: items.jobs_for(&event),
                 ..Outcome::ok()
             }
         }

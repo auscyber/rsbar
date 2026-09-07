@@ -1,80 +1,311 @@
-//! What an item can be told about.
+//! What happened, and what it carries.
+//!
+//! Both come out of one macro. Declaring an event in two places — a kind here
+//! and a payload there — is how they drift, and how a payload ends up as
+//! `Option<String>` that every script re-parses.
+//!
+//! The macro produces three things per declaration: a payload struct, a variant
+//! of [`Event`] carrying it, and a variant of [`Kind`] without it. [`Kind`] is
+//! what an item subscribes to — a subscription names an event, it does not
+//! carry one — and [`Event`] is what a source emits.
 
+use crate::Json;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-/// Why an item is being updated.
-///
-/// A `Custom` event is any name a config invented and triggers itself, so the
-/// set is open — unlike `SketchyBar`, which packs subscriptions into a `u64`
-/// mask and is therefore capped at 64 events in total.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// Where the machine is drawing power from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Event {
-    /// The periodic tick, gated per item by its update frequency.
-    Routine,
-    /// An explicit refresh, ignoring update frequency.
-    Forced,
-    FrontAppSwitched,
-    SpaceChanged,
-    DisplayChanged,
-    SystemWoke,
-    SystemWillSleep,
-    VolumeChanged,
-    BrightnessChanged,
-    PowerSourceChanged,
-    WifiChanged,
-    MediaChanged,
-    SpaceWindowsChanged,
-    /// The config file changed on disk and has been re-run.
-    ConfigReloaded,
-    Custom(String),
+pub enum PowerSource {
+    Ac,
+    Battery,
+    /// What a machine reports before anything has asked, and what a failed
+    /// query returns.
+    #[default]
+    Unknown,
+}
+
+impl fmt::Display for PowerSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The spelling a script matches on, so it is part of the interface.
+        f.write_str(match self {
+            Self::Ac => "AC",
+            Self::Battery => "BATTERY",
+            Self::Unknown => "UNKNOWN",
+        })
+    }
+}
+
+/// Which mouse button was used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseButton {
+    #[default]
+    Left,
+    Right,
+    Other,
+}
+
+impl fmt::Display for MouseButton {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Other => "other",
+        })
+    }
+}
+
+bitflags::bitflags! {
+    /// The modifier keys held during a click or scroll.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct Modifiers: u8 {
+        const SHIFT = 1 << 0;
+        const CTRL  = 1 << 1;
+        const ALT   = 1 << 2;
+        const CMD   = 1 << 3;
+        const FN    = 1 << 4;
+    }
+}
+
+/// Serialised as its bits rather than bitflags' own string form: postcard is
+/// the wire format, and a byte beats a list of names.
+impl Serialize for Modifiers {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.bits().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Modifiers {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Truncating rather than failing: an unknown bit from a newer client is
+        // a modifier we do not model, not a corrupt message.
+        Ok(Self::from_bits_truncate(u8::deserialize(deserializer)?))
+    }
+}
+
+impl fmt::Display for Modifiers {
+    /// A comma-separated list, or `none`. A script splits on commas rather than
+    /// decoding a bitmask.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_empty() {
+            return f.write_str("none");
+        }
+        let names = [
+            (Self::SHIFT, "shift"),
+            (Self::CTRL, "ctrl"),
+            (Self::ALT, "alt"),
+            (Self::CMD, "cmd"),
+            (Self::FN, "fn"),
+        ];
+        let held: Vec<&str> = names
+            .iter()
+            .filter(|(flag, _)| self.contains(*flag))
+            .map(|(_, name)| *name)
+            .collect();
+        f.write_str(&held.join(","))
+    }
+}
+
+/// Declares the built-in events.
+///
+/// `Variant = "name" => Payload { field: Type }` gives a payload struct, an
+/// `Event::Variant(Payload)`, and a `Kind::Variant` named `"name"`.
+///
+/// Every field also becomes an environment variable for scripts, named
+/// `RSBAR_` plus the field in upper case. That is why the fields are named
+/// what a config would call them.
+macro_rules! events {
+    (
+        $(
+            $variant:ident = $name:literal => $data:ident {
+                $( $field:ident : $ty:ty ),* $(,)?
+            }
+        ),* $(,)?
+    ) => {
+        $(
+            #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+            pub struct $data {
+                $( pub $field: $ty, )*
+            }
+
+            impl $data {
+                /// This payload's fields, as a script sees them.
+                // Built by pushing because the field list is a macro
+                // repetition; `vec![]` cannot be written for one.
+                #[allow(unused_mut, clippy::vec_init_then_push)]
+                #[must_use]
+                pub fn fields(&self) -> Vec<(String, String)> {
+                    let mut fields = Vec::new();
+                    $( fields.push((stringify!($field).to_owned(), self.$field.to_string())); )*
+                    fields
+                }
+            }
+        )*
+
+        /// Something that happened, with what it carries.
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        pub enum Event {
+            $( $variant($data), )*
+            /// An event a config invented and triggers itself.
+            Custom(Custom),
+        }
+
+        /// What an item subscribes to: an event without its payload.
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        pub enum Kind {
+            $( $variant, )*
+            Custom(String),
+        }
+
+        impl Event {
+            /// What this is, for matching a subscription against.
+            #[must_use]
+            pub fn kind(&self) -> Kind {
+                match self {
+                    $( Self::$variant(_) => Kind::$variant, )*
+                    Self::Custom(custom) => Kind::Custom(custom.name.clone()),
+                }
+            }
+
+            /// The payload's fields, as a script sees them.
+            #[must_use]
+            pub fn fields(&self) -> Vec<(String, String)> {
+                match self {
+                    $( Self::$variant(data) => data.fields(), )*
+                    Self::Custom(custom) => custom.fields(),
+                }
+            }
+        }
+
+        impl Kind {
+            /// The name a config writes, and a script reads in `RSBAR_SENDER`.
+            #[must_use]
+            pub fn name(&self) -> &str {
+                match self {
+                    $( Self::$variant => $name, )*
+                    Self::Custom(name) => name,
+                }
+            }
+
+            /// Every built-in, for validating a subscription and for `--help`.
+            #[must_use]
+            pub fn built_in() -> Vec<Kind> {
+                vec![ $( Kind::$variant, )* ]
+            }
+
+            /// Whether `event` is one of these.
+            ///
+            /// Generated alongside the variants so a new event cannot be added
+            /// without the match arm that recognises it. Compares directly
+            /// rather than going through [`Event::kind`], which would allocate
+            /// a name for every custom event on every dispatch.
+            #[must_use]
+            pub fn matches(&self, event: &Event) -> bool {
+                match (self, event) {
+                    $( (Self::$variant, Event::$variant(_)) => true, )*
+                    (Self::Custom(name), Event::Custom(custom)) => *name == custom.name,
+                    _ => false,
+                }
+            }
+
+            /// An event of this kind carrying nothing.
+            ///
+            /// What `--trigger` produces: a client naming an event knows the
+            /// name, not the payload the source would have filled in.
+            #[must_use]
+            pub fn into_event(self) -> Event {
+                match self {
+                    $( Self::$variant => Event::$variant($data::default()), )*
+                    Self::Custom(name) => {
+                        Event::Custom(Custom { name, data: Json::Null })
+                    }
+                }
+            }
+        }
+    };
+}
+
+events! {
+    Routine = "routine" => Routine {},
+    Forced = "forced" => Forced {},
+    FrontAppSwitched = "front_app_switched" => FrontApp { app: String },
+    SpaceChanged = "space_changed" => SpaceChange { display: u32, space: u64 },
+    DisplayChanged = "display_changed" => DisplayChange {},
+    SystemWoke = "system_woke" => SystemWoke {},
+    SystemWillSleep = "system_will_sleep" => SystemWillSleep {},
+    VolumeChanged = "volume_changed" => VolumeChange { volume: u8 },
+    BrightnessChanged = "brightness_changed" => BrightnessChange { brightness: u8 },
+    PowerSourceChanged = "power_source_changed" => PowerChange { power_source: PowerSource },
+    WifiChanged = "wifi_changed" => WifiChange { ssid: String },
+    MediaChanged = "media_changed" => MediaChange { media: Json },
+    SpaceWindowsChanged = "space_windows_changed" => SpaceWindowsChange { space: u64 },
+    ConfigReloaded = "config_reloaded" => ConfigReload {},
+
+    // The pointer. `.global` fires for the bar as a whole rather than for one
+    // item, which is how a config reacts to the empty space between items.
+    MouseEntered = "mouse.entered" => MouseEnter {},
+    MouseExited = "mouse.exited" => MouseExit {},
+    MouseEnteredGlobal = "mouse.entered.global" => MouseEnterGlobal {},
+    MouseExitedGlobal = "mouse.exited.global" => MouseExitGlobal {},
+    MouseClicked = "mouse.clicked" => MouseClick { button: MouseButton, modifiers: Modifiers },
+    MouseScrolled = "mouse.scrolled" => Scroll { scroll_delta: f64, modifiers: Modifiers },
+    MouseScrolledGlobal = "mouse.scrolled.global" => ScrollGlobal { scroll_delta: f64, modifiers: Modifiers },
+}
+
+/// An event a config invented. Its payload is whatever the trigger passed.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Custom {
+    pub name: String,
+    pub data: Json,
+}
+
+impl Custom {
+    fn fields(&self) -> Vec<(String, String)> {
+        match &self.data {
+            Json::Null => Vec::new(),
+            data => vec![("data".to_owned(), data.to_string())],
+        }
+    }
 }
 
 impl Event {
-    /// The name a script sees in `RSBAR_SENDER`.
+    /// The environment a script is handed, beyond `RSBAR_NAME`.
+    ///
+    /// `RSBAR_SENDER` is the event's name. `RSBAR_INFO` is the payload as one
+    /// value — the field itself when there is exactly one, a JSON object when
+    /// there are several, empty when there are none — which is what a config
+    /// already reaches for. Every field also arrives under its own name, so a
+    /// script that wants the volume can read `RSBAR_VOLUME` instead of parsing.
     #[must_use]
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Routine => "routine",
-            Self::Forced => "forced",
-            Self::FrontAppSwitched => "front_app_switched",
-            Self::SpaceChanged => "space_changed",
-            Self::DisplayChanged => "display_changed",
-            Self::SystemWoke => "system_woke",
-            Self::SystemWillSleep => "system_will_sleep",
-            Self::VolumeChanged => "volume_changed",
-            Self::BrightnessChanged => "brightness_changed",
-            Self::PowerSourceChanged => "power_source_changed",
-            Self::WifiChanged => "wifi_changed",
-            Self::MediaChanged => "media_changed",
-            Self::SpaceWindowsChanged => "space_windows_changed",
-            Self::ConfigReloaded => "config_reloaded",
-            Self::Custom(name) => name,
-        }
-    }
+    pub fn env(&self) -> Vec<(String, String)> {
+        let fields = self.fields();
+        let info = match fields.as_slice() {
+            [] => String::new(),
+            [(_, only)] => only.clone(),
+            many => Json::Object(
+                many.iter()
+                    .map(|(k, v)| (k.clone(), Json::String(v.clone())))
+                    .collect(),
+            )
+            .to_string(),
+        };
 
-    /// The events a config can name, excluding `Custom`.
-    pub const BUILT_IN: [Self; 14] = [
-        Self::Routine,
-        Self::Forced,
-        Self::FrontAppSwitched,
-        Self::SpaceChanged,
-        Self::DisplayChanged,
-        Self::SystemWoke,
-        Self::SystemWillSleep,
-        Self::VolumeChanged,
-        Self::BrightnessChanged,
-        Self::PowerSourceChanged,
-        Self::WifiChanged,
-        Self::MediaChanged,
-        Self::SpaceWindowsChanged,
-        Self::ConfigReloaded,
-    ];
+        let mut env = vec![
+            ("RSBAR_SENDER".to_owned(), self.kind().name().to_owned()),
+            ("RSBAR_INFO".to_owned(), info),
+        ];
+        env.extend(
+            fields
+                .into_iter()
+                .map(|(name, value)| (format!("RSBAR_{}", name.to_uppercase()), value)),
+        );
+        env
+    }
 }
 
-impl fmt::Display for Event {
+impl fmt::Display for Kind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
     }
@@ -84,14 +315,17 @@ impl fmt::Display for Event {
 #[error("`{0}` is not an event name")]
 pub struct InvalidEvent(String);
 
-impl FromStr for Event {
+impl FromStr for Kind {
     type Err = InvalidEvent;
 
     /// Accepts `-` as well as `_`, since a CLI reads better with dashes.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let normalised = s.replace('-', "_").to_ascii_lowercase();
-        if let Some(event) = Self::BUILT_IN.iter().find(|e| e.name() == normalised) {
-            return Ok(event.clone());
+        if let Some(kind) = Self::built_in()
+            .into_iter()
+            .find(|k| k.name() == normalised)
+        {
+            return Ok(kind);
         }
         // A custom event has to be nameable by the same rules, or a typo in a
         // built-in name would silently become a custom event nobody triggers.
@@ -112,21 +346,135 @@ mod tests {
 
     #[test]
     fn built_in_names_round_trip() {
-        for event in &Event::BUILT_IN {
-            assert_eq!(event.name().parse::<Event>().as_ref(), Ok(event));
+        for kind in Kind::built_in() {
+            assert_eq!(kind.name().parse::<Kind>().as_ref(), Ok(&kind));
         }
     }
 
     #[test]
     fn dashes_and_case_are_accepted() {
-        assert_eq!("front-app-switched".parse(), Ok(Event::FrontAppSwitched));
-        assert_eq!("SYSTEM_WOKE".parse(), Ok(Event::SystemWoke));
+        assert_eq!("front-app-switched".parse(), Ok(Kind::FrontAppSwitched));
+        assert_eq!("SYSTEM_WOKE".parse(), Ok(Kind::SystemWoke));
     }
 
     #[test]
     fn custom_events_are_still_validated() {
-        assert_eq!("my.event".parse(), Ok(Event::Custom("my.event".into())));
-        assert!("has space".parse::<Event>().is_err());
-        assert!("".parse::<Event>().is_err());
+        assert_eq!("my.event".parse(), Ok(Kind::Custom("my.event".into())));
+        assert!("has space".parse::<Kind>().is_err());
+        assert!("".parse::<Kind>().is_err());
+    }
+
+    #[test]
+    fn an_event_knows_its_own_kind() {
+        let event = Event::VolumeChanged(VolumeChange { volume: 42 });
+        assert_eq!(event.kind(), Kind::VolumeChanged);
+    }
+
+    #[test]
+    fn a_single_field_becomes_info_directly() {
+        let env = Event::VolumeChanged(VolumeChange { volume: 42 }).env();
+        assert!(env.contains(&("RSBAR_SENDER".into(), "volume_changed".into())));
+        assert!(env.contains(&("RSBAR_INFO".into(), "42".into())));
+        assert!(env.contains(&("RSBAR_VOLUME".into(), "42".into())));
+    }
+
+    #[test]
+    fn several_fields_become_a_json_object_and_named_variables() {
+        let env = Event::SpaceChanged(SpaceChange {
+            display: 2,
+            space: 7,
+        })
+        .env();
+        assert!(env.contains(&("RSBAR_DISPLAY".into(), "2".into())));
+        assert!(env.contains(&("RSBAR_SPACE".into(), "7".into())));
+        let info = env.iter().find(|(k, _)| k == "RSBAR_INFO").unwrap();
+        assert!(
+            info.1.contains("\"display\""),
+            "several fields render as an object: {}",
+            info.1
+        );
+    }
+
+    #[test]
+    fn an_empty_payload_still_sets_info_so_a_script_never_sees_it_unset() {
+        let env = Event::SystemWoke(SystemWoke {}).env();
+        assert!(env.contains(&("RSBAR_INFO".into(), String::new())));
+    }
+
+    #[test]
+    fn a_custom_event_carries_its_own_name_and_data() {
+        let event = Event::Custom(Custom {
+            name: "my.event".into(),
+            data: Json::parse_or_string("hi"),
+        });
+        assert_eq!(event.kind(), Kind::Custom("my.event".into()));
+        let env = event.env();
+        assert!(env.contains(&("RSBAR_SENDER".into(), "my.event".into())));
+        assert!(env.contains(&("RSBAR_INFO".into(), "hi".into())));
+    }
+
+    #[test]
+    fn a_tag_matches_only_its_own_event() {
+        let volume = Event::VolumeChanged(VolumeChange { volume: 42 });
+        assert!(Kind::VolumeChanged.matches(&volume));
+        assert!(!Kind::SystemWoke.matches(&volume));
+    }
+
+    #[test]
+    fn custom_tags_match_by_name() {
+        let mine = Event::Custom(Custom {
+            name: "mine".into(),
+            data: Json::Null,
+        });
+        assert!(Kind::Custom("mine".into()).matches(&mine));
+        assert!(!Kind::Custom("yours".into()).matches(&mine));
+        assert!(!Kind::VolumeChanged.matches(&mine));
+    }
+
+    #[test]
+    fn matching_agrees_with_the_tag_an_event_reports() {
+        // The two must not be able to disagree.
+        for kind in Kind::built_in() {
+            let event = kind.clone().into_event();
+            assert_eq!(event.kind(), kind);
+            assert!(kind.matches(&event));
+        }
+    }
+
+    #[test]
+    fn mouse_events_keep_the_dotted_names_a_config_writes() {
+        assert_eq!("mouse.clicked".parse(), Ok(Kind::MouseClicked));
+        assert_eq!(
+            "mouse.scrolled.global".parse(),
+            Ok(Kind::MouseScrolledGlobal)
+        );
+        assert_eq!(Kind::MouseEnteredGlobal.name(), "mouse.entered.global");
+    }
+
+    #[test]
+    fn a_click_reports_its_button_and_modifiers_by_name() {
+        let click = Event::MouseClicked(MouseClick {
+            button: MouseButton::Right,
+            modifiers: Modifiers::CMD | Modifiers::SHIFT,
+        });
+        let env = click.env();
+        assert!(env.contains(&("RSBAR_BUTTON".into(), "right".into())));
+        assert!(env.contains(&("RSBAR_MODIFIERS".into(), "shift,cmd".into())));
+    }
+
+    #[test]
+    fn no_modifiers_reads_as_none_rather_than_empty() {
+        // A script comparing against "" would be a trap.
+        assert_eq!(Modifiers::empty().to_string(), "none");
+    }
+
+    #[test]
+    fn events_round_trip_through_the_wire_format() {
+        let event = Event::SpaceChanged(SpaceChange {
+            display: 1,
+            space: 9,
+        });
+        let bytes = postcard::to_allocvec(&event).unwrap();
+        assert_eq!(postcard::from_bytes::<Event>(&bytes).unwrap(), event);
     }
 }

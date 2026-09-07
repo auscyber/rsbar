@@ -6,12 +6,10 @@
 #![cfg(target_os = "macos")]
 
 pub mod event;
-pub mod info;
 pub mod json;
 pub mod style;
 
-pub use event::Event;
-pub use info::{Info, PowerSource};
+pub use event::{Event, Kind, PowerSource};
 pub use json::Json;
 
 use serde::{Deserialize, Serialize};
@@ -184,13 +182,10 @@ pub enum Request {
     /// Replaces the item's subscriptions.
     Subscribe {
         name: ItemName,
-        events: Vec<Event>,
+        events: Vec<Kind>,
     },
     /// Fires an event now, as if a source had produced it.
-    Trigger {
-        event: Event,
-        info: Info,
-    },
+    Trigger(Event),
     /// Runs every item's script immediately, ignoring update frequency.
     UpdateAll,
     /// Re-runs the config from scratch, as a file change does.
@@ -222,7 +217,7 @@ pub struct ItemState {
     pub drawing: bool,
     pub script: Option<String>,
     pub update_freq: u32,
-    pub events: Vec<Event>,
+    pub events: Vec<Kind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

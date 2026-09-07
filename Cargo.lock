@@ -1191,6 +1191,7 @@ dependencies = [
 name = "rsbar-protocol"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "postcard",
  "serde",
  "serde_json",

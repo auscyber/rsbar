@@ -1,16 +1,18 @@
 //! Workspace events: the front application, spaces, displays, sleep and wake.
 
-use crate::sources::{Emission, Emitter, Registration, Source, SourceId, StartError};
+use crate::sources::{Emitter, Registration, Source, SourceId, StartError};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2_app_kit::{NSRunningApplication, NSWorkspace};
 use objc2_foundation::{NSNotification, NSNotificationCenter, NSNotificationName, NSString};
-use rsbar_protocol::{Event, Info};
+use rsbar_protocol::event::{DisplayChange, FrontApp, SpaceChange, SystemWillSleep, SystemWoke};
+use rsbar_protocol::{Event, Kind};
 
 /// What a notification contributes to `RSBAR_INFO`, beyond the bare fact that
 /// it happened.
-type ExtractInfo = fn(&NSNotification) -> Info;
+/// Builds the event a notification means, reading whatever it carries.
+type ToEvent = fn(&NSNotification) -> Event;
 
 /// Keeps observers registered. Dropping it deregisters them, on the thread that
 /// registered them.
@@ -32,20 +34,14 @@ impl Observers {
 
     /// Registers one notification as `event`, carrying whatever `info` pulls
     /// out of it.
-    fn observe(
-        &mut self,
-        name: &NSNotificationName,
-        emit: &Emitter,
-        event: Event,
-        info: ExtractInfo,
-    ) {
+    fn observe(&mut self, name: &NSNotificationName, emit: &Emitter, to_event: ToEvent) {
         let emit = emit.clone();
         let block = RcBlock::new(move |note: std::ptr::NonNull<NSNotification>| {
             // SAFETY: the notification is live for the duration of the call.
-            let info = info(unsafe { note.as_ref() });
+            let event = to_event(unsafe { note.as_ref() });
             // A full channel means the daemon is not keeping up. Dropping the
             // event beats blocking a system notification callback.
-            emit.send(Emission::new(event.clone(), info));
+            emit.send(event);
         });
 
         let token = unsafe {
@@ -65,29 +61,41 @@ impl Drop for Observers {
     }
 }
 
-/// Notifications that carry nothing worth passing on.
-fn no_info(_: &NSNotification) -> Info {
-    Info::None
-}
-
-/// The localized name of the application a workspace notification is about.
-fn app_name(note: &NSNotification) -> Info {
+/// The localized name of the application a notification is about, as the event
+/// it means.
+fn front_app(note: &NSNotification) -> Event {
     let Some(info) = note.userInfo() else {
-        return Info::None;
+        return Event::FrontAppSwitched(FrontApp::default());
     };
     let key = NSString::from_str("NSWorkspaceApplicationKey");
     // A checked downcast rather than a transmute: the key is documented to hold
     // an NSRunningApplication, but this dictionary comes from another process's
     // notification, so it is worth actually verifying.
-    let Some(app) = info
+    let app = info
         .objectForKey(&key)
         .and_then(|value| value.downcast::<NSRunningApplication>().ok())
-    else {
-        return Info::None;
-    };
-    app.localizedName().map_or(Info::None, |name| Info::App {
-        name: name.to_string(),
-    })
+        .and_then(|app| app.localizedName())
+        .map(|name| name.to_string())
+        .unwrap_or_default();
+    Event::FrontAppSwitched(FrontApp { app })
+}
+
+fn space_changed(_: &NSNotification) -> Event {
+    // The notification says only that it happened; which space is a separate
+    // question the window server answers.
+    Event::SpaceChanged(SpaceChange::default())
+}
+
+fn display_changed(_: &NSNotification) -> Event {
+    Event::DisplayChanged(DisplayChange {})
+}
+
+fn will_sleep(_: &NSNotification) -> Event {
+    Event::SystemWillSleep(SystemWillSleep {})
+}
+
+fn woke(_: &NSNotification) -> Event {
+    Event::SystemWoke(SystemWoke {})
 }
 
 pub struct Workspace;
@@ -97,13 +105,13 @@ impl Source for Workspace {
         SourceId("workspace")
     }
 
-    fn provides(&self) -> Vec<Event> {
+    fn provides(&self) -> Vec<Kind> {
         vec![
-            Event::FrontAppSwitched,
-            Event::SpaceChanged,
-            Event::DisplayChanged,
-            Event::SystemWoke,
-            Event::SystemWillSleep,
+            Kind::FrontAppSwitched,
+            Kind::SpaceChanged,
+            Kind::DisplayChanged,
+            Kind::SystemWoke,
+            Kind::SystemWillSleep,
         ]
     }
 
@@ -114,36 +122,29 @@ impl Source for Workspace {
         // `NSWorkspaceActiveDisplayDidChangeNotification` is undocumented and
         // absent from the generated bindings, so it is named by string — the
         // same way SketchyBar reaches it.
-        let display_changed = NSString::from_str("NSWorkspaceActiveDisplayDidChangeNotification");
+        let display_notification =
+            NSString::from_str("NSWorkspaceActiveDisplayDidChangeNotification");
 
-        for (name, event, info) in [
+        for (name, to_event) in [
             (
                 unsafe { objc2_app_kit::NSWorkspaceDidActivateApplicationNotification },
-                Event::FrontAppSwitched,
-                app_name as ExtractInfo,
+                front_app as ToEvent,
             ),
             (
                 unsafe { objc2_app_kit::NSWorkspaceActiveSpaceDidChangeNotification },
-                Event::SpaceChanged,
-                no_info as ExtractInfo,
+                space_changed as ToEvent,
             ),
-            (
-                &display_changed,
-                Event::DisplayChanged,
-                no_info as ExtractInfo,
-            ),
+            (&display_notification, display_changed as ToEvent),
             (
                 unsafe { objc2_app_kit::NSWorkspaceWillSleepNotification },
-                Event::SystemWillSleep,
-                no_info as ExtractInfo,
+                will_sleep as ToEvent,
             ),
             (
                 unsafe { objc2_app_kit::NSWorkspaceDidWakeNotification },
-                Event::SystemWoke,
-                no_info as ExtractInfo,
+                woke as ToEvent,
             ),
         ] {
-            observers.observe(name, &emit, event, info);
+            observers.observe(name, &emit, to_event);
         }
 
         Ok(Box::new(observers))

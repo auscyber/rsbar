@@ -9,7 +9,7 @@
 
 use bevy_ecs::prelude::*;
 use rsbar_protocol::style::{Color, FontSpec};
-use rsbar_protocol::{Event, ItemName, Position};
+use rsbar_protocol::{ItemName, Kind, Position};
 use std::collections::{BTreeSet, HashMap};
 
 /// Marks an entity as a bar item.
@@ -113,7 +113,7 @@ impl Routine {
 }
 
 #[derive(Component, Debug, Clone, Default, PartialEq, Eq)]
-pub struct Subscriptions(pub BTreeSet<Event>);
+pub struct Subscriptions(pub BTreeSet<Kind>);
 
 /// Name to entity, so a request naming an item does not scan every one.
 ///

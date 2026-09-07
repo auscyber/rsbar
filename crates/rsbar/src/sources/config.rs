@@ -4,9 +4,10 @@
 //! stream everything else does.
 
 use crate::config::{self, Debounce, Shared};
-use crate::sources::{Cause, Emission, Emitter, Registration, Source, SourceId, StartError};
+use crate::sources::{Cause, Emitter, Registration, Source, SourceId, StartError};
 use notify::{RecursiveMode, Watcher as _};
-use rsbar_protocol::Event;
+use rsbar_protocol::event::ConfigReload;
+use rsbar_protocol::{Event, Kind};
 use std::time::Duration;
 
 /// How long one save is allowed to keep producing events.
@@ -21,8 +22,8 @@ impl Source for Watcher {
         SourceId("config")
     }
 
-    fn provides(&self) -> Vec<Event> {
-        vec![Event::ConfigReloaded]
+    fn provides(&self) -> Vec<Kind> {
+        vec![Kind::ConfigReloaded]
     }
 
     fn register(&mut self, emit: Emitter) -> Result<Registration, StartError> {
@@ -50,7 +51,7 @@ impl Source for Watcher {
                 if !debounce.admit() {
                     return;
                 }
-                emit.send(Emission::bare(Event::ConfigReloaded));
+                emit.send(Event::ConfigReloaded(ConfigReload {}));
             })
             .map_err(|err| StartError::new(SourceId("config"), Cause::from(err)))?;
 
