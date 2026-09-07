@@ -32,7 +32,9 @@
 )]
 
 use crate::bar::{Panels, Settings};
-use crate::components::{Icon, Index, Item, Label, Name, Routine, Script, Stale};
+use crate::components::{
+    AliasContent, AliasSpec, Icon, Index, Item, Label, Name, Routine, Script, Stale,
+};
 use crate::config::Shared as SharedConfig;
 use crate::layout::{self, ForceRepaint, Hit, Placements};
 use crate::requests::{Context, Items, ItemsRead};
@@ -119,6 +121,7 @@ pub fn build(
         .insert_non_send(panels)
         .insert_non_send(Sources(registry))
         .insert_non_send(Cache::default())
+        .insert_non_send(crate::alias::Captures::default())
         .insert_resource(settings)
         .init_resource::<Index>()
         .init_resource::<Queue>()
@@ -153,6 +156,7 @@ pub fn build(
             Last,
             (
                 settle_sources,
+                refresh_aliases,
                 layout::repaint.run_if(layout::needs_repaint),
                 layout::clear_force_repaint,
             )
@@ -229,6 +233,24 @@ fn settle_sources(mut sources: NonSendMut<Sources>) {
     sources.0.settle();
 }
 
+/// Re-captures every alias item, and says so only when one actually changed.
+///
+/// `SketchyBar` redraws an alias whether or not it moved. Comparing what came
+/// back against what was drawn means a menu bar clock that changes once a
+/// minute costs one repaint a minute rather than one a second — and because
+/// the digest lands on a component, the damage tracker repaints just that
+/// item's rect.
+fn refresh_aliases(
+    mut captures: NonSendMut<crate::alias::Captures>,
+    mut items: Query<(Entity, &AliasSpec, &mut AliasContent)>,
+) {
+    for (entity, spec, mut content) in &mut items {
+        if let Some(digest) = captures.refresh(entity, &spec.0) {
+            content.set_if_neq(AliasContent(digest));
+        }
+    }
+}
+
 fn drain_events(mut sources: NonSendMut<Sources>, mut out: MessageWriter<EventMessage>) {
     sources.0.drain(|id, event| {
         tracing::trace!(source = %id, kind = %event.kind(), "drained");
@@ -296,7 +318,10 @@ fn dispatch_events(
         sources
             .0
             .dependents_into(event, &Target::All, &mut dependents);
-        read.push_jobs(event, &dependents, &mut queue.0);
+        // One allocation for the event, then a reference count per item that
+        // wants it, rather than a deep copy of the payload each.
+        let shared = std::sync::Arc::new(event.clone());
+        read.push_jobs(&shared, &dependents, &mut queue.0);
     }
 }
 
@@ -389,7 +414,9 @@ fn route_pointer(
         };
         match placements.hit(objc2_core_foundation::CGPoint::new(x, y)) {
             Hit::Item { entity, .. } => {
-                queue.0.extend(read.jobs_for_item(entity, event));
+                queue
+                    .0
+                    .extend(read.jobs_for_item(entity, &std::sync::Arc::new(event.clone())));
             }
             // On the bar but not on an item. The `.global` events exist for
             // exactly this, and are matched the ordinary way.
@@ -420,7 +447,7 @@ fn pointer_location(event: &Event) -> Option<(f64, f64)> {
 fn tick(
     time: Res<bevy_time::Time<bevy_time::Real>>,
     mut since: Local<Duration>,
-    mut items: Query<(&Name, &mut Routine, Option<&Script>)>,
+    mut items: Query<(Entity, &Name, &mut Routine, Option<&Script>)>,
     mut queue: ResMut<Queue>,
 ) {
     *since += time.delta();
@@ -430,16 +457,17 @@ fn tick(
     // Subtract rather than zero, so a late wake does not lose the remainder.
     *since -= TICK;
 
-    for (name, mut routine, script) in &mut items {
+    for (entity, name, mut routine, script) in &mut items {
         // `bypass_change_detection`, because a routine clock ticking is not a
         // reason to repaint — only what the script then sets is.
         if routine.bypass_change_detection().tick()
             && let Some(script) = script
         {
             queue.0.push(Job {
+                entity,
                 item: name.0.clone(),
-                script: script.0.clone(),
-                event: Event::Routine(rsbar_protocol::event::Routine {}),
+                script: std::sync::Arc::clone(&script.0),
+                event: std::sync::Arc::new(Event::Routine(rsbar_protocol::event::Routine {})),
             });
         }
     }

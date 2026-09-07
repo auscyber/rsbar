@@ -81,7 +81,7 @@ impl Harness {
             .get(&self.world)
             .expect("item params are always valid");
         let dependents = self.sources.dependents(event, &crate::sources::Target::All);
-        read.jobs_for(event, &dependents)
+        read.jobs_for(&std::sync::Arc::new(event.clone()), &dependents)
     }
 
     /// The items, as `--query items` would report them.
@@ -494,7 +494,8 @@ mod tests {
         let jobs = bar.jobs_for(&Event::VolumeChanged(VolumeChange { volume: 1 }));
         assert_eq!(jobs.len(), 1);
         assert_eq!(
-            jobs[0].script, "updated",
+            jobs[0].script.as_ref(),
+            "updated",
             "the update script, not the click one"
         );
 
@@ -577,7 +578,7 @@ mod tests {
             outcome
                 .jobs
                 .iter()
-                .all(|job| matches!(job.event, Event::Forced(Forced {})))
+                .all(|job| matches!(*job.event, Event::Forced(Forced {})))
         );
     }
 

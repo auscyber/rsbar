@@ -87,7 +87,7 @@ pub struct Placement(pub Position);
 pub struct Drawing(pub bool);
 
 #[derive(Component, Debug, Clone, PartialEq, Eq)]
-pub struct Script(pub String);
+pub struct Script(pub std::sync::Arc<str>);
 
 /// Run when this item is clicked, instead of the update script.
 ///
@@ -95,7 +95,7 @@ pub struct Script(pub String);
 /// keeps the item's contents current, the other acts on the user. An item can
 /// have either, both, or neither.
 #[derive(Component, Debug, Clone, PartialEq, Eq)]
-pub struct ClickScript(pub String);
+pub struct ClickScript(pub std::sync::Arc<str>);
 
 /// A routine update, in whole seconds.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +122,22 @@ impl Routine {
 
 #[derive(Component, Debug, Clone, Default, PartialEq, Eq)]
 pub struct Subscriptions(pub BTreeSet<Kind>);
+
+/// The menu bar item this one mirrors, as `Owner,Name`.
+///
+/// Only the spec lives here. The captured image is a `CGImage` and so cannot
+/// be a component; it sits in the [`Captures`](crate::alias::Captures) cache
+/// alongside the shaped text, keyed by entity.
+#[derive(Component, Debug, Clone, PartialEq, Eq)]
+pub struct AliasSpec(pub String);
+
+/// A digest of what the alias last drew.
+///
+/// Its own component so that change detection sees a menu bar item whose icon
+/// actually changed, and does not see one that was re-captured and came back
+/// identical — which is most re-captures.
+#[derive(Component, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AliasContent(pub u64);
 
 /// The claims this item holds on the sources behind its subscriptions.
 ///

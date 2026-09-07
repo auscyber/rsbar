@@ -16,6 +16,7 @@
 //! the pipes produced is the truth, and a lost reap is logged at debug rather
 //! than reported as a failure.
 
+use bevy_ecs::entity::Entity;
 use rsbar_protocol::{Event, ItemName};
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -24,11 +25,21 @@ use std::sync::{Arc, Mutex};
 
 /// One script to run, with the context its environment describes.
 pub struct Job {
+    /// Which item this belongs to. The entity rather than the name: a script's
+    /// result comes back addressed to something, and looking the name up again
+    /// can find a different item — or nothing — if a reload has been through in
+    /// the meantime.
+    pub entity: Entity,
     pub item: ItemName,
-    pub script: String,
+    /// Shared, not copied. One event dispatched to a dozen items used to clone
+    /// the script text a dozen times; this is a reference count instead.
+    pub script: Arc<str>,
     /// Why this is running, and what it carries. One value rather than a
     /// sender and a payload, because they were never independent.
-    pub event: Event,
+    ///
+    /// Shared for the same reason: an event with a payload is not small, and
+    /// every item watching it was being handed its own copy.
+    pub event: Arc<Event>,
 }
 
 /// A fixed pool of workers.
@@ -108,7 +119,7 @@ fn run(job: &Job) {
         command
     } else {
         let mut command = Command::new("/bin/sh");
-        command.arg("-c").arg(&job.script);
+        command.arg("-c").arg(job.script.as_ref());
         command
     };
 

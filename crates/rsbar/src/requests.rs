@@ -21,6 +21,7 @@ use rsbar_protocol::{
     Event, ItemName, ItemPatch, ItemState, Kind, Query as ProtocolQuery, Request, Response,
 };
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 /// Every component a request can write.
 ///
@@ -32,6 +33,7 @@ use std::collections::BTreeSet;
 #[derive(QueryData)]
 #[query_data(mutable)]
 pub struct ItemWrite {
+    pub entity: Entity,
     pub name: &'static Name,
     pub icon: &'static mut Icon,
     pub label: &'static mut Label,
@@ -94,15 +96,16 @@ impl Items<'_, '_> {
     /// `dependents` comes from the claims, so this never scans: an event goes
     /// to what asked for it, and an event nothing asked for costs nothing.
     #[must_use]
-    pub fn jobs_for(&self, event: &Event, dependents: &[Entity]) -> Vec<Job> {
+    pub fn jobs_for(&self, event: &Arc<Event>, dependents: &[Entity]) -> Vec<Job> {
         dependents
             .iter()
             .filter_map(|entity| {
                 let row = self.write.get(*entity).ok()?;
                 Some(Job {
+                    entity: row.entity,
                     item: row.name.0.clone(),
-                    script: row.script?.0.clone(),
-                    event: event.clone(),
+                    script: Arc::clone(&row.script?.0),
+                    event: Arc::clone(event),
                 })
             })
             .collect()
@@ -115,9 +118,10 @@ impl Items<'_, '_> {
             .iter()
             .filter_map(|row| {
                 Some(Job {
+                    entity: row.entity,
                     item: row.name.0.clone(),
-                    script: row.script?.0.clone(),
-                    event: Event::Forced(rsbar_protocol::event::Forced {}),
+                    script: Arc::clone(&row.script?.0),
+                    event: Arc::new(Event::Forced(rsbar_protocol::event::Forced {})),
                 })
             })
             .collect()
@@ -146,8 +150,8 @@ fn write_state(row: &ItemWriteReadOnlyItem<'_, '_>) -> ItemState {
         icon: row.icon.0.string.clone(),
         label: row.label.0.string.clone(),
         drawing: row.drawing.0,
-        script: row.script.map(|s| s.0.clone()),
-        click_script: row.click.map(|s| s.0.clone()),
+        script: row.script.map(|s| s.0.to_string()),
+        click_script: row.click.map(|s| s.0.to_string()),
         update_freq: row.routine.every,
         events: row.subscriptions.0.iter().cloned().collect(),
         alias: row.alias.map(|alias| alias.0.clone()),
@@ -163,7 +167,7 @@ impl ItemsRead<'_, '_> {
     /// fire, because they are different questions: one is "do this when
     /// clicked", the other is "tell me when anything happens".
     #[must_use]
-    pub fn jobs_for_item(&self, entity: Entity, event: &Event) -> Vec<Job> {
+    pub fn jobs_for_item(&self, entity: Entity, event: &Arc<Event>) -> Vec<Job> {
         let Ok(row) = self.read.get(entity) else {
             return Vec::new();
         };
@@ -173,18 +177,20 @@ impl ItemsRead<'_, '_> {
         let mut jobs = Vec::new();
         if let Some(click) = click {
             jobs.push(Job {
+                entity,
                 item: name.0.clone(),
-                script: click.0.clone(),
-                event: event.clone(),
+                script: Arc::clone(&click.0),
+                event: Arc::clone(event),
             });
         }
         if subscriptions.0.iter().any(|kind| kind.matches(event))
             && let Some(script) = script
         {
             jobs.push(Job {
+                entity,
                 item: name.0.clone(),
-                script: script.0.clone(),
-                event: event.clone(),
+                script: Arc::clone(&script.0),
+                event: Arc::clone(event),
             });
         }
         jobs
@@ -197,7 +203,7 @@ impl ItemsRead<'_, '_> {
     /// asked for costs nothing. Items without a script are skipped —
     /// subscribing a scriptless item is legal and simply does nothing.
     #[must_use]
-    pub fn jobs_for(&self, event: &Event, dependents: &[Entity]) -> Vec<Job> {
+    pub fn jobs_for(&self, event: &Arc<Event>, dependents: &[Entity]) -> Vec<Job> {
         let mut into = Vec::new();
         self.push_jobs(event, dependents, &mut into);
         into
@@ -207,7 +213,7 @@ impl ItemsRead<'_, '_> {
     ///
     /// Straight into the destination: an event with three dependents should
     /// not build a three-element `Vec` for something else to copy out of.
-    pub fn push_jobs(&self, event: &Event, dependents: &[Entity], into: &mut Vec<Job>) {
+    pub fn push_jobs(&self, event: &Arc<Event>, dependents: &[Entity], into: &mut Vec<Job>) {
         into.reserve(dependents.len());
         for entity in dependents {
             let Ok(row) = self.read.get(*entity) else {
@@ -221,9 +227,10 @@ impl ItemsRead<'_, '_> {
                 continue;
             };
             into.push(Job {
+                entity: *entity,
                 item: row.name.0.clone(),
-                script: script.0.clone(),
-                event: event.clone(),
+                script: Arc::clone(&script.0),
+                event: Arc::clone(event),
             });
         }
     }
@@ -235,9 +242,10 @@ impl ItemsRead<'_, '_> {
             .iter()
             .filter_map(|row| {
                 Some(Job {
+                    entity: row.entity,
                     item: row.name.0.clone(),
-                    script: row.script?.0.clone(),
-                    event: Event::Forced(rsbar_protocol::event::Forced {}),
+                    script: Arc::clone(&row.script?.0),
+                    event: Arc::new(Event::Forced(rsbar_protocol::event::Forced {})),
                 })
             })
             .collect()
@@ -264,8 +272,8 @@ fn state_of(row: &ItemReadItem<'_, '_>) -> ItemState {
         icon: row.icon.0.string.clone(),
         label: row.label.0.string.clone(),
         drawing: row.drawing.0,
-        script: row.script.map(|s| s.0.clone()),
-        click_script: row.click.map(|s| s.0.clone()),
+        script: row.script.map(|s| s.0.to_string()),
+        click_script: row.click.map(|s| s.0.to_string()),
         update_freq: row.routine.every,
         events: row.subscriptions.0.iter().cloned().collect(),
         alias: row.alias.map(|alias| alias.0.clone()),
@@ -479,7 +487,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             // claimed it — the same path a source's event takes.
             let dependents = sources.dependents(&event, &Target::All);
             Outcome {
-                jobs: items.jobs_for(&event, &dependents),
+                jobs: items.jobs_for(&Arc::new(event), &dependents),
                 ..Outcome::ok()
             }
         }
@@ -593,14 +601,18 @@ fn set_item(
         if script.is_empty() {
             commands.entity(entity).remove::<Script>();
         } else {
-            commands.entity(entity).insert(Script(script.clone()));
+            commands
+                .entity(entity)
+                .insert(Script(script.as_str().into()));
         }
     }
     if let Some(script) = &patch.click_script {
         if script.is_empty() {
             commands.entity(entity).remove::<ClickScript>();
         } else {
-            commands.entity(entity).insert(ClickScript(script.clone()));
+            commands
+                .entity(entity)
+                .insert(ClickScript(script.as_str().into()));
         }
     }
     if let Some(alias) = &patch.alias {
