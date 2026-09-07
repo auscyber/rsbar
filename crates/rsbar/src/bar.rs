@@ -1,9 +1,10 @@
 //! The bar itself: geometry, the item list, and the draw pass.
 
+use crate::display::{self, Display};
 use crate::item::Item;
 use crate::script::Job;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_core_graphics::{CGContext, CGDisplayBounds, CGMainDisplayID};
+use objc2_core_graphics::CGContext;
 use rsbar_protocol::style::Color;
 use rsbar_protocol::{BarPatch, BarState, Edge, Event, ItemName, ItemPatch, Position};
 use skylight::{Window, WindowTags, level};
@@ -40,6 +41,13 @@ pub fn fill_rounded_rect(ctx: &CGContext, rect: CGRect, radius: f64, color: Colo
     CGContext::fill_path(Some(ctx));
 }
 
+/// The bar on one display.
+struct Panel {
+    display: Display,
+    window: Window,
+    frame: CGRect,
+}
+
 pub struct Bar {
     height: f64,
     edge: Edge,
@@ -51,8 +59,10 @@ pub struct Bar {
     hidden: bool,
 
     items: Vec<Item>,
-    window: Window,
-    frame: CGRect,
+    /// One per display. The bar is not one window stretched across the desktop:
+    /// with "Displays have separate Spaces" a single window renders on only one
+    /// of them, so each display needs its own.
+    panels: Vec<Panel>,
     /// Set by any mutation; the draw pass clears it. Repainting on every
     /// request would redraw the whole bar per `--set` in a config run.
     dirty: bool,
@@ -66,18 +76,8 @@ impl Bar {
     /// Returns the window server's error if the bar window cannot be created
     /// or configured.
     pub fn new() -> skylight::Result<Self> {
-        let height = 32.0;
-        let frame = Self::frame_for(height, Edge::Top, 0.0, 0.0);
-        let window = Window::new(frame)?;
-        window.set_scale(Self::scale())?;
-        window.set_opaque(false)?;
-        window.set_alpha(1.0)?;
-        window.set_level(level::STATUS)?;
-        window.set_tags(WindowTags::BAR | WindowTags::IGNORE_FOR_EVENTS)?;
-        window.order_above(None)?;
-
-        Ok(Self {
-            height,
+        let mut bar = Self {
+            height: 32.0,
             edge: Edge::Top,
             color: Color(0xe014_1820),
             margin: 0.0,
@@ -86,26 +86,87 @@ impl Bar {
             blur_radius: 0,
             hidden: false,
             items: Vec::new(),
-            window,
-            frame,
+            panels: Vec::new(),
             dirty: true,
-        })
+        };
+        bar.rebuild_panels()?;
+        Ok(bar)
     }
 
-    fn scale() -> f64 {
-        // TODO: per-display backing scale once the bar spans displays.
-        2.0
+    /// Rebuilds one panel per active display, reusing the window of a display
+    /// that is still present so a resize does not flicker the bar away.
+    ///
+    /// # Errors
+    ///
+    /// Returns the window server's error if a window cannot be created or
+    /// configured.
+    pub fn rebuild_panels(&mut self) -> skylight::Result<()> {
+        let displays = display::active();
+        let mut panels = Vec::with_capacity(displays.len());
+
+        for display in displays {
+            let frame = self.frame_for(&display);
+            let existing = self
+                .panels
+                .iter()
+                .position(|panel| panel.display.id == display.id);
+
+            let panel = if let Some(index) = existing {
+                let mut panel = self.panels.remove(index);
+                panel.window.set_frame(frame)?;
+                if (panel.display.scale - display.scale).abs() > f64::EPSILON {
+                    panel.window.set_scale(display.scale)?;
+                }
+                panel.display = display;
+                panel.frame = frame;
+                panel
+            } else {
+                let window = Window::new(frame)?;
+                window.set_scale(display.scale)?;
+                window.set_opaque(false)?;
+                window.set_alpha(1.0)?;
+                window.set_level(level::STATUS)?;
+                window.set_tags(WindowTags::BAR | WindowTags::IGNORE_FOR_EVENTS)?;
+                if self.blur_radius != 0 {
+                    window.set_blur_radius(self.blur_radius)?;
+                }
+                if !self.hidden {
+                    window.order_above(None)?;
+                }
+                Panel {
+                    display,
+                    window,
+                    frame,
+                }
+            };
+            panels.push(panel);
+        }
+
+        for panel in &panels {
+            tracing::debug!(
+                display = panel.display.id,
+                scale = panel.display.scale,
+                frame = ?panel.frame,
+                "panel"
+            );
+        }
+
+        // Whatever is left in `self.panels` belongs to a display that is gone;
+        // dropping it releases the window.
+        self.panels = panels;
+        self.dirty = true;
+        Ok(())
     }
 
-    fn frame_for(height: f64, edge: Edge, margin: f64, y_offset: f64) -> CGRect {
-        let display = CGDisplayBounds(CGMainDisplayID());
-        let y = match edge {
-            Edge::Top => display.origin.y + y_offset,
-            Edge::Bottom => display.origin.y + display.size.height - height - y_offset,
+    fn frame_for(&self, display: &Display) -> CGRect {
+        let bounds = display.bounds;
+        let y = match self.edge {
+            Edge::Top => bounds.origin.y + self.y_offset,
+            Edge::Bottom => bounds.origin.y + bounds.size.height - self.height - self.y_offset,
         };
         CGRect::new(
-            CGPoint::new(display.origin.x + margin, y),
-            CGSize::new(display.size.width - 2.0 * margin, height),
+            CGPoint::new(bounds.origin.x + self.margin, y),
+            CGSize::new(bounds.size.width - 2.0 * self.margin, self.height),
         )
     }
 
@@ -139,20 +200,36 @@ impl Bar {
         }
         if let Some(r) = patch.blur_radius {
             self.blur_radius = r;
-            self.window.set_blur_radius(r)?;
+            for panel in &self.panels {
+                panel.window.set_blur_radius(r)?;
+            }
         }
         if let Some(hidden) = patch.hidden {
             self.hidden = hidden;
-            if hidden {
-                self.window.order_out()?;
-            } else {
-                self.window.order_above(None)?;
+            for panel in &self.panels {
+                if hidden {
+                    panel.window.order_out()?;
+                } else {
+                    panel.window.order_above(None)?;
+                }
             }
         }
 
         if geometry_changed {
-            self.frame = Self::frame_for(self.height, self.edge, self.margin, self.y_offset);
-            self.window.set_frame(self.frame)?;
+            // One batch, so a height change lands on every display at once
+            // rather than rippling across them.
+            let frames: Vec<_> = self
+                .panels
+                .iter()
+                .map(|p| self.frame_for(&p.display))
+                .collect();
+            skylight::batched(|| -> skylight::Result<()> {
+                for (panel, frame) in self.panels.iter_mut().zip(frames) {
+                    panel.window.set_frame(frame)?;
+                    panel.frame = frame;
+                }
+                Ok(())
+            })?;
         }
         self.dirty = true;
         Ok(())
@@ -262,7 +339,7 @@ impl Bar {
             corner_radius: self.corner_radius,
             blur_radius: self.blur_radius,
             hidden: self.hidden,
-            displays: 1,
+            displays: self.panels.len(),
         }
     }
 
@@ -273,22 +350,26 @@ impl Bar {
         }
         self.dirty = false;
 
-        let size = self.frame.size;
         let bar_color = self.color;
         let radius = self.corner_radius;
-        let placements = self.layout();
 
-        skylight::draw(self.window.id(), size, |ctx| {
-            fill_rounded_rect(
-                ctx,
-                CGRect::new(CGPoint::new(0.0, 0.0), size),
-                radius,
-                bar_color,
-            );
-            for (index, frame) in placements {
-                self.items[index].draw(ctx, frame);
-            }
-        });
+        for panel in &self.panels {
+            let size = panel.frame.size;
+            // Layout depends on the panel's width, so it is computed per
+            // display rather than shared across them.
+            let placements = self.layout(size);
+            skylight::draw(panel.window.id(), size, |ctx| {
+                fill_rounded_rect(
+                    ctx,
+                    CGRect::new(CGPoint::new(0.0, 0.0), size),
+                    radius,
+                    bar_color,
+                );
+                for (index, frame) in placements {
+                    self.items[index].draw(ctx, frame);
+                }
+            });
+        }
     }
 
     /// Assigns each drawn item a frame, bucket by bucket.
@@ -296,9 +377,9 @@ impl Bar {
     /// Right and centre-right run right-to-left so their trailing edges stay
     /// pinned as content resizes; the centre group is measured as a whole and
     /// then placed, so it stays centred rather than growing from its left edge.
-    fn layout(&self) -> Vec<(usize, CGRect)> {
-        let width = self.frame.size.width;
-        let height = self.frame.size.height;
+    fn layout(&self, size: CGSize) -> Vec<(usize, CGRect)> {
+        let width = size.width;
+        let height = size.height;
         let drawn = |p: Position| {
             self.items
                 .iter()

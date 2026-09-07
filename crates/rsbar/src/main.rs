@@ -9,10 +9,11 @@
 use async_mach_ports::{Receiver, RecvPort, Reply};
 use objc2_core_foundation::CFRunLoop;
 use rsbar::bar::Bar;
+use rsbar::display::ReconfigurationWatch;
 use rsbar::runloop::{Timer, Waker};
 use rsbar::script::{Job, Runner};
 use rsbar::sources::Sources;
-use rsbar_protocol::{Query, Request, Response, service_name};
+use rsbar_protocol::{Event, Query, Request, Response, service_name};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -87,31 +88,21 @@ fn main() {
         })
     };
 
-    // Workspace notifications arrive on this thread already, so they act on
-    // the bar directly rather than going back through the run loop source.
-    // Held for the life of the process: dropping it deregisters the observers.
-    let _sources = {
-        let bar = Rc::clone(&bar);
-        let runner = Rc::clone(&runner);
-        Sources::install(move |event, info| {
-            let jobs = bar.borrow().jobs_for(&event, info.as_deref());
-            for job in jobs {
-                runner.run(job);
-            }
-        })
-    };
+    // Held for the life of the process: dropping any of these stops the thing
+    // it drives.
+    let _observers = install_observers(&bar, &runner);
 
-    // Held for the life of the process: dropping it stops the tick.
-    let _tick = {
-        let bar = Rc::clone(&bar);
-        let runner = Rc::clone(&runner);
-        Timer::every(TICK_SECONDS, move || {
-            for job in bar.borrow_mut().tick() {
-                runner.run(job);
-            }
-        })
-    };
+    spawn_ipc(receiver, tx, waker);
 
+    tracing::info!(%service, "rsbar is up");
+    CFRunLoop::run();
+}
+
+/// Receives requests and hands them to the main thread.
+///
+/// Lives on its own thread because it blocks on a port, which the drawing
+/// thread must never do.
+fn spawn_ipc(receiver: Receiver<Request>, tx: mpsc::Sender<Incoming>, waker: Waker) {
     std::thread::Builder::new()
         .name("rsbar-ipc".into())
         .spawn(move || {
@@ -135,9 +126,54 @@ fn main() {
             });
         })
         .expect("failed to spawn the IPC thread");
+}
 
-    tracing::info!(%service, "rsbar is up");
-    CFRunLoop::run();
+/// Everything that produces work without being asked: system notifications,
+/// display changes, and the routine tick.
+fn install_observers(
+    bar: &Rc<RefCell<Bar>>,
+    runner: &Rc<Runner>,
+) -> (Sources, ReconfigurationWatch, Timer) {
+    let rebuild = |bar: &Rc<RefCell<Bar>>| {
+        let mut bar = bar.borrow_mut();
+        if let Err(err) = bar.rebuild_panels() {
+            tracing::error!(%err, "could not rebuild the bar after a display change");
+        }
+        bar.redraw_if_dirty();
+    };
+
+    // Workspace notifications arrive on this thread already, so they act on
+    // the bar directly rather than going back through the run loop source.
+    let sources = {
+        let (bar, runner) = (Rc::clone(bar), Rc::clone(runner));
+        Sources::install(move |event, info| {
+            for job in bar.borrow().jobs_for(&event, info.as_deref()) {
+                runner.run(job);
+            }
+            // The active display changing can also mean its geometry did.
+            if event == Event::DisplayChanged {
+                rebuild(&bar);
+            }
+        })
+    };
+
+    // Displays appearing or disappearing is the one thing NSWorkspace does not
+    // report, and it invalidates every panel's geometry.
+    let displays = {
+        let bar = Rc::clone(bar);
+        ReconfigurationWatch::install(move || rebuild(&bar))
+    };
+
+    let tick = {
+        let (bar, runner) = (Rc::clone(bar), Rc::clone(runner));
+        Timer::every(TICK_SECONDS, move || {
+            for job in bar.borrow_mut().tick() {
+                runner.run(job);
+            }
+        })
+    };
+
+    (sources, displays, tick)
 }
 
 fn handle(bar: &mut Bar, request: Request, shutdown: &mut bool) -> (Response, Vec<Job>) {
