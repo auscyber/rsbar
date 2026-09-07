@@ -6,7 +6,7 @@
 //! every signature is a claim about an ABI Apple may change.
 
 use objc2_core_foundation::{CFArray, CFString, CFType, CGRect};
-use objc2_core_graphics::{CGContext, CGError};
+use objc2_core_graphics::{CGContext, CGError, CGImage};
 use std::ffi::{c_int, c_void};
 
 /// A window server connection. `int` on the C side; the width matters because
@@ -172,6 +172,28 @@ unsafe extern "C" {
         event: u32,
         context: *mut c_void,
     ) -> CGError;
+
+    // ---- capture ----------------------------------------------------------
+
+    /// Renders a window's current contents into a `CGImage`.
+    ///
+    /// `wid` is a *pointer to a 64-bit* window id even though window ids are
+    /// 32-bit, because the call takes a list. `rect` may be `CGRectNull` for
+    /// the whole window. Needs Screen Recording; without it the out-pointer is
+    /// left null rather than an error being returned.
+    pub fn SLSCaptureWindowsContentsToRectWithOptions(
+        cid: ConnectionId,
+        wid: *const u64,
+        meh: bool,
+        rect: CGRect,
+        options: u32,
+        out_image: *mut *mut CGImage,
+    );
+
+    /// A window's rect in screen coordinates, which is the only reliable
+    /// source of its true size — the window list's bounds can disagree.
+    pub fn SLSGetScreenRectForWindow(cid: ConnectionId, wid: WindowId, out: *mut CGRect)
+    -> CGError;
 
     // ---- mouse tracking ---------------------------------------------------
 

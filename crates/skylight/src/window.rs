@@ -2,8 +2,10 @@ use crate::error::{Error, Result, ok};
 use crate::ffi::{self, ConnectionId, WindowId};
 use crate::region::Region;
 use crate::tags::WindowTags;
-use objc2_core_foundation::{CGPoint, CGRect};
+use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
+use objc2_core_graphics::CGImage;
 use std::ptr;
+use std::ptr::NonNull;
 
 /// Standard CoreGraphics window levels, resolved from `CGWindowLevelForKey`.
 /// Hardcoded because the key-to-level mapping has been stable for two decades
@@ -215,6 +217,59 @@ impl Window {
         // SAFETY: plain scalar arguments.
         ok(unsafe { ffi::SLSOrderWindow(self.connection, self.id, mode, relative_to) })
             .map_err(Error::Order)
+    }
+
+    /// Renders this window's current on-screen contents to a still image.
+    ///
+    /// This is how `alias` items mirror another process's menu bar item. It
+    /// needs Screen Recording permission; without it the window server leaves
+    /// the image null rather than reporting an error, which surfaces here as
+    /// [`Error::NoCapture`].
+    pub fn capture(&self) -> Result<CFRetained<CGImage>> {
+        // The full-resolution capture bit, cross-checked against SketchyBar's
+        // `window.c`.
+        const FULL_RESOLUTION: u32 = 1 << 8;
+
+        // `CGRectNull` reconstructed by hand: `objc2-core-graphics` does not
+        // bind the extern symbol, but the null rect's definition — infinite
+        // origin, zero size — is a stable, documented constant, and this is
+        // what tells the window server to capture the whole window.
+        let whole_window = CGRect::new(
+            CGPoint::new(f64::INFINITY, f64::INFINITY),
+            CGSize::new(0.0, 0.0),
+        );
+
+        let wide_id = u64::from(self.id);
+        let mut image: *mut CGImage = ptr::null_mut();
+        // SAFETY: `wide_id` outlives the call, and `image` is a valid
+        // out-pointer.
+        unsafe {
+            ffi::SLSCaptureWindowsContentsToRectWithOptions(
+                self.connection,
+                &raw const wide_id,
+                true,
+                whole_window,
+                FULL_RESOLUTION,
+                &raw mut image,
+            );
+        }
+
+        let image = NonNull::new(image).ok_or(Error::NoCapture)?;
+        // SAFETY: a non-null result carries a +1 reference, ownership of
+        // which transfers to `CFRetained`.
+        Ok(unsafe { CFRetained::from_raw(image) })
+    }
+
+    /// This window's true size in screen points.
+    ///
+    /// The window list's own bounds can disagree with this; this is the
+    /// value `SketchyBar` actually draws a capture at.
+    pub fn true_rect(&self) -> Result<CGRect> {
+        let mut rect = CGRect::ZERO;
+        // SAFETY: `rect` is a valid out-pointer.
+        ok(unsafe { ffi::SLSGetScreenRectForWindow(self.connection, self.id, &raw mut rect) })
+            .map_err(Error::ScreenRect)?;
+        Ok(rect)
     }
 }
 

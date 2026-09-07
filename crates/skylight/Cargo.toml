@@ -11,7 +11,7 @@ publish = false
 [dependencies]
 bitflags = { workspace = true }
 objc2-core-foundation = { workspace = true, features = ["CFArray", "CFNumber", "CFString", "CFCGTypes"] }
-objc2-core-graphics = { workspace = true, features = ["CGError", "CGDirectDisplay", "CGContext"] }
+objc2-core-graphics = { workspace = true, features = ["CGError", "CGDirectDisplay", "CGContext", "CGImage", "CGWindow"] }
 objc2-quartz-core = { workspace = true, features = ["CALayer", "CATransaction", "objc2-core-foundation", "objc2-core-graphics"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }

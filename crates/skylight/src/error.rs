@@ -28,6 +28,12 @@ pub enum Error {
     Blur(CGError),
     #[error("the window server returned no drawing context for this window")]
     NoContext,
+    #[error(
+        "the window server returned no captured image; the process probably lacks Screen Recording permission"
+    )]
+    NoCapture,
+    #[error("failed to read a window's true screen rect: {0:?}")]
+    ScreenRect(CGError),
 }
 
 /// Turns the window server's success-or-code convention into a `Result`.
