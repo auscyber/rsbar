@@ -42,6 +42,51 @@
 //!   call returns [`AXError::APIDisabled`], so the Control Center workaround
 //!   silently finds nothing. [`accessibility_trusted`] reports this ahead of
 //!   time so a caller can tell "no items" from "no permission".
+//!
+//! # Push updates were investigated; neither route delivers
+//!
+//! [`Captures::refresh`] is still a poll — a re-capture and a full pixel
+//! hash, called on a timer by `ecs::refresh_aliases` — because nothing this
+//! investigation tried actually pushes a change. Both routes were checked
+//! against real, live changes rather than trusted on registration succeeding
+//! (`skylight/examples/notify_probe.rs` and `rsbar/examples/ax_observer_probe.rs`
+//! are the evidence, cross-checked live on macOS 26.5.1):
+//!
+//! - **`SkyLight`/CGS window notifications**, the mechanism `sources/spaces.rs`
+//!   uses for space events: registering every plausibly-relevant `kCGSEvent*`
+//!   this investigation could find — window move/resize/reorder/visibility,
+//!   dirty-screen, connection visibility, title-changed, menu bar
+//!   creation/style, space-window-transaction — via both
+//!   `SLSRegisterConnectionNotifyProc` and the connection-less
+//!   `SLSRegisterNotifyProc`, plus `SLSRequestNotificationsForWindows` for the
+//!   target window, always reports success, but nothing ever arrives — not
+//!   for the menu bar clock's minute rollover, not for a real foreign window
+//!   (Finder) resized six times live, not even for a window this process
+//!   owns and moves/orders itself. Cross-checking upstream `SketchyBar`'s own
+//!   `sketchybar.c`/`window.c` settles it further: the only content-adjacent
+//!   event it registers, `kCGSWindowTitleChanged` (1322), is used purely to
+//!   *pause* its capture poll for ~1s during a transition
+//!   (`g_disable_capture`) — never to trigger one. Even the reference
+//!   implementation this project cross-checks against only polls; this
+//!   mechanism looks non-functional on this machine besides, matching
+//!   `sources/spaces.rs`'s own note that its space-change event was never
+//!   observed firing live either.
+//! - **`AXObserver` on the item's own `AXUIElement`**: rejected immediately
+//!   with `kAXErrorNotificationUnsupported`, for `kAXValueChangedNotification`
+//!   and `kAXTitleChangedNotification` alike, on both a Control Center-native
+//!   item (Clock) and a genuinely separate-process one (Fantastical). The
+//!   `AXMenuBarItem` role does not participate in AX's notification system at
+//!   all — confirmed as a real rejection, not silence. Registering the same
+//!   notifications one level up, on the owning app or its `AXExtrasMenuBar`,
+//!   *is* accepted, and notifications do arrive (proving the plumbing itself
+//!   works) — but unscoped to the item asked for: what arrived was a
+//!   different app's still-mounted popover text, on an observer created for a
+//!   third pid entirely. It never reported the actual icon changing.
+//!
+//! So this module leans on [`STALE_AFTER`] instead: not a push, but a poll
+//! that also double-checks the window is still the right one whenever it
+//! looks suspiciously unchanging, closing the gap a plain capture-and-hash
+//! loop cannot see on its own (see its doc comment).
 
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{
@@ -679,7 +724,28 @@ struct Mirror {
     /// The spec it was built from, so a changed spec rebuilds it.
     spec: String,
     captured: Option<Captured>,
+    /// Consecutive [`Captures::refresh`] calls in a row that captured the
+    /// same digest as `captured`. See [`STALE_AFTER`].
+    unchanged: u32,
 }
+
+/// After this many consecutive unchanged captures, [`Captures::refresh`]
+/// forces the alias to re-resolve its window before capturing again, rather
+/// than trusting the cached one.
+///
+/// This exists for a failure mode `capture()`'s own error handling cannot
+/// see: the window server can keep successfully capturing a `WindowId` whose
+/// real item was destroyed and rebuilt out from under it — most commonly an
+/// app tearing down and recreating its `NSStatusItem` — producing the same
+/// bytes forever with no error at any point. [`Alias::invalidate`] existed to
+/// handle exactly this, but nothing called it: this is that caller.
+///
+/// A poll interval is the caller's business, not this module's (see
+/// `ecs::ALIAS_POLL`), so this counts calls rather than time. At the daemon's
+/// current 500ms poll, this is two minutes — long enough that a legitimately
+/// static icon eats only one extra window-list scan every couple of minutes,
+/// short enough that a genuinely stale mirror does not stay stale for long.
+const STALE_AFTER: u32 = 240;
 
 /// Splits an `Owner,Name` spec. The name may itself contain commas, so only
 /// the first one separates.
@@ -724,9 +790,15 @@ impl Captures {
                     alias: Alias::new(owner, name),
                     spec: spec.to_owned(),
                     captured: None,
+                    unchanged: 0,
                 })
                 .into_mut(),
         };
+
+        if mirror.unchanged >= STALE_AFTER {
+            mirror.alias.invalidate();
+            mirror.unchanged = 0;
+        }
 
         let capture = match mirror.alias.capture() {
             Ok(capture) => capture,
@@ -742,8 +814,10 @@ impl Captures {
             .as_ref()
             .is_some_and(|held| held.digest == digest)
         {
+            mirror.unchanged = mirror.unchanged.saturating_add(1);
             return None;
         }
+        mirror.unchanged = 0;
         mirror.captured = Some(Captured {
             image: capture.image,
             size: capture.size,

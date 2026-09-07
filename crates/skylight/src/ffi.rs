@@ -173,6 +173,17 @@ unsafe extern "C" {
         context: *mut c_void,
     ) -> CGError;
 
+    /// Asks the window server to deliver per-window notifications (order,
+    /// move, resize, ...) for windows this connection does not own. Without
+    /// this, `SLSRegisterConnectionNotifyProc` sees only this process's own
+    /// windows for those event types. Cross-checked against yabai's
+    /// `event_loop.c` and `rift`'s `window_notify.rs`.
+    pub fn SLSRequestNotificationsForWindows(
+        cid: ConnectionId,
+        window_list: *const WindowId,
+        window_count: c_int,
+    ) -> CGError;
+
     // ---- capture ----------------------------------------------------------
 
     /// Renders a window's current contents into a `CGImage`.
