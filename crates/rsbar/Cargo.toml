@@ -28,6 +28,7 @@ objc2 = { workspace = true }
 objc2-app-kit = { workspace = true, features = ["NSWorkspace", "NSRunningApplication", "NSApplication", "NSScreen", "NSGraphics", "objc2-core-foundation"] }
 objc2-foundation = { workspace = true, features = ["NSNotification", "NSString", "NSDictionary", "NSOperation", "NSValue", "NSObject", "NSArray", "block2"] }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
