@@ -85,6 +85,54 @@ pub fn kinds_from_value(value: &Value) -> mlua::Result<Vec<Kind>> {
     }
 }
 
+/// `SketchyBar`'s own convention for matching several items by name at once:
+/// `/menu\..*/` rather than one literal name. Only `rsbar.set` and bracket
+/// membership understand this — it is resolved entirely on this side, against
+/// a snapshot of every item's name, since the protocol has no such concept.
+///
+/// # Errors
+///
+/// Returns [`ApiError::InvalidPattern`] if `name` looks like a pattern (is
+/// wrapped in `/.../`) but its interior is not a valid regex.
+pub fn pattern_from_name(name: &str) -> Result<Option<regex::Regex>> {
+    let Some(inner) = name.strip_prefix('/').and_then(|s| s.strip_suffix('/')) else {
+        return Ok(None);
+    };
+    regex::Regex::new(inner)
+        .map(Some)
+        .map_err(|e| ApiError::InvalidPattern(name.to_string(), e.to_string()))
+}
+
+/// Merges `overlay` onto `base`, recursively wherever both sides have a table
+/// at the same key, so `rsbar.default`'s `icon = { font = { family = ... } }`
+/// combines with an item's own `icon = { font = { size = ... } }` rather than
+/// one replacing the other outright. Neither input is mutated; the result is
+/// a fresh table naming exactly the keys either side actually set — nothing
+/// is invented, which is what keeps a merged patch as narrow as the item's
+/// own table would have produced alone.
+///
+/// # Errors
+///
+/// Returns a Lua error only if table creation or iteration itself fails.
+pub fn deep_merge(lua: &Lua, base: &Table, overlay: &Table) -> mlua::Result<Table> {
+    let result = lua.create_table()?;
+    for pair in base.clone().pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        result.set(key, value)?;
+    }
+    for pair in overlay.clone().pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        let merged = match (result.get::<Value>(key.clone())?, &value) {
+            (Value::Table(existing), Value::Table(new)) => {
+                Value::Table(deep_merge(lua, &existing, new)?)
+            }
+            _ => value,
+        };
+        result.set(key, merged)?;
+    }
+    Ok(result)
+}
+
 fn opt<T: mlua::FromLua>(table: &Table, key: &str) -> mlua::Result<Option<T>> {
     table.get::<Option<T>>(key)
 }
@@ -101,6 +149,18 @@ fn opt_position(table: &Table, key: &str) -> mlua::Result<Option<Position>> {
         .map(|s| position_from_str(&s))
         .transpose()
         .map_err(Into::into)
+}
+
+/// The `position` an add options table carries, or [`Position::default`] if
+/// it names none — `rsbar.add`'s own vocabulary reads position out of the
+/// options table rather than as a separate positional argument, matching how
+/// a real `SketchyBar` config always writes it (`{ position = "left", ... }`).
+///
+/// # Errors
+///
+/// Returns a Lua error if `position` is set but not a recognised spelling.
+pub fn item_position_from_table(table: &Table) -> mlua::Result<Position> {
+    Ok(opt_position(table, "position")?.unwrap_or_default())
 }
 
 /// `icon = "text"` or `icon = { text = "...", color = 0x..., font = "Family:Style:Size" }`.
@@ -145,7 +205,7 @@ fn background_patch(table: &Table) -> mlua::Result<Option<rsbar_protocol::Backgr
     let Some(sub) = opt::<Table>(table, "background")? else {
         return Ok(None);
     };
-    warn_unknown(&sub, "background", KNOWN);
+    warn_unknown_with(&sub, "background", KNOWN, BACKGROUND_UNSUPPORTED);
     Ok(Some(rsbar_protocol::BackgroundPatch {
         color: opt_color(&sub, "color")?,
         corner_radius: opt(&sub, "corner_radius")?,
@@ -168,10 +228,22 @@ fn background_patch(table: &Table) -> mlua::Result<Option<rsbar_protocol::Backgr
 /// Logged rather than rejected. A config that is right apart from one key
 /// should still come up, with the key named loudly enough to fix.
 fn warn_unknown(table: &Table, what: &str, known: &[&str]) {
+    warn_unknown_with(table, what, known, &[]);
+}
+
+/// As [`warn_unknown`], but `unsupported` names real `SketchyBar` keys that
+/// rsbar recognises and deliberately does not implement yet — a per-item
+/// `display`, say. Those get their own message (what's missing, not "did you
+/// mean") rather than being mistaken for a typo.
+fn warn_unknown_with(table: &Table, what: &str, known: &[&str], unsupported: &[(&str, &str)]) {
     for pair in table.clone().pairs::<Value, Value>().flatten() {
         let Value::String(key) = pair.0 else { continue };
         let Ok(key) = key.to_str() else { continue };
         if known.contains(&&*key) {
+            continue;
+        }
+        if let Some((_, note)) = unsupported.iter().find(|(k, _)| *k == &*key) {
+            tracing::error!(%what, key = %key, "recognised, but not implemented: {note}");
             continue;
         }
         // A key that is real but in the wrong place is the likelier mistake,
@@ -196,6 +268,50 @@ fn warn_unknown(table: &Table, what: &str, known: &[&str]) {
         }
     }
 }
+
+/// `SketchyBar` item properties rsbar has no `ItemPatch` field for yet. Each
+/// needs a protocol change; noted here so a config that uses one is loud about
+/// it instead of silently dropping it.
+const ITEM_UNSUPPORTED: &[(&str, &str)] = &[
+    (
+        "updates",
+        "toggling routine/forced updates independently of `drawing`; needs an `ItemPatch` field",
+    ),
+    (
+        "width",
+        "a fixed-width spacer item; needs an `ItemPatch::width`",
+    ),
+    (
+        "display",
+        "targeting one display; needs an `ItemPatch::display` (tracked separately)",
+    ),
+    (
+        "popup",
+        "a popup attached to this item; needs popup support (tracked separately)",
+    ),
+];
+
+/// As above, for the nested `background = { ... }` table.
+const BACKGROUND_UNSUPPORTED: &[(&str, &str)] = &[(
+    "drawing",
+    "toggling the background independently of the item; needs a `BackgroundPatch::drawing`",
+)];
+
+/// As above, for `rsbar.bar({...})`.
+const BAR_UNSUPPORTED: &[(&str, &str)] = &[
+    (
+        "display",
+        "the bar always spans every display; needs a `BarPatch::display`",
+    ),
+    (
+        "padding_left",
+        "space before the first/after the last item, distinct from `margin`; needs `BarPatch::padding_left`",
+    ),
+    (
+        "padding_right",
+        "space before the first/after the last item, distinct from `margin`; needs `BarPatch::padding_right`",
+    ),
+];
 
 /// The known key closest to `key`, when one is close enough to be worth
 /// suggesting — a prefix, a suffix, or a one-character slip.
@@ -223,7 +339,11 @@ fn nearest<'a>(key: &str, known: &[&'a str]) -> Option<&'a str> {
 }
 
 impl IconOrLabel {
+    // `string` is the spelling a real SketchyBar config uses for the text
+    // content of an icon/label; `text` is kept too so nothing that already
+    // wrote it stops working. If a table somehow sets both, `string` wins.
     const KNOWN: &'static [&'static str] = &[
+        "string",
         "text",
         "color",
         "font",
@@ -241,10 +361,12 @@ impl IconOrLabel {
             }),
             Value::Table(sub) => {
                 warn_unknown(&sub, key, Self::KNOWN);
+                let string = opt::<String>(&sub, "string")?;
+                let text = opt::<String>(&sub, "text")?;
                 Ok(Self {
-                    text: opt::<String>(&sub, "text")?,
+                    text: string.or(text),
                     color: opt_color(&sub, "color")?,
-                    font: opt::<String>(&sub, "font")?,
+                    font: font_from_value(sub.get("font")?)?,
                     drawing: opt(&sub, "drawing")?,
                     padding_left: opt(&sub, "padding_left")?,
                     padding_right: opt(&sub, "padding_right")?,
@@ -258,6 +380,45 @@ impl IconOrLabel {
     }
 }
 
+/// `font = "Family:Style:Size"` or `font = { family = ..., style = ...,
+/// size = ... }`. The protocol only carries the flat, colon-joined spelling
+/// (`FontSpec::parse` on the daemon side), so a nested table is joined into
+/// it here; a field the table does not set joins as empty, which
+/// `FontSpec::parse` already treats as "keep the default for this part".
+///
+/// A *partial* nested font (`font = { size = 11.0 }` alone, no family or
+/// style) only makes sense combined with `rsbar.default`'s own `font` table —
+/// see `api::merged_opts` — since rsbar has nothing to read a running item's
+/// current font back from to merge against otherwise.
+fn font_from_value(value: Value) -> mlua::Result<Option<String>> {
+    const KNOWN: &[&str] = &["family", "style", "size"];
+    match value {
+        Value::Nil => Ok(None),
+        Value::String(s) => Ok(Some(s.to_str()?.to_string())),
+        Value::Table(sub) => {
+            warn_unknown(&sub, "font", KNOWN);
+            let family = opt::<String>(&sub, "family")?.unwrap_or_default();
+            let style = opt::<String>(&sub, "style")?.unwrap_or_default();
+            let size = match sub.get::<Value>("size")? {
+                Value::Nil => String::new(),
+                Value::Integer(i) => i.to_string(),
+                Value::Number(n) => n.to_string(),
+                other => {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "`font.size` must be a number, got {}",
+                        other.type_name()
+                    )));
+                }
+            };
+            Ok(Some(format!("{family}:{style}:{size}")))
+        }
+        other => Err(mlua::Error::RuntimeError(format!(
+            "`font` must be a string or a table, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
 /// `rsbar.bar({...})`.
 ///
 /// # Errors
@@ -267,6 +428,11 @@ impl IconOrLabel {
 const BAR_KEYS: &[&str] = &[
     "height",
     "edge",
+    // A real SketchyBar config's own spelling for `edge` — the bar itself
+    // uses `position` for top/bottom, distinct from an *item*'s `position`
+    // (left/center/right). Accepted as a plain alias rather than requiring a
+    // second, rsbar-only spelling every bar table would need translating.
+    "position",
     "color",
     "margin",
     "y_offset",
@@ -276,6 +442,16 @@ const BAR_KEYS: &[&str] = &[
     "topmost",
 ];
 
+fn edge_from_str(key: &str, s: &str) -> mlua::Result<Edge> {
+    match s.to_ascii_lowercase().as_str() {
+        "top" => Ok(Edge::Top),
+        "bottom" => Ok(Edge::Bottom),
+        other => Err(mlua::Error::RuntimeError(format!(
+            "`{key}` must be \"top\" or \"bottom\", got \"{other}\""
+        ))),
+    }
+}
+
 /// # Errors
 ///
 /// Returns a Lua error if a value has the wrong type or cannot be parsed —
@@ -283,18 +459,20 @@ const BAR_KEYS: &[&str] = &[
 /// no bucket. An unrecognised *key* is logged rather than raised: a config
 /// that is right apart from one setting should still come up.
 pub fn bar_patch_from_table(table: &Table) -> mlua::Result<BarPatch> {
-    warn_unknown(table, "bar", BAR_KEYS);
+    warn_unknown_with(table, "bar", BAR_KEYS, BAR_UNSUPPORTED);
+    // `position` is what a real config actually writes; `edge` predates it
+    // here and stays accepted too. `position` wins if a table somehow sets
+    // both.
+    let position = opt::<String>(table, "position")?;
+    let edge = match position {
+        Some(s) => Some(edge_from_str("position", &s)?),
+        None => opt::<String>(table, "edge")?
+            .map(|s| edge_from_str("edge", &s))
+            .transpose()?,
+    };
     Ok(BarPatch {
         height: opt(table, "height")?,
-        edge: opt::<String>(table, "edge")?
-            .map(|s| match s.to_ascii_lowercase().as_str() {
-                "top" => Ok(Edge::Top),
-                "bottom" => Ok(Edge::Bottom),
-                other => Err(mlua::Error::RuntimeError(format!(
-                    "`edge` must be \"top\" or \"bottom\", got \"{other}\""
-                ))),
-            })
-            .transpose()?,
+        edge,
         color: opt_color(table, "color")?,
         margin: opt(table, "margin")?,
         y_offset: opt(table, "y_offset")?,
@@ -349,7 +527,7 @@ fn opt_members(table: &Table) -> mlua::Result<Option<Vec<rsbar_protocol::ItemNam
 /// no bucket. An unrecognised *key* is logged rather than raised: a config
 /// that is right apart from one setting should still come up.
 pub fn item_patch_from_table(table: &Table) -> mlua::Result<ItemPatch> {
-    warn_unknown(table, "item", ITEM_KEYS);
+    warn_unknown_with(table, "item", ITEM_KEYS, ITEM_UNSUPPORTED);
     let icon = IconOrLabel::read(table, "icon")?;
     let label = IconOrLabel::read(table, "label")?;
 
@@ -448,4 +626,163 @@ pub fn event_to_table(lua: &Lua, item: &ItemName, event: &Event) -> mlua::Result
         table.set(key, scalar(lua, &value)?)?;
     }
     Ok(table)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_name_is_not_a_pattern() {
+        assert!(pattern_from_name("front_app").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_slash_wrapped_name_compiles_as_a_regex() {
+        let pattern = pattern_from_name("/menu\\..*/").unwrap().unwrap();
+        assert!(pattern.is_match("menu.1"));
+        assert!(!pattern.is_match("front_app"));
+    }
+
+    #[test]
+    fn an_invalid_pattern_names_itself_in_the_error() {
+        let err = pattern_from_name("/[/").unwrap_err();
+        assert!(matches!(err, ApiError::InvalidPattern(name, _) if name == "/[/"));
+    }
+
+    #[test]
+    fn deep_merge_combines_nested_tables_rather_than_replacing_them() {
+        let lua = Lua::new();
+        let base: Table = lua
+            .load(r#"{ icon = { color = 1, font = { family = "A", style = "B" } } }"#)
+            .eval()
+            .unwrap();
+        let overlay: Table = lua
+            .load(r#"{ icon = { font = { size = 11 } }, label = "hi" }"#)
+            .eval()
+            .unwrap();
+
+        let merged = deep_merge(&lua, &base, &overlay).unwrap();
+        let icon: Table = merged.get("icon").unwrap();
+        assert_eq!(icon.get::<i64>("color").unwrap(), 1);
+        let font: Table = icon.get("font").unwrap();
+        assert_eq!(font.get::<String>("family").unwrap(), "A");
+        assert_eq!(font.get::<String>("style").unwrap(), "B");
+        assert_eq!(font.get::<i64>("size").unwrap(), 11);
+        assert_eq!(merged.get::<String>("label").unwrap(), "hi");
+    }
+
+    #[test]
+    fn deep_merge_lets_the_overlay_win_on_a_leaf_conflict() {
+        let lua = Lua::new();
+        let base: Table = lua.load(r"{ color = 1 }").eval().unwrap();
+        let overlay: Table = lua.load(r"{ color = 2 }").eval().unwrap();
+        let merged = deep_merge(&lua, &base, &overlay).unwrap();
+        assert_eq!(merged.get::<i64>("color").unwrap(), 2);
+    }
+
+    #[test]
+    fn deep_merge_does_not_mutate_either_input() {
+        let lua = Lua::new();
+        let base: Table = lua.load(r"{ color = 1 }").eval().unwrap();
+        let overlay: Table = lua.load(r"{ color = 2 }").eval().unwrap();
+        deep_merge(&lua, &base, &overlay).unwrap();
+        assert_eq!(base.get::<i64>("color").unwrap(), 1);
+        assert_eq!(overlay.get::<i64>("color").unwrap(), 2);
+    }
+
+    #[test]
+    fn icon_string_is_sketchybars_own_spelling_for_the_glyph_text() {
+        let lua = Lua::new();
+        let table: Table = lua.load(r#"{ icon = { string = "" } }"#).eval().unwrap();
+        let patch = item_patch_from_table(&table).unwrap();
+        assert_eq!(patch.icon.unwrap().text.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_flat_font_string_passes_through_unchanged() {
+        let lua = Lua::new();
+        let table: Table = lua
+            .load(r#"{ label = { font = "Hack:Bold:14" } }"#)
+            .eval()
+            .unwrap();
+        let patch = item_patch_from_table(&table).unwrap();
+        assert_eq!(patch.label.unwrap().font.as_deref(), Some("Hack:Bold:14"));
+    }
+
+    #[test]
+    fn a_nested_font_table_joins_into_the_flat_spelling() {
+        let lua = Lua::new();
+        let table: Table = lua
+            .load(r#"{ icon = { font = { family = "Hack", style = "Bold", size = 14 } } }"#)
+            .eval()
+            .unwrap();
+        let patch = item_patch_from_table(&table).unwrap();
+        assert_eq!(patch.icon.unwrap().font.as_deref(), Some("Hack:Bold:14"));
+    }
+
+    #[test]
+    fn a_patch_only_carries_the_fields_the_table_actually_set() {
+        // A config that only sets `label` must not synthesise `icon`,
+        // `background`, or the untouched half of `label` itself — the daemon
+        // marks a component dirty just by touching it, so a full patch would
+        // repaint fields nothing changed.
+        let lua = Lua::new();
+        let table: Table = lua.load(r#"{ label = "hi" }"#).eval().unwrap();
+        let patch = item_patch_from_table(&table).unwrap();
+        assert!(patch.icon.is_none());
+        assert!(patch.background.is_none());
+        let label = patch.label.unwrap();
+        assert_eq!(label.text.as_deref(), Some("hi"));
+        assert_eq!(label.color, None);
+        assert_eq!(label.font, None);
+    }
+
+    #[test]
+    fn a_background_table_only_carries_the_fields_it_set() {
+        let lua = Lua::new();
+        let table: Table = lua
+            .load(r"{ background = { color = 0xffff0000 } }")
+            .eval()
+            .unwrap();
+        let patch = item_patch_from_table(&table).unwrap();
+        let background = patch.background.unwrap();
+        assert_eq!(background.color, Some(0xffff_0000));
+        assert_eq!(background.height, None);
+        assert_eq!(background.corner_radius, None);
+    }
+
+    #[test]
+    fn position_defaults_to_left_when_unset() {
+        let lua = Lua::new();
+        let table: Table = lua.load(r"{ }").eval().unwrap();
+        assert_eq!(item_position_from_table(&table).unwrap(), Position::Left);
+    }
+
+    #[test]
+    fn position_is_read_out_of_the_options_table() {
+        let lua = Lua::new();
+        let table: Table = lua.load(r#"{ position = "right" }"#).eval().unwrap();
+        assert_eq!(item_position_from_table(&table).unwrap(), Position::Right);
+    }
+
+    #[test]
+    fn a_bar_table_reads_top_and_bottom_from_position_like_sketchybar_does() {
+        let lua = Lua::new();
+        let table: Table = lua.load(r#"{ position = "bottom" }"#).eval().unwrap();
+        assert_eq!(
+            bar_patch_from_table(&table).unwrap().edge,
+            Some(Edge::Bottom)
+        );
+    }
+
+    #[test]
+    fn a_bar_table_still_accepts_the_older_edge_spelling() {
+        let lua = Lua::new();
+        let table: Table = lua.load(r#"{ edge = "bottom" }"#).eval().unwrap();
+        assert_eq!(
+            bar_patch_from_table(&table).unwrap().edge,
+            Some(Edge::Bottom)
+        );
+    }
 }

@@ -9,16 +9,19 @@
 //! `exec_async`), so an ordinary call syntax is enough for it to yield to the
 //! executor while its request is in flight.
 
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use mlua::{Function, Lua, Table, UserData, UserDataMethods, Value};
-use rsbar_protocol::{ItemName, Query, Request, Response};
+use rsbar_protocol::{ItemName, ItemPatch, Query, Request, Response};
 
 use crate::convert::{
-    bar_patch_from_table, bar_state_to_table, item_name_from_str, item_patch_from_table,
-    item_state_to_table, kinds_from_value, position_from_str,
+    bar_patch_from_table, bar_state_to_table, deep_merge, item_name_from_str,
+    item_patch_from_table, item_position_from_table, item_state_to_table, kinds_from_value,
+    pattern_from_name,
 };
 use crate::dispatch::Dispatcher;
+use crate::error::ApiError;
 use crate::events::Registry;
 
 /// One item, as handed back by `rsbar.add`. Cheap to hold: cloning just
@@ -106,9 +109,24 @@ fn unexpected(response: &Response) -> mlua::Error {
 pub fn install(lua: &Lua, dispatcher: Rc<dyn Dispatcher>) -> mlua::Result<Table> {
     let rsbar = lua.create_table()?;
     let registry = Rc::new(Registry::new(Rc::clone(&dispatcher)));
+    // What `rsbar.default(...)` last stored — merged into every `add` from
+    // then on. `Cell`/`RefCell`, not `tokio::sync`: this is plain single-
+    // threaded bookkeeping local to the one thread hosting the `Lua` state,
+    // never touched across an `.await`, so there is nothing here for an
+    // async-aware lock to buy.
+    let defaults: Rc<RefCell<Option<Table>>> = Rc::new(RefCell::new(None));
+    // Names the next anonymous bracket (`rsbar.add("bracket", {members}, {})`,
+    // with no name of its own).
+    let bracket_counter = Rc::new(Cell::new(0_u64));
 
     rsbar.set("bar", bar_fn(lua, &dispatcher)?)?;
-    rsbar.set("add", add_fn(lua, &dispatcher, &registry)?)?;
+    rsbar.set(
+        "add",
+        add_fn(lua, &dispatcher, &registry, &defaults, &bracket_counter)?,
+    )?;
+    rsbar.set("set", set_fn(lua, &dispatcher)?)?;
+    rsbar.set("default", default_fn(lua, &defaults)?)?;
+    rsbar.set("exec", exec_fn(lua)?)?;
     rsbar.set("remove", remove_fn(lua, &dispatcher)?)?;
     rsbar.set("trigger", trigger_fn(lua, &dispatcher)?)?;
     rsbar.set(
@@ -153,51 +171,322 @@ fn bar_fn(lua: &Lua, dispatcher: &Rc<dyn Dispatcher>) -> mlua::Result<Function> 
     })
 }
 
+async fn add_item(
+    dispatcher: &Rc<dyn Dispatcher>,
+    name: ItemName,
+    position: rsbar_protocol::Position,
+) -> mlua::Result<()> {
+    expect_ok(dispatcher.call(Request::AddItem { name, position }).await)
+}
+
+async fn set_item(
+    dispatcher: &Rc<dyn Dispatcher>,
+    name: ItemName,
+    patch: ItemPatch,
+) -> mlua::Result<()> {
+    expect_ok(
+        dispatcher
+            .call(Request::SetItem {
+                name,
+                patch: Box::new(patch),
+            })
+            .await,
+    )
+}
+
+/// Every item's name, right now — the snapshot `rsbar.set` and bracket
+/// membership resolve a `/pattern/` against, since the protocol itself has no
+/// concept of matching several items by one name.
+async fn query_item_names(dispatcher: &Rc<dyn Dispatcher>) -> crate::error::Result<Vec<ItemName>> {
+    match dispatcher.call(Request::Query(Query::Items)).await? {
+        Response::Items(states) => Ok(states.into_iter().map(|state| state.name).collect()),
+        other => Err(ApiError::UnexpectedResponse(other)),
+    }
+}
+
+fn value_to_string(value: &Value, what: &str) -> mlua::Result<String> {
+    match value {
+        Value::String(s) => Ok(s.to_str()?.to_string()),
+        other => Err(mlua::Error::RuntimeError(format!(
+            "expected {what} to be a string, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn value_to_opt_table(value: &Value, what: &str) -> mlua::Result<Option<Table>> {
+    match value {
+        Value::Nil => Ok(None),
+        Value::Table(table) => Ok(Some(table.clone())),
+        other => Err(mlua::Error::RuntimeError(format!(
+            "expected {what} to be a table, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// `opts` layered over whatever `rsbar.default` last stored, deep-merged so
+/// only the keys either side actually named end up in the result — see
+/// [`deep_merge`]. Neither `defaults` nor `opts` is consumed: both may be
+/// reused by later `add` calls (`defaults`) or still be owned by the caller
+/// (`opts`, borrowed).
+fn merged_opts(
+    lua: &Lua,
+    defaults: &RefCell<Option<Table>>,
+    opts: Option<&Table>,
+) -> mlua::Result<Table> {
+    match (defaults.borrow().as_ref(), opts) {
+        (Some(base), Some(overlay)) => deep_merge(lua, base, overlay),
+        (Some(base), None) => Ok(base.clone()),
+        (None, Some(overlay)) => Ok(overlay.clone()),
+        (None, None) => lua.create_table(),
+    }
+}
+
+/// A bracket's members: literal item names, or `/pattern/`s expanded against
+/// [`query_item_names`] — resolved once per `add("bracket", ...)` call, not
+/// per member, so a bracket with several patterns costs one query rather than
+/// one per pattern.
+async fn resolve_members(
+    dispatcher: &Rc<dyn Dispatcher>,
+    members: &Value,
+) -> mlua::Result<Vec<ItemName>> {
+    let Value::Table(members) = members else {
+        return Err(mlua::Error::RuntimeError(format!(
+            "bracket members must be a table of item names, got {}",
+            members.type_name()
+        )));
+    };
+
+    let mut names = Vec::new();
+    let mut every_name: Option<Vec<ItemName>> = None;
+    for entry in members.clone().sequence_values::<mlua::LuaString>() {
+        let raw = entry?.to_str()?.to_string();
+        match pattern_from_name(&raw)? {
+            Some(pattern) => {
+                if every_name.is_none() {
+                    every_name = Some(query_item_names(dispatcher).await?);
+                }
+                let matched = every_name
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .filter(|name| pattern.is_match(name.as_str()));
+                let before = names.len();
+                names.extend(matched.cloned());
+                if names.len() == before {
+                    tracing::warn!(pattern = %raw, "bracket member pattern matched no items");
+                }
+            }
+            None => names.push(item_name_from_str(&raw)?),
+        }
+    }
+    Ok(names)
+}
+
+/// `rsbar.add(kind, name, ...)` — `SketchyBar`'s own calling convention, kept
+/// deliberately close to it rather than to a different shape rsbar might
+/// otherwise have preferred, since the whole point is that a config only
+/// changes its `require`. `kind` decides how the rest of the arguments are
+/// read:
+///
+/// * `"item"`, `"alias"` — `add(kind, name, opts?)`. `opts.position` picks the
+///   bucket (default `left`); an `"alias"` additionally mirrors `name` itself
+///   as the menu-bar item to shadow, unless `opts.alias` already says so.
+/// * `"bracket"` — `add("bracket", name, members, opts?)`, or, anonymously,
+///   `add("bracket", members, opts?)` (`SketchyBar`'s own sugar for "I don't
+///   need to name this bracket").
+/// * `"event"` — `add("event", name)`. Declares nothing server-side (there is
+///   no request that could); only checks `name` is a name `subscribe`/
+///   `trigger` will accept later. Returns `nil`.
+/// * anything else — logged by name and treated as a plain item, since a kind
+///   rsbar does not model (`"slider"`, so far) still deserves *something* to
+///   `:set`/`:subscribe` against rather than aborting the whole config.
 fn add_fn(
     lua: &Lua,
     dispatcher: &Rc<dyn Dispatcher>,
     registry: &Rc<Registry>,
+    defaults: &Rc<RefCell<Option<Table>>>,
+    bracket_counter: &Rc<Cell<u64>>,
 ) -> mlua::Result<Function> {
     let dispatcher = Rc::clone(dispatcher);
     let registry = Rc::clone(registry);
+    let defaults = Rc::clone(defaults);
+    let bracket_counter = Rc::clone(bracket_counter);
     lua.create_async_function(
-        move |_, (name, position, patch): (String, Option<String>, Option<Table>)| {
+        move |lua, (kind, arg2, arg3, arg4): (String, Value, Value, Value)| {
             let dispatcher = Rc::clone(&dispatcher);
             let registry = Rc::clone(&registry);
+            let defaults = Rc::clone(&defaults);
+            let bracket_counter = Rc::clone(&bracket_counter);
             async move {
-                let name = item_name_from_str(&name)?;
-                let position = position
-                    .map(|p| position_from_str(&p))
-                    .transpose()?
-                    .unwrap_or_default();
-
-                expect_ok(
-                    dispatcher
-                        .call(Request::AddItem {
-                            name: name.clone(),
-                            position,
-                        })
-                        .await,
-                )?;
-
-                if let Some(patch) = patch {
-                    let patch = item_patch_from_table(&patch)?;
-                    expect_ok(
-                        dispatcher
-                            .call(Request::SetItem {
-                                name: name.clone(),
-                                patch: Box::new(patch),
-                            })
-                            .await,
-                    )?;
+                if kind == "event" {
+                    let name = value_to_string(&arg2, "event name")?;
+                    crate::convert::kind_from_str(&name)?;
+                    return Ok(None);
                 }
 
-                Ok(Item {
-                    name,
+                let (name_str, opts_value, members_value): (String, Value, Option<Value>) =
+                    if kind == "bracket" {
+                        match &arg2 {
+                            Value::Table(_) => {
+                                let n = bracket_counter.get() + 1;
+                                bracket_counter.set(n);
+                                (format!("bracket.{n}"), arg3.clone(), Some(arg2.clone()))
+                            }
+                            Value::String(s) => {
+                                (s.to_str()?.to_string(), arg4.clone(), Some(arg3.clone()))
+                            }
+                            other => {
+                                return Err(mlua::Error::RuntimeError(format!(
+                                    "add(\"bracket\", ...)'s second argument must be a name or a table of members, got {}",
+                                    other.type_name()
+                                )));
+                            }
+                        }
+                    } else {
+                        if kind != "item" && kind != "alias" {
+                            tracing::error!(
+                                kind = %kind,
+                                "unknown add kind; treating it as a plain item"
+                            );
+                        }
+                        let name = value_to_string(&arg2, "item name")?;
+                        // A kind rsbar does not model may carry its options
+                        // somewhere other than the third argument (a
+                        // slider's width sits there instead) — use whichever
+                        // of the two trailing arguments is a table, and name
+                        // the one that got skipped.
+                        let opts = match (&arg3, &arg4) {
+                            (Value::Table(_), _) => arg3.clone(),
+                            (_, Value::Table(_)) => {
+                                if !matches!(arg3, Value::Nil) {
+                                    tracing::error!(
+                                        kind = %kind,
+                                        argument = ?arg3,
+                                        "ignoring an argument rsbar has nowhere to put for this add kind"
+                                    );
+                                }
+                                arg4.clone()
+                            }
+                            _ => Value::Nil,
+                        };
+                        (name, opts, None)
+                    };
+
+                let item_name = item_name_from_str(&name_str)?;
+                let opts_table = value_to_opt_table(&opts_value, "add options")?;
+                let merged = merged_opts(&lua, &defaults, opts_table.as_ref())?;
+                let position = item_position_from_table(&merged)?;
+
+                add_item(&dispatcher, item_name.clone(), position).await?;
+
+                let mut patch = item_patch_from_table(&merged)?;
+                if kind == "alias" && patch.alias.is_none() {
+                    patch.alias = Some(name_str.clone());
+                }
+                if let Some(members_value) = members_value {
+                    patch.members = Some(resolve_members(&dispatcher, &members_value).await?);
+                }
+                set_item(&dispatcher, item_name.clone(), patch).await?;
+
+                Ok(Some(Item {
+                    name: item_name,
                     dispatcher,
                     registry,
-                })
+                }))
             }
+        },
+    )
+}
+
+/// `rsbar.set(name, opts)` — sets an item by name rather than through the
+/// handle `rsbar.add` returned, which is what lets one module (`paneru_bar`)
+/// reach into items another module (`items/left.lua`, `wm.lua`) created. Also
+/// accepts a `/pattern/` name, resolved the same way a bracket's members are.
+fn set_fn(lua: &Lua, dispatcher: &Rc<dyn Dispatcher>) -> mlua::Result<Function> {
+    let dispatcher = Rc::clone(dispatcher);
+    lua.create_async_function(move |_, (name, patch): (String, Table)| {
+        let dispatcher = Rc::clone(&dispatcher);
+        async move {
+            let patch = item_patch_from_table(&patch)?;
+            match pattern_from_name(&name)? {
+                Some(pattern) => {
+                    let targets = query_item_names(&dispatcher).await?;
+                    let matched: Vec<_> = targets
+                        .into_iter()
+                        .filter(|target| pattern.is_match(target.as_str()))
+                        .collect();
+                    if matched.is_empty() {
+                        tracing::warn!(pattern = %name, "rsbar.set matched no items");
+                    }
+                    for target in matched {
+                        set_item(&dispatcher, target, patch.clone()).await?;
+                    }
+                    Ok(())
+                }
+                None => set_item(&dispatcher, item_name_from_str(&name)?, patch).await,
+            }
+        }
+    })
+}
+
+/// `rsbar.default(opts)` — properties merged into every `add` from this point
+/// on (see [`merged_opts`]), replacing whatever an earlier call stored.
+/// Implemented entirely client-side: there is no request that could apply
+/// this on the daemon's behalf, and there does not need to be one, since it
+/// only ever affects what `add` sends at the moment an item is created.
+fn default_fn(lua: &Lua, defaults: &Rc<RefCell<Option<Table>>>) -> mlua::Result<Function> {
+    let defaults = Rc::clone(defaults);
+    lua.create_function(move |_, opts: Table| {
+        *defaults.borrow_mut() = Some(opts);
+        Ok(())
+    })
+}
+
+/// `rsbar.exec(command, callback?)` — runs `command` through `sh -c` and, if
+/// given, calls `callback` with its stdout once it exits. Purely local: no
+/// `Dispatcher` involved, since this never talks to the daemon at all.
+///
+/// Real `SketchyBar`'s `exec` is fire-and-forget — the calling script keeps
+/// running immediately while the command executes in the background, and the
+/// callback lands later. This awaits the whole thing (spawn, run, callback)
+/// before returning instead, since the whole config already runs as one Lua
+/// coroutine with no scheduler of its own to hand a detached task to. That
+/// keeps every observable ordering the same as a config that never notices
+/// the difference (a lookup before continuing), at the cost of a slower
+/// config load or event callback when the command is itself slow. Making
+/// this truly concurrent would mean a `tokio::task::LocalSet` in the host
+/// binary (`bin/rsbar_lua.rs`) `spawn_local`-ing it instead — worth doing if
+/// a config turns out to depend on `exec` actually running in the background.
+fn exec_fn(lua: &Lua) -> mlua::Result<Function> {
+    lua.create_async_function(
+        move |_, (command, callback): (String, Option<Function>)| async move {
+            match tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .output()
+                .await
+            {
+                Ok(output) => {
+                    if !output.status.success() {
+                        tracing::warn!(
+                            %command,
+                            status = %output.status,
+                            stderr = %String::from_utf8_lossy(&output.stderr),
+                            "rsbar.exec exited non-zero"
+                        );
+                    }
+                    if let Some(callback) = callback {
+                        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                        if let Err(err) = callback.call_async::<()>(stdout).await {
+                            tracing::error!(%command, %err, "an rsbar.exec callback failed");
+                        }
+                    }
+                }
+                Err(err) => tracing::error!(%command, %err, "rsbar.exec could not run the command"),
+            }
+            Ok(())
         },
     )
 }

@@ -43,6 +43,15 @@ fn main() -> ExitCode {
         eprintln!("rsbar: {err}");
         return ExitCode::FAILURE;
     }
+    // This bin owns the whole Lua state (no foreign host sharing it), so it
+    // can safely replace `require` with one that lets a config's own
+    // `require("bar")`-style module calls yield through an async `rsbar`
+    // call at their top level — see `rsbar_lua::require` for why the builtin
+    // cannot.
+    if let Err(err) = rsbar_lua::require::install(&lua) {
+        eprintln!("rsbar: {err}");
+        return ExitCode::FAILURE;
+    }
 
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()

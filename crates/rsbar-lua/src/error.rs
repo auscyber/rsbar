@@ -15,6 +15,8 @@ pub enum ApiError {
     InvalidEvent(String, InvalidEvent),
     #[error("`{0}` is not a colour: expected 0xaarrggbb, 0xrrggbb or \"#rrggbb\"")]
     InvalidColor(String),
+    #[error("`{0}` is not a valid item-name pattern: {1}")]
+    InvalidPattern(String, String),
     #[error("rsbar is not running")]
     NotRunning,
     #[error("lost contact with rsbar: {0}")]

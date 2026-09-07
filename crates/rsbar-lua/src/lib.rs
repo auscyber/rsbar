@@ -12,6 +12,7 @@ pub mod dispatch;
 pub mod error;
 pub mod events;
 pub mod ipc;
+pub mod require;
 
 pub use dispatch::{BoxedEventStream, Dispatcher};
 pub use error::{ApiError, Result};

@@ -57,12 +57,16 @@ futures-lite = { workspace = true }
 # `SelectAll`, for merging every subscribed item's event stream into one
 # `rsbar.run()` loop without spawning a task per item.
 futures-util = { version = "0.3", default-features = false, features = ["std", "alloc"] }
-# Only the bin needs an actual runtime (`rt`) to drive `exec_async`; the
-# library half uses `tokio::sync` per workspace convention.
-tokio = { workspace = true, features = ["rt"] }
+# Only the bin needs an actual runtime (`rt`) to drive `exec_async`, plus
+# `process` for `rsbar.exec` spawning a shell command.
+tokio = { workspace = true, features = ["rt", "process"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+# `rsbar.set`/bracket membership accept SketchyBar's `/pattern/` item-name
+# regexes; there is no protocol concept of these, so they are resolved here,
+# against a `Query::Items` snapshot, entirely client-side.
+regex = "1"
 
 [lints]
 workspace = true
