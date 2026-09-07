@@ -56,6 +56,10 @@ use std::ffi::c_void;
 /// rather than a backlog to absorb.
 const QUEUE_DEPTH: usize = 256;
 
+/// The ready-set bit for events this process produces itself — a click, or
+/// `--trigger` — which have no source behind them.
+const LOCAL_BIT: u64 = 1 << (u64::BITS - 1);
+
 /// Names a source. Carried alongside every event it produces, so a stray
 /// emission can be traced back to what made it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -90,6 +94,10 @@ impl std::fmt::Display for SourceId {
 pub struct Emitter {
     queue: tokio::sync::mpsc::Sender<Event>,
     waker: crate::runloop::Waker,
+    /// Which sources have something queued, shared by all of them.
+    ready: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// This source's bit in that set.
+    bit: u64,
 }
 
 impl Emitter {
@@ -100,7 +108,13 @@ impl Emitter {
     /// stall a system callback.
     pub fn send(&self, event: Event) {
         match self.queue.try_send(event) {
-            Ok(()) => self.waker.wake(),
+            Ok(()) => {
+                // Says which source to look at, so waking does not mean asking
+                // every one of them whether it was them.
+                self.ready
+                    .fetch_or(self.bit, std::sync::atomic::Ordering::Release);
+                self.waker.wake();
+            }
             Err(err) => tracing::warn!(%err, "dropping an event; the queue is full"),
         }
     }
@@ -157,9 +171,19 @@ impl Feed {
     /// main thread owns, and `--trigger` arrives over IPC. They join the same
     /// stream as everything else rather than being a special case downstream.
     #[must_use]
-    pub fn manual(id: SourceId, waker: crate::runloop::Waker) -> (Emitter, Self) {
+    pub fn manual(
+        id: SourceId,
+        waker: crate::runloop::Waker,
+        ready: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        bit: u64,
+    ) -> (Emitter, Self) {
         let (queue, events) = tokio::sync::mpsc::channel(QUEUE_DEPTH);
-        let emit = Emitter { queue, waker };
+        let emit = Emitter {
+            queue,
+            waker,
+            ready,
+            bit,
+        };
         (emit.clone(), Self::new(id, events, emit, Box::new(())))
     }
 
@@ -715,12 +739,16 @@ fn start(
     wanted: &BTreeSet<Kind>,
     shared: &mut Shared,
     waker: &crate::runloop::Waker,
+    ready: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    bit: u64,
 ) -> Result<Feed, StartError> {
     let id = source.id();
     let (queue, events) = tokio::sync::mpsc::channel(QUEUE_DEPTH);
     let emit = Emitter {
         queue,
         waker: waker.clone(),
+        ready: std::sync::Arc::clone(ready),
+        bit,
     };
     let mut cx = Registering {
         id,
@@ -749,6 +777,10 @@ pub struct Registry {
     providers: HashMap<Kind, Vec<SourceId>>,
     /// Every claim currently out, however many items hold a handle on each.
     claims: Claims,
+    /// Which sources have something queued. A source sets its bit when it
+    /// sends, so a wake says *which* one to look at rather than starting a
+    /// walk of all of them.
+    ready: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Context the sources share, built on first ask.
     shared: Shared,
     /// Events with no framework behind them — a click, or `--trigger`.
@@ -775,6 +807,8 @@ struct Registered {
     /// structural reasons — a missing config file, a framework saying no — so a
     /// second attempt fails identically.
     failed: bool,
+    /// This source's bit in the ready set.
+    bit: u64,
 }
 
 impl Registered {
@@ -789,6 +823,11 @@ impl Registered {
 
 impl Registry {
     /// Builds the registry over the sources this build knows about.
+    ///
+    /// # Panics
+    ///
+    /// If this build has more event sources than there are bits in the ready
+    /// set, which would make two of them indistinguishable.
     #[must_use]
     pub fn new(config: crate::config::Shared, waker: crate::runloop::Waker) -> Self {
         let sources: Vec<Box<dyn Source>> = vec![
@@ -802,7 +841,15 @@ impl Registry {
 
         let mut providers: HashMap<Kind, Vec<SourceId>> = HashMap::new();
         let mut registered = HashMap::with_capacity(sources.len());
-        for source in sources {
+        // One bit each, and the top one for the events this process produces
+        // itself. A build with more sources than bits would silently share
+        // them, so it is worth failing here instead.
+        assert!(
+            sources.len() < u64::BITS as usize,
+            "more event sources than bits in the ready set"
+        );
+        let ready = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        for (index, source) in sources.into_iter().enumerate() {
             let id = source.id();
             let provided: BTreeSet<Kind> = source.provides().into_iter().collect();
             for kind in &provided {
@@ -817,15 +864,22 @@ impl Registry {
                     feed: None,
                     serving: BTreeSet::new(),
                     failed: false,
+                    bit: 1 << index,
                 },
             );
         }
 
-        let (emit, manual) = Feed::manual(SourceId("local"), waker.clone());
+        let (emit, manual) = Feed::manual(
+            SourceId("local"),
+            waker.clone(),
+            std::sync::Arc::clone(&ready),
+            LOCAL_BIT,
+        );
         Self {
             sources: registered,
             providers,
             claims: Claims::default(),
+            ready,
             shared: Shared::default(),
             manual,
             emit,
@@ -961,6 +1015,7 @@ impl Registry {
             sources,
             shared,
             waker,
+            ready,
             ..
         } = self;
         let Some(entry) = sources.get_mut(&id) else {
@@ -1013,7 +1068,14 @@ impl Registry {
             return;
         }
 
-        match start(entry.source.as_mut(), &demand, shared, waker) {
+        match start(
+            entry.source.as_mut(),
+            &demand,
+            shared,
+            waker,
+            ready,
+            entry.bit,
+        ) {
             Ok(feed) => {
                 tracing::debug!(source = %id, wants = ?demand, "registered event source");
                 entry.feed = Some(feed);
@@ -1031,19 +1093,34 @@ impl Registry {
     ///
     /// Each emission is tagged with the source that produced it, so an event
     /// arriving from somewhere unexpected is traceable rather than anonymous.
-    pub fn drain(&mut self) -> Vec<(SourceId, Event)> {
+    pub fn drain(&mut self, mut on_event: impl FnMut(SourceId, Event)) {
         let Self {
-            sources, manual, ..
+            sources,
+            manual,
+            ready,
+            ..
         } = self;
-        let mut drained = Vec::new();
-        let feeds = sources.values_mut().filter_map(|e| e.feed.as_mut());
-        for feed in feeds.chain(std::iter::once(manual)) {
+        // Which sources actually have something. Taken once and cleared, so a
+        // wake looks at whatever woke us rather than asking every source
+        // whether it was them.
+        let signalled = ready.swap(0, std::sync::atomic::Ordering::AcqRel);
+        if signalled == 0 {
+            return;
+        }
+        let feeds = sources
+            .values_mut()
+            .filter(|entry| entry.bit & signalled != 0)
+            .filter_map(|entry| entry.feed.as_mut());
+        let local = (signalled & LOCAL_BIT != 0).then_some(manual);
+        for feed in feeds.chain(local) {
             let id = feed.id();
             while let Some(event) = feed.try_next() {
-                drained.push((id, event));
+                // Handed straight on rather than collected. One list of
+                // everything every source produced is an allocation per pass
+                // for a consumer that only walks it once.
+                on_event(id, event);
             }
         }
-        drained
     }
 }
 

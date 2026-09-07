@@ -230,10 +230,10 @@ fn settle_sources(mut sources: NonSendMut<Sources>) {
 }
 
 fn drain_events(mut sources: NonSendMut<Sources>, mut out: MessageWriter<EventMessage>) {
-    for (id, event) in sources.0.drain() {
+    sources.0.drain(|id, event| {
         tracing::trace!(source = %id, kind = %event.kind(), "drained");
         out.write(EventMessage(event));
-    }
+    });
 }
 
 /// Drains the request queue and applies each one.
