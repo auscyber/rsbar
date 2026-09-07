@@ -133,6 +133,16 @@ fn direct_argv(script: &str) -> Option<Vec<&str>> {
     (!argv.is_empty()).then_some(argv)
 }
 
+/// `PATH` with this daemon reachable as `sketchybar`, which is the name a
+/// config's plugin scripts call to set their own item. See [`crate::shim`].
+fn shim_path() -> Option<(&'static str, std::ffi::OsString)> {
+    thread_local! {
+        static PATH: Option<std::ffi::OsString> =
+            crate::shim::directory().map(|_| rsbar_protocol::shimmed_path());
+    }
+    PATH.with(|path| path.clone().map(|path| ("PATH", path)))
+}
+
 fn run(job: &Job) {
     let mut command = if let Some(argv) = direct_argv(&job.script) {
         let mut command = Command::new(argv[0]);
@@ -145,9 +155,11 @@ fn run(job: &Job) {
     };
 
     let mut child = match command
+        .env("NAME", job.item.name().as_str())
         .env("RSBAR_NAME", job.item.name().as_str())
         .envs(job.event.env())
         .env("RSBAR_SERVICE", rsbar_protocol::service_name())
+        .envs(shim_path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

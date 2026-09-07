@@ -351,15 +351,25 @@ impl Event {
             }
         };
 
+        // Under both spellings: a config's plugin scripts are written against
+        // `SketchyBar`, which passes `SENDER`/`INFO` unprefixed, and the whole
+        // point of matching its CLI is that those scripts run unchanged. The
+        // `RSBAR_` names stay because a bare `NAME` in the environment is easy
+        // for something else to have set, and a script that wants to be sure
+        // can ask for the one nothing else uses.
         let mut env = BTreeMap::from([
+            ("SENDER".to_owned(), self.kind().name().to_owned()),
             ("RSBAR_SENDER".to_owned(), self.kind().name().to_owned()),
+            ("INFO".to_owned(), info.clone()),
             ("RSBAR_INFO".to_owned(), info),
         ]);
-        env.extend(
-            fields
-                .into_iter()
-                .map(|(name, value)| (format!("RSBAR_{}", name.to_uppercase()), value)),
-        );
+        env.extend(fields.into_iter().flat_map(|(name, value)| {
+            let upper = name.to_uppercase();
+            [
+                (upper.clone(), value.clone()),
+                (format!("RSBAR_{upper}"), value),
+            ]
+        }));
         env
     }
 }
