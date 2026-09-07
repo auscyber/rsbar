@@ -64,55 +64,14 @@ use rsbar_protocol::Edge;
 use rsbar_protocol::style::Color;
 use skylight::{Window, WindowTags, level};
 use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::str::FromStr;
 
-/// Which side of the host item a popup's own edge lines up with —
-/// `SketchyBar`'s `popup.align`. The popup's width and the host's are
-/// independent, so `Left`/`Right` are about edges, not centring.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PopupAlign {
-    #[default]
-    Left,
-    Center,
-    Right,
-}
+pub use rsbar_protocol::{InvalidAlign, PopupAlign};
 
-impl fmt::Display for PopupAlign {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Left => "left",
-            Self::Center => "center",
-            Self::Right => "right",
-        })
-    }
-}
+/// A row's height when a popup does not set one.
+const DEFAULT_ROW_HEIGHT: f64 = 25.0;
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("`{0}` is not a popup alignment: expected left, center or right")]
-pub struct InvalidAlign(String);
-
-impl FromStr for PopupAlign {
-    type Err = InvalidAlign;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "left" | "l" => Ok(Self::Left),
-            "center" | "centre" | "c" => Ok(Self::Center),
-            "right" | "r" => Ok(Self::Right),
-            _ => Err(InvalidAlign(s.to_owned())),
-        }
-    }
-}
-
-/// A row's height when nothing overrides it — `SketchyBar`'s own default
-/// `cell_size`.
-pub const DEFAULT_ROW_HEIGHT: f64 = 30.0;
-
-/// A host item's popup: whether it is open, how its rows are laid out, and
-/// what its own surface looks like.
-///
-/// Lives on the *host* item's entity — the one a config points a popup at —
-/// not on the items inside it; those instead carry [`PopupOf`].
+/// One popup's own drawing properties -- a component on the item that hosts
+/// it, not on the items inside it; those instead carry [`PopupOf`].
 #[derive(Component, Debug, Clone, Copy, PartialEq)]
 pub struct PopupConfig {
     pub drawing: bool,

@@ -11,47 +11,9 @@ use bevy_ecs::prelude::*;
 use rsbar_protocol::style::{Color, FontSpec};
 use rsbar_protocol::{ItemName, Kind, Position};
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::NonZeroU64;
 
-/// Which display something is restricted to: every one, or a single 1-based
-/// index into [`crate::display::active`]'s order — the same order
-/// [`crate::bar::Panels`] builds its panels in, so an item's `display` and a
-/// panel's ordinal are always talking about the same numbering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DisplayTarget {
-    #[default]
-    All,
-    Index(NonZeroU32),
-}
-
-impl DisplayTarget {
-    /// Parses the wire form: `"all"`, case-insensitively, or a positive
-    /// decimal index. Anything else falls back to `All` — a config typo
-    /// should not make an item vanish, only fail to restrict it.
-    #[must_use]
-    pub fn parse(spec: &str) -> Self {
-        if spec.eq_ignore_ascii_case("all") {
-            return Self::All;
-        }
-        if let Some(index) = spec.parse::<u32>().ok().and_then(NonZeroU32::new) {
-            return Self::Index(index);
-        }
-        tracing::warn!(
-            spec,
-            "not a display: expected `all` or a 1-based index; showing on all"
-        );
-        Self::All
-    }
-
-    /// Whether this target includes the display at `ordinal`, 1-based.
-    #[must_use]
-    pub fn matches(self, ordinal: u32) -> bool {
-        match self {
-            Self::All => true,
-            Self::Index(index) => index.get() == ordinal,
-        }
-    }
-}
+pub use rsbar_protocol::DisplayTarget;
 
 /// Marks an entity as a bar item.
 #[derive(Component)]
@@ -658,29 +620,8 @@ mod tests {
     }
 
     #[test]
-    fn display_targets_parse_the_spellings_a_config_uses() {
-        assert_eq!(DisplayTarget::parse("all"), DisplayTarget::All);
-        assert_eq!(DisplayTarget::parse("ALL"), DisplayTarget::All);
-        assert_eq!(
-            DisplayTarget::parse("1"),
-            DisplayTarget::Index(NonZeroU32::new(1).unwrap())
-        );
-        assert_eq!(
-            DisplayTarget::parse("2"),
-            DisplayTarget::Index(NonZeroU32::new(2).unwrap())
-        );
-    }
-
-    #[test]
-    fn an_unparsable_display_falls_back_to_all_rather_than_hiding_the_item() {
-        assert_eq!(DisplayTarget::parse("0"), DisplayTarget::All);
-        assert_eq!(DisplayTarget::parse("second"), DisplayTarget::All);
-        assert_eq!(DisplayTarget::parse(""), DisplayTarget::All);
-    }
-
-    #[test]
     fn display_target_matching() {
-        let two = DisplayTarget::Index(NonZeroU32::new(2).unwrap());
+        let two = DisplayTarget::Index(std::num::NonZeroU32::new(2).unwrap());
         assert!(DisplayTarget::All.matches(1));
         assert!(DisplayTarget::All.matches(2));
         assert!(!two.matches(1));

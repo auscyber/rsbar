@@ -157,12 +157,12 @@ impl Settings {
         if let Some(p) = patch.padding_right {
             self.padding_right = p;
         }
-        if let Some(spec) = &patch.display {
+        if let Some(spec) = patch.display.as_ref() {
             // Guarded, unlike every other field here: rebuilding every panel
             // — tearing down and recreating window server windows — is real
             // work, and a `SetBar` that only touched an unrelated field would
             // otherwise pay for it on every request.
-            let target = DisplayTarget::parse(spec);
+            let target = *spec;
             if target != self.display {
                 self.display = target;
                 changes.insert(Changes::DISPLAYS);

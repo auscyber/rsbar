@@ -8,9 +8,9 @@
 use crate::bar::{Changes, Panels, Settings};
 use crate::components::{
     AliasContent, AliasSpec, AssociatedSpace, Background, ClickScript, DEFAULT_GRAPH_SAMPLES,
-    DEFAULT_SLIDER_WIDTH, DisplayTarget, Drawing, Graph, Icon, Index, ItemDisplay, ItemHandle,
-    Label, Members, Name, Offset, Order, Padding, Placement, Routine, Run, Script, Selected,
-    Slider, Stale, Subscriptions, Updates, Watching, Width, bundle,
+    DEFAULT_SLIDER_WIDTH, Drawing, Graph, Icon, Index, ItemDisplay, ItemHandle, Label, Members,
+    Name, Offset, Order, Padding, Placement, Routine, Run, Script, Selected, Slider, Stale,
+    Subscriptions, Updates, Watching, Width, bundle,
 };
 use crate::popup::{PopupConfig, PopupOf};
 use crate::script::Job;
@@ -187,7 +187,7 @@ fn popup_state(config: Option<&PopupConfig>) -> rsbar_protocol::PopupState {
     rsbar_protocol::PopupState {
         drawing: config.drawing,
         horizontal: config.horizontal,
-        align: config.align.to_string(),
+        align: config.align,
         topmost: config.topmost,
         height: config.height,
         y_offset: config.y_offset,
@@ -506,7 +506,7 @@ fn apply_popup(
     let patch = crate::popup::PopupPatch {
         drawing: patch.drawing.map(|d| d.resolve(existing.drawing)),
         horizontal: patch.horizontal,
-        align: patch.align.as_deref().and_then(|a| a.parse().ok()),
+        align: patch.align,
         topmost: patch.topmost,
         height: patch.height,
         y_offset: patch.y_offset,
@@ -1113,8 +1113,7 @@ fn set_item(
         row.width.set_if_neq(Width(Some(w)));
     }
     if let Some(spec) = &patch.display {
-        row.display
-            .set_if_neq(ItemDisplay(DisplayTarget::parse(spec)));
+        row.display.set_if_neq(ItemDisplay(*spec));
     }
     if let Some(freq) = patch.update_freq {
         routine.every = freq;

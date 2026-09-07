@@ -138,6 +138,31 @@ fn opt<T: mlua::FromLua>(table: &Table, key: &str) -> mlua::Result<Option<T>> {
 /// A boolean that may also be `"toggle"`, which only the daemon can resolve:
 /// `SketchyBar` accepts it wherever it accepts on/off, and this config binds a
 /// click to `popup.drawing=toggle`.
+/// A field whose wire type parses from a string, so the Lua side hands over
+/// the type rather than a string for the daemon to re-parse.
+fn opt_parsed<T: FromStr>(table: &Table, key: &str) -> mlua::Result<Option<T>>
+where
+    T::Err: std::fmt::Display,
+{
+    match table.get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::Integer(i) => i
+            .to_string()
+            .parse()
+            .map(Some)
+            .map_err(|e| mlua::Error::RuntimeError(format!("`{key}`: {e}"))),
+        Value::String(s) => s
+            .to_str()?
+            .parse()
+            .map(Some)
+            .map_err(|e| mlua::Error::RuntimeError(format!("`{key}`: {e}"))),
+        other => Err(mlua::Error::RuntimeError(format!(
+            "`{key}` must be a string or a number, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
 fn opt_toggle(table: &Table, key: &str) -> mlua::Result<Option<rsbar_protocol::Toggle>> {
     match table.get::<Value>(key)? {
         Value::Nil => Ok(None),
@@ -193,21 +218,6 @@ fn opt_color(table: &Table, key: &str) -> mlua::Result<Option<Color>> {
 }
 
 /// `display = "main"` / `display = "1,2"` / `display = 1`, the way a real
-/// config writes either a name or a 1-based index — flattened to the string
-/// the protocol carries either way.
-fn opt_display(table: &Table, key: &str) -> mlua::Result<Option<String>> {
-    match table.get::<Value>(key)? {
-        Value::Nil => Ok(None),
-        Value::String(s) => Ok(Some(s.to_str()?.to_string())),
-        Value::Integer(i) => Ok(Some(i.to_string())),
-        Value::Number(n) => Ok(Some(n.to_string())),
-        other => Err(mlua::Error::RuntimeError(format!(
-            "`{key}` must be a string or a number, got {}",
-            other.type_name()
-        ))),
-    }
-}
-
 /// `position = "left"`, or `SketchyBar`'s `"popup.<owner item>"`, which is a
 /// popup anchor rather than a bar bucket. Anything unparseable is logged and
 /// dropped rather than raised: one bad `position` should not crash the whole
@@ -539,7 +549,7 @@ pub fn bar_patch_from_table(table: &Table) -> mlua::Result<BarPatch> {
         notch_display_height: opt(table, "notch_display_height")?,
         padding_left: opt(table, "padding_left")?,
         padding_right: opt(table, "padding_right")?,
-        display: opt_display(table, "display")?,
+        display: opt_parsed(table, "display")?,
         height: opt(table, "height")?,
         edge,
         color: opt_color(table, "color")?,
@@ -577,7 +587,7 @@ fn popup_patch(table: &Table) -> mlua::Result<Option<rsbar_protocol::PopupPatch>
     Ok(Some(rsbar_protocol::PopupPatch {
         drawing: opt_toggle(&sub, "drawing")?,
         horizontal: opt(&sub, "horizontal")?,
-        align: opt(&sub, "align")?,
+        align: opt_parsed(&sub, "align")?,
         topmost: opt_bool(&sub, "topmost")?,
         height: opt(&sub, "height")?,
         y_offset: opt(&sub, "y_offset")?,
@@ -667,7 +677,7 @@ pub fn item_patch_from_table(table: &Table) -> mlua::Result<ItemPatch> {
         popup: popup_patch(table)?,
         updates: opt_bool(table, "updates")?,
         width: opt(table, "width")?,
-        display: opt_display(table, "display")?,
+        display: opt_parsed(table, "display")?,
         // `IconOrLabel::read` already covers both the bare-string and the
         // `{ text = ... }` spellings of `icon`/`label` — there is no separate
         // flat key left to fall back to, and `icon`/`label` themselves are
@@ -1034,7 +1044,7 @@ mod tests {
             popup: rsbar_protocol::PopupState {
                 drawing: false,
                 horizontal: false,
-                align: "left".into(),
+                align: rsbar_protocol::PopupAlign::Left,
                 topmost: true,
                 height: 0.0,
                 y_offset: 0.0,

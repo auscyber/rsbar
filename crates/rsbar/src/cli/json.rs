@@ -464,7 +464,7 @@ mod tests {
             popup: rsbar_protocol::PopupState {
                 drawing: false,
                 horizontal: false,
-                align: "left".into(),
+                align: rsbar_protocol::PopupAlign::Left,
                 topmost: true,
                 height: 0.0,
                 y_offset: 0.0,

@@ -26,6 +26,117 @@ pub fn service_name() -> String {
     std::env::var("RSBAR_SERVICE").unwrap_or_else(|_| "com.auscyber.rsbar".to_owned())
 }
 
+/// Which side of the host item a popup's own edge lines up with --
+/// `SketchyBar`'s `popup.align`. The popup's width and the host's are
+/// independent, so `Left`/`Right` are about edges, not centring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PopupAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+impl fmt::Display for PopupAlign {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Left => "left",
+            Self::Center => "center",
+            Self::Right => "right",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("`{0}` is not a popup alignment: expected left, center or right")]
+pub struct InvalidAlign(String);
+
+impl FromStr for PopupAlign {
+    type Err = InvalidAlign;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "left" | "l" => Ok(Self::Left),
+            "center" | "centre" | "c" => Ok(Self::Center),
+            "right" | "r" => Ok(Self::Right),
+            _ => Err(InvalidAlign(s.to_owned())),
+        }
+    }
+}
+
+impl Serialize for PopupAlign {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for PopupAlign {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Which display something is restricted to: every one, or a single 1-based
+/// index into the active displays, which is the same order the bar builds its
+/// panels in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisplayTarget {
+    #[default]
+    All,
+    Index(std::num::NonZeroU32),
+}
+
+impl DisplayTarget {
+    /// Whether this includes the display at `ordinal`, 1-based.
+    #[must_use]
+    pub fn matches(self, ordinal: u32) -> bool {
+        match self {
+            Self::All => true,
+            Self::Index(index) => index.get() == ordinal,
+        }
+    }
+}
+
+impl fmt::Display for DisplayTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::All => f.write_str("all"),
+            Self::Index(index) => index.fmt(f),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("`{0}` is not a display: expected `all` or a 1-based index")]
+pub struct InvalidDisplay(String);
+
+impl FromStr for DisplayTarget {
+    type Err = InvalidDisplay;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("all") {
+            return Ok(Self::All);
+        }
+        s.parse::<u32>()
+            .ok()
+            .and_then(std::num::NonZeroU32::new)
+            .map(Self::Index)
+            .ok_or_else(|| InvalidDisplay(s.to_owned()))
+    }
+}
+
+impl Serialize for DisplayTarget {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for DisplayTarget {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// A boolean a config can also ask to flip.
 ///
 /// `SketchyBar` accepts `drawing=toggle` wherever it accepts `on`/`off`, and
@@ -385,8 +496,8 @@ pub struct BarPatch {
     /// insets the items from the bar.
     pub padding_left: Option<f64>,
     pub padding_right: Option<f64>,
-    /// Which displays the bar appears on: `all`, or a 1-based index.
-    pub display: Option<String>,
+    /// Which displays the bar appears on.
+    pub display: Option<DisplayTarget>,
     /// Whether the bar stays put across a space switch.
     pub sticky: Option<bool>,
     /// Whether the bar draws over a fullscreen app.
@@ -444,8 +555,8 @@ pub struct ItemPatch {
     /// leaves it measured; a config sets this for a spacer, or to stop an
     /// item's width jittering as its text changes.
     pub width: Option<f64>,
-    /// Which displays this item appears on: `all`, or a 1-based index.
-    pub display: Option<String>,
+    /// Which displays this item appears on.
+    pub display: Option<DisplayTarget>,
     /// Which space a `space` item stands for. `Some(None)` unsets it, which
     /// is why it is doubly optional: the outer layer is "did the patch say
     /// anything", the inner one is the value.
@@ -467,9 +578,7 @@ pub struct PopupPatch {
     pub drawing: Option<Toggle>,
     /// Rows run left to right instead of stacking.
     pub horizontal: Option<bool>,
-    /// Which edge of the host the popup lines up with: `left`, `center` or
-    /// `right`.
-    pub align: Option<String>,
+    pub align: Option<PopupAlign>,
     pub topmost: Option<bool>,
     /// Each row's height.
     pub height: Option<f64>,
@@ -904,7 +1013,7 @@ pub struct Scripting {
 pub struct PopupState {
     pub drawing: bool,
     pub horizontal: bool,
-    pub align: String,
+    pub align: PopupAlign,
     pub topmost: bool,
     pub height: f64,
     pub y_offset: f64,
@@ -964,6 +1073,29 @@ mod tests {
             ItemName::new("two\nlines"),
             Err(InvalidName::Character(_))
         ));
+    }
+
+    #[test]
+    fn a_display_target_parses_what_a_config_writes() {
+        assert_eq!("all".parse(), Ok(DisplayTarget::All));
+        assert_eq!("ALL".parse(), Ok(DisplayTarget::All));
+        assert_eq!(
+            "2".parse(),
+            Ok(DisplayTarget::Index(std::num::NonZeroU32::new(2).unwrap()))
+        );
+        // Rejected rather than quietly meaning "all", which is what the
+        // daemon's own parser used to do: a typo now fails at the client with
+        // the offending text named, and an invalid one never reaches the bar.
+        assert!("0".parse::<DisplayTarget>().is_err());
+        assert!("second".parse::<DisplayTarget>().is_err());
+        assert!("".parse::<DisplayTarget>().is_err());
+    }
+
+    #[test]
+    fn a_popup_alignment_parses_what_a_config_writes() {
+        assert_eq!("centre".parse(), Ok(PopupAlign::Center));
+        assert_eq!("r".parse(), Ok(PopupAlign::Right));
+        assert!("middle".parse::<PopupAlign>().is_err());
     }
 
     #[test]

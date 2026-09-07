@@ -134,10 +134,44 @@ impl<T: fmt::Display> fmt::Display for Maybe<T> {
     }
 }
 
+/// Builds one shape of a [`Kind`] variant, depending on whether the event it
+/// names is dependent on an item.
+///
+/// `@scoped` is what a config's own bare name cannot say — `mouse.entered`
+/// means "this item's" only once something binds it to one. An unscoped event
+/// has no item to carry, so its `Kind` stays a bare unit exactly as before.
+macro_rules! kind_variant {
+    ($variant:ident) => { $variant };
+    ($variant:ident @scoped) => { $variant(Item) };
+}
+
+/// Matches a [`Kind`] variant regardless of what it carries.
+macro_rules! kind_pattern {
+    ($variant:ident) => { Self::$variant };
+    ($variant:ident @scoped) => { Self::$variant(_) };
+}
+
+/// Builds the wire-shaped, item-less [`Kind`] for one variant — `Item = ()`,
+/// the only value an event's own name can produce.
+macro_rules! kind_unscoped {
+    ($variant:ident) => { Kind::$variant };
+    ($variant:ident @scoped) => { Kind::$variant(()) };
+}
+
+/// One arm of [`Kind::map`]: passes an unscoped variant through untouched,
+/// or recasts a scoped one's item through `f`.
+macro_rules! kind_map_arm {
+    ($variant:ident) => { Self::$variant => Kind::$variant };
+    ($variant:ident @scoped) => { Self::$variant(item) => Kind::$variant(f(item)) };
+}
+
 /// Declares the built-in events.
 ///
 /// `Variant = "name" => Payload { field: Type }` gives a payload struct, an
 /// `Event::Variant(Payload)`, and a `Kind::Variant` named `"name"`.
+/// `Variant = "name" @scoped => ...` gives a `Kind::Variant(Item)` instead —
+/// for an event that happens to one item rather than to the bar. See
+/// [`Kind`]'s own doc for what `Item` is and who fills it in.
 ///
 /// Every field also becomes an environment variable for scripts, named
 /// `RSBAR_` plus the field in upper case. That is why the fields are named
@@ -145,7 +179,7 @@ impl<T: fmt::Display> fmt::Display for Maybe<T> {
 macro_rules! events {
     (
         $(
-            $variant:ident = $name:literal => $data:ident {
+            $variant:ident = $name:literal $(@scoped)? => $data:ident {
                 $( $(#[$field_meta:meta])* $field:ident : $ty:ty ),* $(,)?
             }
         ),* $(,)?

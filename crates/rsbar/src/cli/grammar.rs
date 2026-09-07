@@ -824,7 +824,7 @@ mod tests {
                 Box::new(ItemPatch {
                     updates: Some(false),
                     width: Some(40.0),
-                    display: Some("2".into()),
+                    display: Some("2".parse().unwrap()),
                     ..Default::default()
                 })
             )]
