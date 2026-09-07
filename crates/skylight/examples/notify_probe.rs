@@ -63,25 +63,82 @@ use std::time::{Duration, Instant};
 
 const MENU_BAR_LAYER: i64 = 0x19;
 
-/// Every event number this investigation considered plausible for "a
-/// window's contents changed", plus a few window lifecycle ones as a sanity
-/// check that registration/delivery works at all.
+/// Every `kCGSEvent*`/`kCGS*Notification*` number either source names, not
+/// just the ones judged plausible for "contents changed" — the full public
+/// `NUIKit/CGSInternal` `CGSEvent.h` enumeration, plus every private-range
+/// number in `rift`'s (and identically, `paneru`'s) `KnownCGSEvent`, which
+/// `CGSEvent.h` does not cover (1204 upward). Deduplicated; annotated with
+/// whichever source named it.
 const CANDIDATES: &[(u32, &str)] = &[
+    // -- CGSEvent.h: display --
+    (100, "kCGSDisplayWillReconfigure"),
+    (101, "kCGSDisplayDidReconfigure"),
+    (102, "kCGSDisplayWillSleep"),
+    (103, "kCGSDisplayDidWake"),
+    (106, "kCGSDisplayIsCaptured"),
+    (107, "kCGSDisplayIsReleased"),
+    (108, "kCGSDisplayAllDisplaysReleased"),
+    (111, "kCGSDisplayHardwareChanged"),
+    (115, "kCGSDisplayDidReconfigure2"),
+    (116, "kCGSDisplayFullScreenAppRunning"),
+    (117, "kCGSDisplayFullScreenAppDone"),
+    (118, "kCGSDisplayReconfigureHappened"),
+    (119, "kCGSDisplayColorProfileChanged"),
+    (120, "kCGSDisplayZoomStateChanged"),
+    (121, "kCGSDisplayAcceleratorChanged"),
+    // -- CGSEvent.h: debug --
+    (200, "kCGSDebugOptionsChangedNotification"),
+    (203, "kCGSDebugPrintResourcesNotification"),
+    (205, "kCGSDebugPrintResourcesMemoryNotification"),
+    (206, "kCGSDebugPrintResourcesContextNotification"),
+    (208, "kCGSDebugPrintResourcesImageNotification"),
+    // -- CGSEvent.h: server --
     (300, "kCGSServerConnDirtyScreenNotification"),
+    (301, "kCGSServerLoginNotification"),
+    (302, "kCGSServerShutdownNotification"),
+    (303, "kCGSServerUserPreferencesLoadedNotification"),
     (304, "kCGSServerUpdateDisplayNotification"),
+    (305, "kCGSServerCAContextDidCommitNotification"),
     (306, "kCGSServerUpdateDisplayCompletedNotification"),
+    // -- CGSEvent.h: process --
+    (400, "kCPXForegroundProcessSwitched"),
+    (401, "kCPXSpecialKeyPressed"),
+    (402, "kCPXForegroundProcessSwitchRequestedButRedundant"),
+    // -- CGSEvent.h: input/event-tap (unlikely, included for completeness) --
+    (700, "kCGSSpecialKeyEventNotification"),
+    (710, "kCGSEventNotificationNullEvent"),
+    (723, "kCGSEventNotificationKitDefined"),
+    (724, "kCGSEventNotificationSystemDefined"),
+    (726, "kCGSEventNotificationTimer"),
+    (727, "kCGSEventNotificationCursorUpdate"),
+    (729, "kCGSEventNotificationSuspend"),
+    (730, "kCGSEventNotificationResume"),
+    (731, "kCGSEventNotificationNotification"),
+    (738, "kCGSEventNotificationZoom"),
+    (750, "kCGSEventNotificationAppIsUnresponsive"),
+    (751, "kCGSEventNotificationAppIsNoLongerUnresponsive"),
+    (752, "kCGSEventSecureTextInputIsActive"),
+    (753, "kCGSEventSecureTextInputIsOff"),
+    (760, "kCGSEventNotificationSymbolicHotKeyChanged"),
+    // -- CGSEvent.h: window --
     (800, "kCGSWindowIsObscured"),
     (801, "kCGSWindowIsUnobscured"),
     (802, "kCGSWindowIsOrderedIn"),
     (803, "kCGSWindowIsOrderedOut"),
+    (804, "kCGSWindowIsTerminated"),
+    (805, "kCGSWindowIsChangingScreens"),
     (806, "kCGSWindowDidMove"),
     (807, "kCGSWindowDidResize"),
     (808, "kCGSWindowDidChangeOrder"),
     (809, "kCGSWindowGeometryDidChange"),
     (810, "kCGSWindowMonitorDataPending"),
     (811, "kCGSWindowDidCreate"),
+    (812, "kCGSWindowRightsGrantOffered"),
+    (813, "kCGSWindowRightsGrantCompleted"),
+    (814, "kCGSWindowRecordForTermination"),
     (815, "kCGSWindowIsVisible"),
     (816, "kCGSWindowIsInvisible"),
+    // -- CGSEvent.h: connection/drawing updates --
     (902, "kCGSLikelyUnbalancedDisableUpdateNotification"),
     (904, "kCGSConnectionWindowsBecameVisible"),
     (905, "kCGSConnectionWindowsBecameOccluded"),
@@ -89,23 +146,62 @@ const CANDIDATES: &[(u32, &str)] = &[
     (907, "kCGSConnectionWindowModificationsStopped"),
     (912, "kCGSWindowBecameVisible"),
     (913, "kCGSWindowBecameOccluded"),
+    // -- CGSEvent.h: server window --
     (1000, "kCGSServerWindowDidCreate"),
+    (1001, "kCGSServerWindowWillTerminate"),
     (1002, "kCGSServerWindowOrderDidChange"),
     (1003, "kCGSServerWindowDidTerminate"),
-    // Added after reading SketchyBar's own `sketchybar.c`/`window.c`: it
-    // registers exactly these three (704, 905, 1322) for `system_events`,
-    // but only to set `g_disable_capture` and *skip* a poll for ~1s during a
-    // transition — it never treats any of them as "capture now". Worth
-    // testing for delivery anyway; a fired event still isn't proof it means
-    // "contents changed" without SketchyBar's own corroborating use of it.
-    (723, "kCGSEventNotificationKitDefined"),
+    // -- CGSEvent.h: dock --
+    (1205, "kCGSWindowWasMovedByDockEvent"),
+    (1207, "kCGSWindowWasResizedByDockEvent"),
+    (1208, "kCGSWindowDidBecomeManagedByDockEvent"),
+    // -- CGSEvent.h: menu bar --
     (1300, "kCGSServerMenuBarCreated"),
+    (1301, "kCGSServerHidBackstopMenuBar"),
+    (1302, "kCGSServerShowBackstopMenuBar"),
     (1303, "kCGSServerMenuBarDrawingStyleChanged"),
+    (1304, "kCGSServerPersistentAppsRegistered"),
+    (1305, "kCGSServerPersistentCheckinComplete"),
+    (1306, "kCGSPackagesWorkspacesDisabled"),
+    (1307, "kCGSPackagesWorkspacesEnabled"),
     (1308, "kCGSPackagesStatusBarSpaceChanged"),
-    (1322, "kCGSWindowTitleChanged"),
-    (1336, "kCGSWindowOrderingGroupChanged"),
-    (1338, "kCGSSpaceWindowTransactionCommitted"),
-    (1341, "kCGSWindowParentChanged"),
+    // -- CGSEvent.h: workspace/session/transition --
+    (1400, "kCGSWorkspaceWillChange"),
+    (1401, "kCGSWorkspaceDidChange"),
+    (1402, "kCGSWorkspaceWindowIsViewable"),
+    (1403, "kCGSWorkspaceWindowIsNotViewable"),
+    (1404, "kCGSWorkspaceWindowDidMove"),
+    (1405, "kCGSWorkspacePrefsDidChange"),
+    (1500, "kCGSessionConsoleConnect"),
+    (1501, "kCGSessionConsoleDisconnect"),
+    (1700, "kCGSTransitionDidFinish"),
+    // -- rift's/paneru's private range, not in CGSEvent.h --
+    (1204, "MissionControlEntered"),
+    (1322, "WindowTitleChanged"),
+    (1325, "SpaceWindowCreated"),
+    (1326, "SpaceWindowDestroyed"),
+    (1327, "SpaceCreated"),
+    (1328, "SpaceDestroyed"),
+    (1329, "SpaceCurrentChanged"),
+    (1333, "WindowManagerActivatingClickOrdering"),
+    (1334, "WindowManagerSpaceFrontConnectionChanged"),
+    (1335, "WindowManagerGlobalFrontConnectionChanged"),
+    (1336, "WindowOrderingGroupChanged"),
+    (1338, "SpaceWindowTransactionCommitted"),
+    (1339, "SpaceWindowBatchReassociated"),
+    (1340, "SpaceWindowManagementCapabilitiesChanged"),
+    (1341, "WindowParentChanged"),
+    (1342, "ManagedSpaceMembershipUpdated"),
+    (1411, "WorkspacesWindowDragDidStart"),
+    (1412, "WorkspacesWindowDragDidEnd"),
+    (1413, "WorkspacesWindowDragWillEnd"),
+    (1414, "WorkspacesShowSpaceForProcess"),
+    (
+        1415,
+        "WorkspacesWindowDidOrderInOnNonCurrentManagedSpacesOnly",
+    ),
+    (1416, "WorkspacesWindowDidOrderOutOnNonCurrentManagedSpaces"),
+    (1508, "FrontmostApplicationChanged"),
 ];
 
 extern "C-unwind" fn on_event(
@@ -215,11 +311,12 @@ fn main() {
     println!("SLSRequestNotificationsForWindows -> {status:?}");
 
     println!(
-        "pumping for 130s (pid {}); change the mirrored item's contents now",
+        "pumping for 150s (pid {}), guaranteeing a real minute rollover regardless of start \
+         offset; change the mirrored item's contents now",
         std::process::id()
     );
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(130) {
+    while start.elapsed() < Duration::from_secs(150) {
         // SAFETY: plain CoreFoundation call on this thread's run loop.
         unsafe {
             objc2_core_foundation::CFRunLoop::run_in_mode(
