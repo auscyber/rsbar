@@ -128,9 +128,33 @@ impl FontSpec {
     }
 }
 
+/// The inverse of [`FontSpec::parse`], so a spec can go back out the way it
+/// came in.
+impl fmt::Display for FontSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}:{}", self.family, self.style, self.size)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_font_spec_survives_a_round_trip() {
+        // The daemon parses a spec on the way in and prints it on the way
+        // back out, so a property set to the value it already has has to
+        // compare equal rather than looking like a change.
+        for spec in [
+            "Menlo:Bold:15",
+            "SF Pro:Regular:13",
+            "Hack Nerd Font:Heavy:12.5",
+        ] {
+            assert_eq!(FontSpec::parse(spec).to_string(), spec);
+        }
+        // A short spec fills in from the defaults and then prints in full.
+        assert_eq!(FontSpec::parse("Menlo").to_string(), "Menlo:Regular:13");
+    }
 
     #[test]
     fn parses_colour_forms() {

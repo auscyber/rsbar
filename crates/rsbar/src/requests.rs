@@ -18,10 +18,9 @@ use crate::subscribers::Subscribers;
 use bevy_ecs::prelude::*;
 use bevy_ecs::query::QueryData;
 use bevy_ecs::system::SystemParam;
-use rsbar_protocol::style::{Color, FontSpec};
 use rsbar_protocol::{
-    BackgroundPatch, Event, ItemName, ItemPatch, ItemState, Kind, Query as ProtocolQuery, Request,
-    Response, RunPatch,
+    BackgroundPatch, Event, ItemName, ItemPatch, ItemState, Kind, Patch, Query as ProtocolQuery,
+    Request, Response, RunPatch,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -377,6 +376,12 @@ pub struct Context<'a> {
     pub subscriber: Option<async_mach_ports::Subscriber>,
 }
 
+/// Opens the menu behind an `Owner,Name` alias spec.
+fn press_alias(spec: &str) -> Result<(), crate::alias::Error> {
+    let (owner, name) = spec.split_once(',').unwrap_or((spec, spec));
+    crate::alias::press_item(owner, name)
+}
+
 /// Applies one request.
 #[allow(
     clippy::too_many_lines,
@@ -540,6 +545,38 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             )),
             Err(err) => Outcome::error(err.to_string()),
         },
+        Request::Query(ProtocolQuery::AppMenus) => match crate::menus::list() {
+            Ok(found) => Outcome::answer(Response::AppMenus(
+                found.into_iter().map(|menu| menu.title).collect(),
+            )),
+            Err(err) => Outcome::error(err.to_string()),
+        },
+
+        Request::PressAppMenu(index) => match crate::menus::press(index) {
+            Ok(()) => Outcome::ok(),
+            Err(err) => Outcome::error(err.to_string()),
+        },
+
+        Request::PressAlias(name) => {
+            // The item's own `alias` is what names the thing to press, not the
+            // item's name: the two are usually equal, but a config is free to
+            // call a mirrored item anything it likes.
+            let Some(entity) = items.index.get(&name) else {
+                return no_such(&name);
+            };
+            let spec = items
+                .write
+                .get(entity)
+                .ok()
+                .and_then(|row| row.alias.map(|alias| alias.0.clone()));
+            let Some(spec) = spec else {
+                return Outcome::error(format!("`{name}` is not an alias"));
+            };
+            match press_alias(&spec) {
+                Ok(()) => Outcome::ok(),
+                Err(err) => Outcome::error(err.to_string()),
+            }
+        }
 
         Request::BeginConfig => {
             tracing::debug!("config began");
@@ -693,55 +730,43 @@ fn set_item(
 /// reaches for the `Mut`. `Mut::as_mut` is a `deref_mut`: touching a component
 /// at all marks it changed, and a component marked changed reshapes its text
 /// and repaints its rect whether or not a pixel moved.
+/// The same for the surface behind an item.
 fn patched_run(current: &Run, patch: Option<&RunPatch>) -> Option<Run> {
-    let patch = patch?;
-    let mut next = current.clone();
-    if let Some(s) = &patch.text {
-        s.clone_into(&mut next.string);
-    }
-    if let Some(f) = &patch.font {
-        next.font = FontSpec::parse(f);
-    }
-    if let Some(c) = patch.color {
-        next.color = Color(c);
-    }
-    if let Some(d) = patch.drawing {
-        next.drawing = d;
-    }
-    if let Some(p) = patch.padding_left {
-        next.padding_left = p;
-    }
-    if let Some(p) = patch.padding_right {
-        next.padding_right = p;
-    }
-    (next != *current).then_some(next)
+    patched(current, patch)
 }
 
 /// The same for the surface behind an item.
 fn patched_background(current: &Background, patch: Option<&BackgroundPatch>) -> Option<Background> {
+    patched(current, patch)
+}
+
+/// Applies a patch to a copy, and reports it only if the copy differs.
+///
+/// The merge itself is `struct_patch`'s own [`Patch::apply_with_log`],
+/// generated from the same declaration as the patch struct, so a property
+/// added to one is a property the other already knows about. What is applied
+/// to is the wire form, because that is what the patch is defined against;
+/// the daemon's own form parses a font and a colour out of it, and the two
+/// conversions are exhaustive struct literals, so a new field fails to
+/// compile here rather than silently going unread.
+///
+/// The log names the fields the patch *wrote*, which is not the same as the
+/// fields that *changed* — a config setting a colour to the colour it already
+/// had writes it and changes nothing. That difference is the whole question
+/// when an item is repainting more than it should, so both halves are traced:
+/// the field names here, and whether anything came of them below.
+fn patched<T, W, P>(current: &T, patch: Option<&P>) -> Option<T>
+where
+    T: Clone + PartialEq + for<'a> From<&'a W>,
+    W: for<'a> From<&'a T> + Patch<P>,
+    P: Clone,
+{
     let patch = patch?;
-    let mut next = *current;
-    if let Some(c) = patch.color {
-        next.color = Color(c);
-    }
-    if let Some(r) = patch.corner_radius {
-        next.corner_radius = r;
-    }
-    if let Some(h) = patch.height {
-        next.height = h;
-    }
-    if let Some(p) = patch.padding_left {
-        next.padding_left = p;
-    }
-    if let Some(p) = patch.padding_right {
-        next.padding_right = p;
-    }
-    if let Some(c) = patch.border_color {
-        next.border_color = Color(c);
-    }
-    if let Some(w) = patch.border_width {
-        next.border_width = w;
-    }
+    let mut wire = W::from(current);
+    wire.apply_with_log(patch.clone(), |field| {
+        tracing::trace!(field, "patch wrote");
+    });
+    let next = T::from(&wire);
     (next != *current).then_some(next)
 }
 
@@ -756,6 +781,7 @@ mod patch_tests {
 
     fn background() -> Background {
         Background {
+            drawing: true,
             color: Color(0xff11_2233),
             corner_radius: 4.0,
             height: 20.0,
@@ -775,6 +801,7 @@ mod patch_tests {
     fn a_background_patch_matching_every_current_field_changes_nothing() {
         let current = background();
         let patch = BackgroundPatch {
+            drawing: Some(current.drawing),
             color: Some(current.color.0),
             corner_radius: Some(current.corner_radius),
             height: Some(current.height),

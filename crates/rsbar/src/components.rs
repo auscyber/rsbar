@@ -53,6 +53,65 @@ pub struct Run {
     pub drawing: bool,
 }
 
+/// The wire form of a run, so `struct_patch` can apply a [`rsbar_protocol::RunPatch`]
+/// to it. Exhaustive both ways on purpose: a property added to one end has to
+/// be written down at the other before this compiles.
+impl From<&Run> for rsbar_protocol::Run {
+    fn from(run: &Run) -> Self {
+        Self {
+            text: run.string.clone(),
+            color: run.color.0,
+            font: run.font.to_string(),
+            drawing: run.drawing,
+            padding_left: run.padding_left,
+            padding_right: run.padding_right,
+        }
+    }
+}
+
+impl From<&rsbar_protocol::Run> for Run {
+    fn from(run: &rsbar_protocol::Run) -> Self {
+        Self {
+            string: run.text.clone(),
+            color: Color(run.color),
+            font: FontSpec::parse(&run.font),
+            drawing: run.drawing,
+            padding_left: run.padding_left,
+            padding_right: run.padding_right,
+        }
+    }
+}
+
+impl From<&Background> for rsbar_protocol::Background {
+    fn from(background: &Background) -> Self {
+        Self {
+            drawing: background.drawing,
+            color: background.color.0,
+            corner_radius: background.corner_radius,
+            height: background.height,
+            padding_left: background.padding_left,
+            padding_right: background.padding_right,
+            border_color: background.border_color.0,
+            border_width: background.border_width,
+        }
+    }
+}
+
+impl From<&rsbar_protocol::Background> for Background {
+    fn from(background: &rsbar_protocol::Background) -> Self {
+        Self {
+            drawing: background.drawing,
+            color: Color(background.color),
+            corner_radius: background.corner_radius,
+            height: background.height,
+            padding_left: background.padding_left,
+            padding_right: background.padding_right,
+            border_color: Color(background.border_color),
+            border_width: background.border_width,
+        }
+    }
+}
+
 impl Run {
     #[must_use]
     pub fn new(font: &str, color: Color) -> Self {
@@ -76,6 +135,12 @@ impl Run {
 
 #[derive(Component, Debug, Clone, Copy, PartialEq)]
 pub struct Background {
+    /// Whether the surface is drawn at all.
+    ///
+    /// Separate from the item's own [`Drawing`] so a config can turn a pill
+    /// off and leave the text on it, which is what a bar does to mark an
+    /// item inactive without moving anything.
+    pub drawing: bool,
     pub color: Color,
     pub corner_radius: f64,
     /// A fixed height, or zero for the bar's own.
@@ -250,6 +315,7 @@ pub fn bundle(name: ItemName, position: Position) -> impl Bundle {
         Icon(Run::new("Menlo:Bold:15", Color::WHITE)),
         Label(Run::new("Menlo:Regular:13", Color::WHITE)),
         Background {
+            drawing: true,
             color: Color::TRANSPARENT,
             corner_radius: 0.0,
             height: 0.0,
