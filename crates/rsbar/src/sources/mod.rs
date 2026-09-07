@@ -49,10 +49,10 @@ impl Emission {
 ///
 /// Cloneable and `Send`: source threads hold one each, and so does the main
 /// thread for the events only it can observe.
-pub type Emitter = tokio::sync::mpsc::Sender<Emission>;
+pub type Emitter = std::sync::mpsc::SyncSender<Emission>;
 
-/// The end the runtime reads.
-pub type Events = tokio::sync::mpsc::Receiver<Emission>;
+/// The end the schedule drains.
+pub type Events = std::sync::mpsc::Receiver<Emission>;
 
 #[derive(Debug, thiserror::Error)]
 #[error("could not start the {name} event source: {reason}")]
@@ -77,6 +77,19 @@ pub trait Source: Send {
     /// against this to decide what to start.
     fn provides(&self) -> Vec<Event>;
 
+    /// Whether this source must be installed on the main thread.
+    ///
+    /// `NSWorkspace`'s notification centre is one: an observer registered from
+    /// any other thread is accepted and then silently never fires. Such a
+    /// source does not need a run loop of its own either — it uses the main
+    /// one, which the app's runner is already pumping.
+    ///
+    /// Everything else gets its own thread, so nothing it does can stall
+    /// drawing.
+    fn needs_main_thread(&self) -> bool {
+        false
+    }
+
     /// Registers observers against the current thread's run loop.
     ///
     /// The returned value is kept alive for as long as the source runs, and
@@ -98,20 +111,28 @@ struct RemoteRunLoop(CFRetained<CFRunLoop>);
 unsafe impl Send for RemoteRunLoop {}
 
 /// A source that is running, and the means to stop it.
-struct Running {
-    _name: &'static str,
-    run_loop: Option<RemoteRunLoop>,
-    thread: Option<std::thread::JoinHandle<()>>,
+enum Running {
+    /// Installed here. The observers are dropped when this is, which is on the
+    /// same thread that registered them.
+    Inline(#[allow(dead_code)] Box<dyn std::any::Any>),
+    /// Installed on a thread of its own.
+    Threaded {
+        run_loop: Option<RemoteRunLoop>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    },
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
+        let Self::Threaded { run_loop, thread } = self else {
+            return;
+        };
         // Stopping the run loop is what lets the thread fall out of its loop
         // and drop the observers on the thread that registered them.
-        if let Some(run_loop) = self.run_loop.take() {
+        if let Some(run_loop) = run_loop.take() {
             run_loop.0.stop();
         }
-        if let Some(thread) = self.thread.take() {
+        if let Some(thread) = thread.take() {
             let _ = thread.join();
         }
     }
@@ -139,7 +160,7 @@ impl Registry {
         // unbounded queue would turn that into unbounded memory. Producers use
         // `try_send` and drop on a full queue rather than blocking, because
         // every one of them is on a callback the system wants back promptly.
-        let (emit, events) = tokio::sync::mpsc::channel(256);
+        let (emit, events) = std::sync::mpsc::sync_channel(256);
 
         let sources: Vec<Box<dyn Source>> = vec![
             Box::new(workspace::Workspace),
@@ -183,10 +204,18 @@ impl Registry {
             if entry.running.is_some() || !entry.provides.contains(event) {
                 continue;
             }
-            let Some(source) = entry.source.take() else {
+            let Some(mut source) = entry.source.take() else {
                 continue;
             };
-            match spawn(source, self.emit.clone()) {
+            // A main-thread source installs here, on the caller's thread, and
+            // uses the run loop the app is already pumping. Everything else
+            // gets a thread of its own.
+            let started = if source.needs_main_thread() {
+                source.install(self.emit.clone()).map(Running::Inline)
+            } else {
+                spawn(source, self.emit.clone())
+            };
+            match started {
                 Ok(running) => {
                     tracing::debug!(source = entry.name, %event, "started event source");
                     entry.running = Some(running);
@@ -242,8 +271,7 @@ fn spawn(mut source: Box<dyn Source>, emit: Emitter) -> Result<Running, StartErr
         })?;
 
     match started.recv() {
-        Ok(Ok(run_loop)) => Ok(Running {
-            _name: name,
+        Ok(Ok(run_loop)) => Ok(Running::Threaded {
             run_loop: Some(run_loop),
             thread: Some(thread),
         }),

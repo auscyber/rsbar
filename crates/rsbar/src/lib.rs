@@ -1,7 +1,10 @@
-//! The rsbar daemon: bar geometry, item model, and drawing.
+//! The rsbar daemon: bar geometry, item model, drawing, and the app that
+//! drives them.
 
 pub mod bar;
 pub mod display;
+pub mod ecs;
+pub mod handle;
 pub mod item;
 pub mod runloop;
 pub mod script;

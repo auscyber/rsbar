@@ -17,6 +17,9 @@ async-channel = "2.5"
 async-mach-ports = "0.1"
 async-executor = "1.14"
 async-lock = "3.4"
+bevy_app = { version = "0.19", default-features = false, features = ["std"] }
+bevy_ecs = { version = "0.19", default-features = false, features = ["std"] }
+bevy_time = { version = "0.19", default-features = false, features = ["std"] }
 bitflags = "2.13"
 futures-lite = "2.6"
 libc = "0.2"
@@ -28,7 +31,6 @@ objc2-core-text = { version = "0.3", default-features = false }
 objc2-foundation = { version = "0.3", default-features = false }
 objc2-quartz-core = { version = "0.3", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
-tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros", "time"] }
 thiserror = "2.0"
 tracing = "0.1"
 
