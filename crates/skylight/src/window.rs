@@ -251,6 +251,41 @@ impl Window {
         }
     }
 
+    /// Registers a rectangle within this window that the window server will
+    /// report the cursor entering and leaving.
+    ///
+    /// Per rectangle, not per window: several may be live at once and each
+    /// fires at its own boundary, which is what lets one shared bar window
+    /// report hover for each item on it. The events arrive as Carbon
+    /// `kEventMouseEntered`/`kEventMouseExited` on the run loop, not through
+    /// any callback registered here.
+    ///
+    /// `kEventMouseMoved` is deliberately not the mechanism: it is never
+    /// delivered to this process at all, however the window is tagged --
+    /// established by moving a real cursor across the bar and seeing nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the window server's error if the rectangle is rejected.
+    pub fn add_tracking_rect(&self, rect: CGRect) -> Result<()> {
+        // SAFETY: `self.id` is this process's own window and `rect` is passed
+        // by value.
+        ok(unsafe { ffi::SLSAddTrackingRect(self.connection, self.id, rect) }).map_err(Error::Tags)
+    }
+
+    /// Drops every rectangle [`Self::add_tracking_rect`] registered.
+    ///
+    /// There is no call to remove one individually, so a layout change means
+    /// clearing them all and adding back the ones that still apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns the window server's error if the call is rejected.
+    pub fn clear_tracking_rects(&self) -> Result<()> {
+        // SAFETY: as above.
+        ok(unsafe { ffi::SLSRemoveAllTrackingAreas(self.connection, self.id) }).map_err(Error::Tags)
+    }
+
     /// Reads this window's tags back from the window server, rather than
     /// trusting what this process last asked for — the ground truth this
     /// crate's own bookkeeping is checked against.

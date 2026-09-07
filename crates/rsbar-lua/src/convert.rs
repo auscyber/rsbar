@@ -733,13 +733,6 @@ fn on_off(value: bool) -> &'static str {
 /// Returns a Lua error only if table creation itself fails.
 pub fn item_state_to_table(lua: &Lua, state: &ItemState) -> mlua::Result<Table> {
     let table = serde_table(lua, state)?;
-    // `Kind` serializes as its Rust variant name, not the snake_case string a
-    // config writes and reads, so it is the one field serde gets wrong.
-    let events = lua.create_table()?;
-    for (index, kind) in state.events.iter().enumerate() {
-        events.set(index + 1, kind.name())?;
-    }
-    table.set("events", events)?;
     booleans_as_on_off(&table)?;
     Ok(table)
 }

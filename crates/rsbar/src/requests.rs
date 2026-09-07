@@ -405,11 +405,11 @@ impl Outcome {
 fn is_pointer(kind: &Kind) -> bool {
     matches!(
         kind,
-        Kind::MouseClicked
-            | Kind::MouseScrolled
+        Kind::MouseClicked(())
+            | Kind::MouseScrolled(())
             | Kind::MouseScrolledGlobal
-            | Kind::MouseEntered
-            | Kind::MouseExited
+            | Kind::MouseEntered(())
+            | Kind::MouseExited(())
             | Kind::MouseEnteredGlobal
             | Kind::MouseExitedGlobal
     )
@@ -425,7 +425,7 @@ fn needs(subscribed: &BTreeSet<Kind>, clickable: bool) -> impl Iterator<Item = K
     subscribed
         .iter()
         .cloned()
-        .chain(clickable.then_some(Kind::MouseClicked))
+        .chain(clickable.then_some(Kind::MouseClicked(())))
 }
 
 /// Lets the bar take clicks at all.

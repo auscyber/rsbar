@@ -34,7 +34,7 @@
 use crate::bar::{Panels, Settings};
 use crate::components::{
     AliasContent, AliasSpec, AssociatedSpace, ClickScript, Icon, Index, Item, ItemHandle, Label,
-    Name, Routine, Script, Selected, Stale, Updates,
+    Name, Routine, Script, Selected, Stale, Subscriptions, Updates,
 };
 use crate::config::Shared as SharedConfig;
 use crate::layout::{self, ForceRepaint, Hit, Placements};
@@ -45,7 +45,7 @@ use crate::sources::{Registry, Target};
 use bevy_app::{App, First, Last, PostUpdate, PreUpdate, Update};
 use bevy_ecs::prelude::*;
 use objc2_core_foundation::{CFRunLoop, CFRunLoopRunResult, kCFRunLoopDefaultMode};
-use rsbar_protocol::event::SpaceChange;
+use rsbar_protocol::event::{MouseEnter, MouseExit, SpaceChange};
 use rsbar_protocol::{Event, Kind, Request};
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
@@ -165,6 +165,7 @@ pub fn build(
             Update,
             (
                 route_pointer,
+                track_hover,
                 dispatch_events,
                 update_space_selection,
                 tick,
@@ -185,6 +186,7 @@ pub fn build(
                 // opening must not repaint the bar, and a change inside one
                 // must not either.
                 crate::popup::repaint_popups.run_if(crate::popup::needs_repaint_popups),
+                track_hover_rects,
                 layout::clear_force_repaint,
             )
                 .chain(),
@@ -570,6 +572,112 @@ fn route_pointer(
             // exactly this, and are matched the ordinary way.
             Hit::Bar { .. } | Hit::Nothing => {}
         }
+    }
+}
+
+/// Tells an item when the cursor enters or leaves it.
+///
+/// Hover has no queued event to route the way a click does. `sources::mouse`
+/// only records *where* a tracking rect was last crossed — it has no layout
+/// to say which item that was, and (see its own module doc) the boundary a
+/// window server tracking rect fires on is a Carbon-level `kEventMouseEntered`
+/// /`kEventMouseExited`, not a per-move event this could instead react to. So
+/// this hit-tests that point against the retained layout itself, the same
+/// layout [`route_pointer`] answers a click against, and only acts when the
+/// hit entity actually changed since the last tick — a cursor crossing the
+/// bar must cost one script run per item boundary crossed, never one per
+/// crossing Carbon happens to report.
+/// Tells the window server which rectangles to report the cursor crossing.
+///
+/// One per item that actually subscribes to hover, re-registered whenever the
+/// layout moves. It has to be per item rather than one rect for the whole bar:
+/// crossing from one hoverable item straight to its neighbour never leaves the
+/// bar's own bounds, so a single rect would report neither. There is no call
+/// to remove one rectangle, so a change means clearing the window's and adding
+/// back what still applies.
+fn track_hover_rects(
+    placements: Res<Placements>,
+    panels: NonSend<Panels>,
+    hoverable: Query<&Subscriptions>,
+    resubscribed: Query<(), Changed<Subscriptions>>,
+) {
+    // Subscribing does not move anything, so watching the layout alone would
+    // never register a rect for an item that asks for hover after it was
+    // already placed -- which is the order every config does it in.
+    if !placements.is_changed() && resubscribed.is_empty() {
+        return;
+    }
+    for placed in placements.panels() {
+        let Some(panel) = panels.iter().find(|p| p.display.id == placed.display) else {
+            continue;
+        };
+        if let Err(err) = panel.window.clear_tracking_rects() {
+            tracing::debug!(%err, "could not clear the hover rectangles");
+            continue;
+        }
+        for (entity, rect) in &placed.items {
+            let wanted = hoverable.get(*entity).is_ok_and(|subs| {
+                subs.0.contains(&Kind::MouseEntered(())) || subs.0.contains(&Kind::MouseExited(()))
+            });
+            if !wanted {
+                continue;
+            }
+            match panel.window.add_tracking_rect(*rect) {
+                Ok(()) => tracing::debug!(?entity, ?rect, "tracking an item for hover"),
+                Err(err) => tracing::debug!(%err, "could not track an item for hover"),
+            }
+        }
+    }
+}
+
+fn track_hover(
+    placements: Res<Placements>,
+    read: ItemsRead,
+    mut subscribers: NonSendMut<crate::subscribers::Subscribers>,
+    mut queue: ResMut<Queue>,
+    mut hovered: Local<Option<Entity>>,
+) {
+    let hit =
+        crate::sources::mouse::current_position().and_then(|point| match placements.hit(point) {
+            Hit::Item { entity, .. } => Some(entity),
+            Hit::Bar { .. } | Hit::Nothing => None,
+        });
+    if hit == *hovered {
+        return;
+    }
+    if let Some(left) = hovered.take() {
+        deliver_hover(
+            left,
+            Event::MouseExited(MouseExit {}),
+            &read,
+            &mut subscribers,
+            &mut queue,
+        );
+    }
+    if let Some(entered) = hit {
+        deliver_hover(
+            entered,
+            Event::MouseEntered(MouseEnter {}),
+            &read,
+            &mut subscribers,
+            &mut queue,
+        );
+    }
+    *hovered = hit;
+}
+
+/// One item's hover event, through whichever of a subscriber or a script it
+/// actually goes to — the same choice [`route_pointer`] makes for a click.
+fn deliver_hover(
+    entity: Entity,
+    event: Event,
+    read: &ItemsRead,
+    subscribers: &mut crate::subscribers::Subscribers,
+    queue: &mut Queue,
+) {
+    let event = std::sync::Arc::new(event);
+    if !subscribers.push(entity, &event) {
+        queue.0.extend(read.jobs_for_item(entity, &event));
     }
 }
 

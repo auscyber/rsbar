@@ -134,35 +134,56 @@ impl<T: fmt::Display> fmt::Display for Maybe<T> {
     }
 }
 
-/// Builds one shape of a [`Kind`] variant, depending on whether the event it
-/// names is dependent on an item.
-///
-/// `@scoped` is what a config's own bare name cannot say — `mouse.entered`
-/// means "this item's" only once something binds it to one. An unscoped event
-/// has no item to carry, so its `Kind` stays a bare unit exactly as before.
-macro_rules! kind_variant {
-    ($variant:ident) => { $variant };
-    ($variant:ident @scoped) => { $variant(Item) };
-}
-
 /// Matches a [`Kind`] variant regardless of what it carries.
 macro_rules! kind_pattern {
-    ($variant:ident) => { Self::$variant };
-    ($variant:ident @scoped) => { Self::$variant(_) };
+    ($variant:ident) => {
+        Self::$variant
+    };
+    ($variant:ident @$scope:ident) => {
+        Self::$variant(_)
+    };
 }
 
 /// Builds the wire-shaped, item-less [`Kind`] for one variant — `Item = ()`,
 /// the only value an event's own name can produce.
 macro_rules! kind_unscoped {
-    ($variant:ident) => { Kind::$variant };
-    ($variant:ident @scoped) => { Kind::$variant(()) };
+    ($variant:ident) => {
+        Kind::$variant
+    };
+    ($variant:ident @$scope:ident) => {
+        Kind::$variant(())
+    };
 }
 
-/// One arm of [`Kind::map`]: passes an unscoped variant through untouched,
-/// or recasts a scoped one's item through `f`.
-macro_rules! kind_map_arm {
-    ($variant:ident) => { Self::$variant => Kind::$variant };
-    ($variant:ident @scoped) => { Self::$variant(item) => Kind::$variant(f(item)) };
+/// [`Kind::map`]'s pattern for one variant — binding `$item` only where there
+/// is one to bind. Paired with [`kind_map_expr`]; kept separate because a
+/// macro cannot expand to a whole match arm, only to the pattern or the
+/// expression inside one.
+///
+/// `$item` (and `$f` below) arrive as tokens from [`Kind::map`]'s own body
+/// rather than being named `item`/`f` here directly, because a literal
+/// identifier written inside a macro is hygienic to *that* macro — `item`
+/// bound in this one and `item` used in [`kind_map_expr`] would be two
+/// different bindings that happen to share a spelling. Passing the same
+/// token into both keeps them the one binding.
+macro_rules! kind_map_pattern {
+    ($variant:ident, $item:ident) => {
+        Self::$variant
+    };
+    ($variant:ident @$scope:ident, $item:ident) => {
+        Self::$variant($item)
+    };
+}
+
+/// [`Kind::map`]'s expression for one variant, recasting `$item` through `$f`
+/// where [`kind_map_pattern`] bound one.
+macro_rules! kind_map_expr {
+    ($variant:ident, $f:ident, $item:ident) => {
+        Kind::$variant
+    };
+    ($variant:ident @$scope:ident, $f:ident, $item:ident) => {
+        Kind::$variant($f($item))
+    };
 }
 
 /// Declares the built-in events.
@@ -177,13 +198,47 @@ macro_rules! kind_map_arm {
 /// `RSBAR_` plus the field in upper case. That is why the fields are named
 /// what a config would call them.
 macro_rules! events {
+    // Builds the `Kind` enum's variant list one event at a time.
+    //
+    // A macro cannot expand to a single enum variant — only a whole item, or
+    // an expression, type or pattern inside one — so the per-event `@scoped`
+    // branch cannot be a helper macro spliced into the variant list the way
+    // [`kind_pattern`] is spliced into a match arm's pattern. This is the
+    // accumulator instead: it munches one `Variant` or `Variant @scoped` at a
+    // time off the front, growing `$done` by exactly the variant that event
+    // needs, until nothing is left to munch.
+    (@kind [$($done:tt)*]) => {
+        /// What an item subscribes to: an event without its payload.
+        ///
+        /// Generic over `Item`, which only a handful of variants carry — the
+        /// ones declared `@scoped` above, because they happen to one item
+        /// rather than to the bar. `Item` is `()` on the wire: a config writes
+        /// a bare `mouse.entered`, meaning "mine", and there is no item to
+        /// name in that string — [`Kind::from_str`] can only ever produce
+        /// `Kind<()>`. Whoever resolves "mine" to an actual item calls
+        /// [`Kind::map`] once, at the one place both are known.
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub enum Kind<Item = ()> {
+            $($done)*
+            Custom(String),
+        }
+    };
+    (@kind [$($done:tt)*] $variant:ident @$scope:ident, $($rest:tt)*) => {
+        events!(@kind [$($done)* $variant(Item),] $($rest)*);
+    };
+    (@kind [$($done:tt)*] $variant:ident, $($rest:tt)*) => {
+        events!(@kind [$($done)* $variant,] $($rest)*);
+    };
+
     (
         $(
-            $variant:ident = $name:literal $(@scoped)? => $data:ident {
+            $variant:ident = $name:literal $(@$scope:ident)? => $data:ident {
                 $( $(#[$field_meta:meta])* $field:ident : $ty:ty ),* $(,)?
             }
         ),* $(,)?
     ) => {
+        events!(@kind [] $( $variant $(@$scope)?, )*);
+
         $(
             #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
             pub struct $data {
@@ -212,19 +267,17 @@ macro_rules! events {
             Custom(Custom),
         }
 
-        /// What an item subscribes to: an event without its payload.
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-        pub enum Kind {
-            $( $variant, )*
-            Custom(String),
-        }
-
         impl Event {
             /// What this is, for matching a subscription against.
+            ///
+            /// Always the wire-shaped, item-less `Kind<()>`: a payload never
+            /// carries which item it happened to (that is decided by hit
+            /// geometry, not by the event), so this cannot produce a scoped
+            /// `Kind` and does not try to.
             #[must_use]
             pub fn kind(&self) -> Kind {
                 match self {
-                    $( Self::$variant(_) => Kind::$variant, )*
+                    $( Self::$variant(_) => kind_unscoped!($variant $(@$scope)?), )*
                     Self::Custom(custom) => Kind::Custom(custom.name.clone()),
                 }
             }
@@ -239,20 +292,54 @@ macro_rules! events {
             }
         }
 
+        /// As the name a config writes, not as a variant map -- that name is
+        /// the whole vocabulary a client and this daemon share.
+        ///
+        /// Only the unscoped form has a wire representation. A `Kind<Entity>`
+        /// names an entity in one `World`, which means nothing in another
+        /// process, so there is deliberately no way to send one.
+        impl Serialize for Kind<()> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_str(self.name())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for Kind<()> {
+            fn deserialize<D: serde::Deserializer<'de>>(
+                deserializer: D,
+            ) -> Result<Self, D::Error> {
+                let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+                text.parse().map_err(serde::de::Error::custom)
+            }
+        }
+
+        impl<Item> Kind<Item> {
+            /// Recasts the item this depends on, keeping everything else.
+            ///
+            /// An unscoped variant has no item to recast, so `f` never runs
+            /// for one — it only fires for the handful declared `@scoped`.
+            #[must_use]
+            pub fn map<Other>(self, f: impl FnOnce(Item) -> Other) -> Kind<Other> {
+                match self {
+                    $( kind_map_pattern!($variant $(@$scope)?, item) => kind_map_expr!($variant $(@$scope)?, f, item), )*
+                    Self::Custom(name) => Kind::Custom(name),
+                }
+            }
+        }
+
         impl Kind {
             /// The name a config writes, and a script reads in `RSBAR_SENDER`.
+            ///
+            /// Defined only for the wire-shaped `Kind<()>` — not because a
+            /// scoped `Kind<Entity>` prints differently, it never does, but
+            /// because nothing ever needs its name: a claim is looked up by
+            /// value, never by string, once it carries a real item.
             #[must_use]
             pub fn name(&self) -> &str {
                 match self {
-                    $( Self::$variant => $name, )*
+                    $( kind_pattern!($variant $(@$scope)?) => $name, )*
                     Self::Custom(name) => name,
                 }
-            }
-
-            /// Every built-in, for validating a subscription and for `--help`.
-            #[must_use]
-            pub fn built_in() -> Vec<Kind> {
-                vec![ $( Kind::$variant, )* ]
             }
 
             /// Whether `event` is one of these.
@@ -264,20 +351,33 @@ macro_rules! events {
             #[must_use]
             pub fn matches(&self, event: &Event) -> bool {
                 match (self, event) {
-                    $( (Self::$variant, Event::$variant(_)) => true, )*
+                    $( (kind_pattern!($variant $(@$scope)?), Event::$variant(_)) => true, )*
                     (Self::Custom(name), Event::Custom(custom)) => *name == custom.name,
                     _ => false,
                 }
             }
 
+            /// Every built-in, for validating a subscription and for `--help`.
+            ///
+            /// Scoped kinds come back as `Kind::Variant(())` — not a stand-in
+            /// for a real claim, since a real one is `Kind<Entity>` and no
+            /// value of that type is reachable from here. `()` is simply the
+            /// only item a name on its own can mean.
+            #[must_use]
+            pub fn built_in() -> Vec<Kind> {
+                vec![ $( kind_unscoped!($variant $(@$scope)?), )* ]
+            }
+
             /// An event of this kind carrying nothing.
             ///
             /// What `--trigger` produces: a client naming an event knows the
-            /// name, not the payload the source would have filled in.
+            /// name, not the payload the source would have filled in. Only
+            /// meaningful for the wire-shaped `Kind<()>` — a trigger names an
+            /// event, not one already bound to an item.
             #[must_use]
             pub fn into_event(self) -> Event {
                 match self {
-                    $( Self::$variant => Event::$variant($data::default()), )*
+                    $( kind_pattern!($variant $(@$scope)?) => Event::$variant($data::default()), )*
                     Self::Custom(name) => {
                         Event::Custom(Custom { name, data: Json::Null })
                     }
@@ -316,20 +416,21 @@ events! {
     ConfigReloaded = "config_reloaded" => ConfigReload {},
 
     // The pointer. `.global` fires for the bar as a whole rather than for one
-    // item, which is how a config reacts to the empty space between items.
-    MouseEntered = "mouse.entered" => MouseEnter {},
-    MouseExited = "mouse.exited" => MouseExit {},
+    // item, which is how a config reacts to the empty space between items —
+    // and is exactly why the `.global` twin of each is never `@scoped`.
+    MouseEntered = "mouse.entered" @scoped => MouseEnter {},
+    MouseExited = "mouse.exited" @scoped => MouseExit {},
     MouseEnteredGlobal = "mouse.entered.global" => MouseEnterGlobal {},
     MouseExitedGlobal = "mouse.exited.global" => MouseExitGlobal {},
     // `x` and `y` are where it happened, in global screen coordinates. The
     // daemon routes on them, and a script gets them for free.
-    MouseClicked = "mouse.clicked" => MouseClick {
+    MouseClicked = "mouse.clicked" @scoped => MouseClick {
         button: MouseButton,
         modifiers: Modifiers,
         x: f64,
         y: f64,
     },
-    MouseScrolled = "mouse.scrolled" => Scroll {
+    MouseScrolled = "mouse.scrolled" @scoped => Scroll {
         scroll_delta: f64,
         modifiers: Modifiers,
         x: f64,
@@ -545,12 +646,21 @@ mod tests {
 
     #[test]
     fn mouse_events_keep_the_dotted_names_a_config_writes() {
-        assert_eq!("mouse.clicked".parse(), Ok(Kind::MouseClicked));
+        assert_eq!("mouse.clicked".parse(), Ok(Kind::MouseClicked(())));
         assert_eq!(
             "mouse.scrolled.global".parse(),
             Ok(Kind::MouseScrolledGlobal)
         );
         assert_eq!(Kind::MouseEnteredGlobal.name(), "mouse.entered.global");
+    }
+
+    #[test]
+    fn a_scoped_kind_recasts_its_item_and_leaves_the_rest_alone() {
+        assert_eq!(
+            Kind::MouseClicked(()).map(|()| 7),
+            Kind::<i32>::MouseClicked(7)
+        );
+        assert_eq!(Kind::SystemWoke.map(|()| 7), Kind::<i32>::SystemWoke);
     }
 
     #[test]

@@ -571,16 +571,19 @@ impl<T: Payload> CallbackState<T> {
 
 /// Where an event is delivered.
 ///
-/// The claim's index. A click that landed on the clock is not the same event
-/// as a click on the bar, and an item watching its own clicks must not be
-/// handed everyone else's — so the target is part of what is claimed rather
-/// than something the receiver filters for afterwards.
+/// Used to have a second variant, `Item(ItemName)`, for a claim scoped to one
+/// item — but nothing ever kept that separate from the *event* being scoped:
+/// `mouse.entered` and its siblings are now `Kind::Variant(Entity)` (see
+/// `rsbar_protocol::event::Kind`'s own doc), so the entity a claim depends on
+/// already lives in the key half of `(Kind, Target)`. A second place for the
+/// same fact would only be another way for the two to disagree, so this is
+/// the only variant left. Kept as an enum rather than deleted outright: a
+/// future event that is scoped some other way — by display, say — has
+/// somewhere to add a variant without every call site changing shape again.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Target {
     /// Wherever it happened, to whoever is watching.
     All,
-    /// One item, and only that item.
-    Item(rsbar_protocol::ItemName),
 }
 
 /// A claim on one event, held by whatever depends on it.
@@ -671,9 +674,16 @@ impl Drop for Claim {
 }
 
 /// The claims currently alive, by event and target.
+///
+/// Keyed by `Kind<Entity>`, not the wire-shaped `Kind` a caller hands in —
+/// [`take`](Claims::take) binds `who` into it first. An unscoped kind (most
+/// of them) does not carry `who` at all, so every holder of, say,
+/// `volume_changed` still lands on the one shared key; a scoped kind does
+/// carry it, so item A's `mouse.entered` and item B's are different keys
+/// with no `Target` needed to tell them apart — see `Target`'s own doc.
 #[derive(Debug, Default)]
 struct Claims {
-    live: HashMap<(Kind, Target), std::sync::Weak<Claim>>,
+    live: HashMap<(Kind<Entity>, Target), std::sync::Weak<Claim>>,
     moved: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -681,7 +691,8 @@ impl Claims {
     /// A handle on `kind` at `target` for `who`, sharing the one claim if it
     /// is already alive.
     fn take(&mut self, who: Entity, kind: &Kind, target: &Target) -> Watch {
-        let key = (kind.clone(), target.clone());
+        let scoped = kind.clone().map(|()| who);
+        let key = (scoped, target.clone());
         if let Some(existing) = self.live.get(&key).and_then(std::sync::Weak::upgrade) {
             existing.remember(who);
             return Watch {
@@ -706,23 +717,21 @@ impl Claims {
 
     /// Everything that depends on this occurrence.
     ///
-    /// A targeted event also reaches the untargeted claim: an item watching
-    /// its own clicks and a config watching every click both want the same one.
+    /// `event.kind()` can only ever be the wire-shaped `Kind<()>` — a payload
+    /// never says which item it happened to, that is decided by hit geometry
+    /// — so a scoped kind's real, entity-bound claim can never be reached
+    /// from here. [`Entity::PLACEHOLDER`] stands in for the entity such a
+    /// lookup cannot supply; it is not, and can never become, a real claim's
+    /// key, so this correctly finds nothing for a scoped kind rather than
+    /// guessing at one. That is by design: `mouse.entered` and its siblings
+    /// are delivered by direct hit-test dispatch (see `ecs.rs`), not through
+    /// this map — the same way a click already was before this existed.
     fn dependents_into(&self, event: &Event, target: &Target, into: &mut Vec<Entity>) {
         into.clear();
-        let kind = event.kind();
-        for key in std::iter::once((kind.clone(), target.clone()))
-            .chain((*target != Target::All).then_some((kind, Target::All)))
-        {
-            if let Some(claim) = self.live.get(&key).and_then(std::sync::Weak::upgrade) {
-                claim.append_dependents(into);
-            }
-        }
-        // Only when both a targeted and an untargeted claim contributed can
-        // the same item appear twice.
-        if into.len() > 1 {
-            into.sort_unstable();
-            into.dedup();
+        let kind = event.kind().map(|()| Entity::PLACEHOLDER);
+        let key = (kind, target.clone());
+        if let Some(claim) = self.live.get(&key).and_then(std::sync::Weak::upgrade) {
+            claim.append_dependents(into);
         }
     }
 
@@ -744,11 +753,15 @@ impl Claims {
 
     /// The events still claimed, forgetting the ones whose claim has died.
     ///
-    /// Targets collapse here: a source produces an event or it does not, and
-    /// which item a click is for is not its business.
+    /// Erases the entity a scoped kind carries: a source registers against
+    /// *which events*, not *whose* — the mouse source starts because someone,
+    /// anyone, wants `mouse.entered`, not once per item that does.
     fn wanted(&mut self) -> BTreeSet<Kind> {
         self.live.retain(|_, claim| claim.strong_count() > 0);
-        self.live.keys().map(|(kind, _)| kind.clone()).collect()
+        self.live
+            .keys()
+            .map(|(kind, _)| kind.clone().map(|_| ()))
+            .collect()
     }
 }
 
@@ -976,10 +989,13 @@ impl Registry {
         self.watch_at(who, kind, &Target::All)
     }
 
-    /// Claims an event as it happens to one item, rather than at large.
+    /// [`watch`](Registry::watch), against an explicit [`Target`] rather than
+    /// always [`Target::All`].
     ///
-    /// What a click on that item is: the same [`Kind`], indexed, so the item
-    /// is handed its own and nobody else's.
+    /// A scoped kind — `mouse.entered` and its siblings — does not need this
+    /// to reach one item and not another; the entity is already bound into
+    /// the kind itself when the claim is taken. This exists for whatever a
+    /// future event scopes some other way.
     #[must_use]
     pub fn watch_at(&mut self, who: Entity, kind: &Kind, target: &Target) -> Watch {
         if !self.providers.contains_key(kind) {
@@ -1232,24 +1248,50 @@ mod claim_tests {
     }
 
     #[test]
-    fn a_targeted_occurrence_reaches_that_target_and_the_untargeted_watchers() {
+    fn two_items_claiming_the_same_scoped_kind_get_separate_claims() {
+        // `mouse.clicked` is `@scoped` — the entity `take` was called with is
+        // baked into the claim's key, so item 1's claim and item 2's are two
+        // different `Claim`s sharing nothing, with no `Target` needed to
+        // separate them.
         let mut claims = Claims::default();
-        let clock = rsbar_protocol::ItemName::new("clock").expect("valid name");
-        let other = rsbar_protocol::ItemName::new("other").expect("valid name");
-
-        let _mine = claims.take(item(1), &Kind::MouseClicked, &Target::Item(clock.clone()));
-        let _theirs = claims.take(item(2), &Kind::MouseClicked, &Target::Item(other));
-        let _anyones = claims.take(item(3), &Kind::MouseClicked, &Target::All);
-
-        let pressed = Kind::MouseClicked.into_event();
-        let reached = claims.dependents(&pressed, &Target::Item(clock));
-
-        assert!(reached.contains(&item(1)), "the item it landed on");
-        assert!(!reached.contains(&item(2)), "not the item it did not");
+        let mine = claims.take(item(1), &Kind::MouseClicked(()), &Target::All);
+        let theirs = claims.take(item(2), &Kind::MouseClicked(()), &Target::All);
         assert!(
-            reached.contains(&item(3)),
-            "a config watching every click still hears it"
+            !Arc::ptr_eq(&mine.claim, &theirs.claim),
+            "a scoped kind must not share one item's claim with another's"
         );
+    }
+
+    #[test]
+    fn a_scoped_kind_still_shares_one_claim_for_the_same_item() {
+        let mut claims = Claims::default();
+        let first = claims.take(item(1), &Kind::MouseClicked(()), &Target::All);
+        let second = claims.take(item(1), &Kind::MouseClicked(()), &Target::All);
+        assert!(Arc::ptr_eq(&first.claim, &second.claim));
+    }
+
+    #[test]
+    fn wanted_erases_the_item_a_scoped_kind_carries() {
+        // The source registers against *which events*, not *whose* — two
+        // different items claiming `mouse.clicked` must still add up to one
+        // entry a source's `provides()` can match against.
+        let mut claims = Claims::default();
+        let _mine = claims.take(item(1), &Kind::MouseClicked(()), &Target::All);
+        let _theirs = claims.take(item(2), &Kind::MouseClicked(()), &Target::All);
+        assert_eq!(claims.wanted(), BTreeSet::from([Kind::MouseClicked(())]));
+    }
+
+    #[test]
+    fn a_scoped_event_is_not_reachable_through_dependents() {
+        // `Event::kind()` cannot say which item a click landed on — that is
+        // decided by hit geometry, not carried in the payload — so this can
+        // never find a scoped kind's real, entity-bound claim. Delivery for
+        // these goes through direct hit-test dispatch instead; see
+        // `ecs.rs::route_pointer`.
+        let mut claims = Claims::default();
+        let _mine = claims.take(item(1), &Kind::MouseClicked(()), &Target::All);
+        let pressed = Kind::MouseClicked(()).into_event();
+        assert!(claims.dependents(&pressed, &Target::All).is_empty());
     }
 
     #[test]

@@ -411,6 +411,13 @@ impl Placements {
     /// Returns the panel's display too, so a handler knows which bar was hit
     /// even when the click landed on empty space.
     #[must_use]
+    /// Each surface's own placements, for anything that has to talk to the
+    /// window they were drawn on.
+    pub(crate) fn panels(&self) -> &[PanelPlacements] {
+        &self.0
+    }
+
+    #[must_use]
     pub fn hit(&self, point: CGPoint) -> Hit {
         let Some(panel) = self.0.iter().find(|panel| contains(panel.frame, point)) else {
             return Hit::Nothing;
