@@ -104,39 +104,13 @@
 //! or a plugged-in push notification whose scope has already turned out to
 //! carry noise — cannot see on its own (see its doc comment).
 //!
-//! # The left-hand items: the Apple menu and File/Edit/View/... are not windows
+//! # The left-hand items are not windows
 //!
-//! `list_menu_bar_items` only ever finds items at [`MENU_BAR_LAYER`] (0x19),
-//! and on a real bar that is every right-hand extra and nothing on the left —
-//! no Apple menu, no application name, no File/Edit/View/.... Widening the
-//! layer filter does not fix this, because there is nothing at any other
-//! layer to find either: `crates/rsbar/examples/layer_probe.rs`, written for
-//! this investigation, dumps every on-screen window at every layer, not just
-//! this one. On this machine (macOS 26.5.1) the entire left-hand menu bar
-//! chrome shows up as exactly two windows — both owned by `Window Server`,
-//! both named `"Menubar"`, one per display, one layer *below* the status
-//! items at 0x18 — each spanning the full width of its display. Nothing else
-//! in the unfiltered list, at 0x18, at 0x19, or anywhere else, corresponds to
-//! "File" or "Edit" or the Apple logo individually. This is a real platform
-//! limit, not a coverage gap in the filter: the window server paints an
-//! application's own menu titles directly into that one shared surface, from
-//! data it reads out of the frontmost application itself
-//! (`AXMenuBarAttribute`), the same way it always has — there is no
-//! per-title window here to decompose, capture, or alias.
-//!
-//! This does not mean the left-hand items can't be listed and made
-//! clickable — they can, natively, and [`crate::menus`] is how — only that
-//! they can never be pixel-mirrored the way [`list_menu_bar_items`]'s items
-//! are: [`Capture`] and [`Captures`] are built entirely around one specific
-//! window, and here there is no window narrower than the whole menu bar to
-//! capture from. The config this daemon replaces confirms this is the actual
-//! shape of the feature, not a shortcut: `items/menus.lua`/`items/left.lua`
-//! never try to alias the Apple menu or the app-menu row either — they draw
-//! the Apple glyph as a static icon and the rest as plain text labels kept in
-//! sync with `menus -l`, each bound to `menus -s <index>` as its click
-//! script. "Aliasable" for this class of item means listed-and-pressable,
-//! sourced from [`crate::menus::list`] and driven by
-//! [`crate::menus::press`], not mirrored through this module.
+//! `list_menu_bar_items` only finds items at [`MENU_BAR_LAYER`], which is
+//! every right-hand extra and nothing on the left. Widening the filter finds
+//! nothing more: the Apple menu and an application's own titles are painted
+//! into one shared window-server surface and have no window of their own. See
+//! [`crate::menus`], which lists and presses them instead.
 
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{

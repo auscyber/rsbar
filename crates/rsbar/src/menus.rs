@@ -1,75 +1,30 @@
-//! The frontmost application's own menu bar — the Apple menu and its
-//! File/Edit/View/... titles — natively, replacing the user's C helper
-//! (`helpers/menus/menus.c`, built with `-l`/`-A`/`-s`) with the equivalent
-//! behaviour in-process: no vendored C, no build step, no shelling out.
+//! The frontmost application's own menu bar -- the Apple menu and its
+//! File/Edit/View titles -- replacing the config's `menus.c` helper with no C
+//! and no shell-out.
 //!
-//! # Why this is a separate module from [`crate::alias`]
+//! Separate from [`crate::alias`] because it reads a different attribute on a
+//! different element: `AXMenuBar` on the frontmost application, rather than
+//! `AXExtrasMenuBar` on a status item's owner. `menus.c`'s `-A` is already
+//! [`crate::alias::list_menu_bar_items`], which disambiguates duplicate names
+//! and resolves a Control Centre-hosted item's owner on every macOS version
+//! rather than only on 26 and later.
 //!
-//! `menus.c`'s `-A` — print the aliasable extras — is already
-//! [`crate::alias::list_menu_bar_items`], and better: it disambiguates
-//! duplicate names and resolves a Control Center-hosted item's real owner
-//! the same way regardless of macOS version, rather than `menus.c`'s
-//! `source_pid_needs_workaround`, which only ever ran the resolution at all
-//! on macOS 26+ (`Gestalt(gestaltSystemVersionMajor, ...) >= 26`) and used a
-//! tight exact-position match (`point_distance_squared <= 1.0`) with no
-//! fallback. Both approaches solve the same problem — recovering a status
-//! item's real owner once Control Center starts hosting it — so this daemon
-//! keeps the one already proven against this machine
-//! ([`crate::alias`]'s module docs) instead of carrying two.
+//! # These titles are not windows, so they cannot be mirrored
 //!
-//! `-l` and `-s` have no equivalent in `crate::alias` at all, because they
-//! read a *different* Accessibility attribute — `AXMenuBar`, not
-//! `AXExtrasMenuBar` — on a *different* element, the frontmost application
-//! rather than a status item's owner. This module is what reads it.
+//! `crates/rsbar/examples/layer_probe.rs` dumps every on-screen window at
+//! every layer. On macOS 26.5.1 the whole left-hand menu bar is two windows
+//! owned by `Window Server`, both named `"Menubar"`, one per display, at layer
+//! 0x18 -- one below the status items -- each spanning its display. Nothing
+//! anywhere in that list is "File" or "Edit" or the Apple logo on its own: the
+//! window server paints an application's titles straight into that shared
+//! surface out of the app's own `AXMenuBar`. So these are listable and
+//! pressable but never capturable, which is what the config this replaces
+//! already assumed -- `items/menus.lua` draws them as plain text refreshed
+//! from `menus -l` and clicks them with `menus -s <index>`.
 //!
-//! # Why these titles were never findable as menu bar aliases (task 12)
-//!
-//! `--query menu-items` only ever lists windows at
-//! the menu bar layer (0x19) — the status items on the right.
-//! The Apple menu and an app's own File/Edit/View/... titles on the left are
-//! not there, and widening that filter finds nothing, because there is
-//! nothing to find: `crates/rsbar/examples/layer_probe.rs` (a scratch probe
-//! written for this investigation) dumps every on-screen window at every
-//! layer, unfiltered, and on this machine (macOS 26.5.1) the left-hand menu
-//! bar chrome is not decomposed into one window per title at all. It shows
-//! up as exactly two windows owned by `Window Server`, both named
-//! `"Menubar"`, one per display, at layer 0x18 — one level *below* the
-//! status items' own 0x19 — each covering the *entire* menu bar strip on its
-//! display. Nothing else in the full, unfiltered list — at 0x18, at 0x19, or
-//! anywhere else — corresponds to "File" or "Edit" or the Apple logo
-//! individually. This is a real platform limit, not a filtering bug: the
-//! window server paints the frontmost application's menu titles directly
-//! into that one shared surface from data it pulls out of the app itself
-//! (`AXMenuBarAttribute`/`AXVisibleChildren`, per [`list`] below), the same
-//! way it has since long before status items existed, and there is nothing
-//! resembling a per-title window anywhere in the list to capture.
-//!
-//! Confirming this is not just theoretical: the very config this daemon
-//! replaces does not try to alias these items either.
-//! `items/menus.lua`/`items/left.lua` build the Apple glyph as a static
-//! icon string and the File/Edit/View/... row as plain text labels refreshed
-//! from `menus -l` on every `front_app_switched` event, each bound to
-//! `menus -s <index>` as its click script — exactly the `list`/`press` shape
-//! this module provides, never a captured picture. "Aliasable" for these
-//! items means listed-and-pressable, not pixel-mirrored, and that is a real
-//! difference from [`crate::alias`]'s items: there is no window to capture,
-//! so there is no [`crate::alias::Capture`] and no [`crate::alias::Captures`]
-//! entry for one of these — nothing here is a drawable component, so nothing
-//! here needs a place in `layout.rs`'s damage-tracking gate the way
-//! `AliasContent` does. A caller wanting to show these titles draws them as
-//! ordinary text, the way the Lua config above already does.
-//!
-//! # Pressing does not touch a mirrored item's own capture
-//!
-//! [`crate::alias::press_item`] and [`press`] both only ever perform an AX
-//! action on the *system's* menu bar element. The menu that opens is the
-//! system's own window, not anything this daemon draws or captures, so
-//! neither function reads or writes an [`crate::alias::Alias`]'s cached
-//! window, invalidates it, or otherwise makes
-//! [`crate::alias::Captures::refresh`] think anything changed. A press is
-//! genuinely a no-op as far as this daemon's own draw state is concerned —
-//! deliberately, since a click that repainted a mirrored item for no reason
-//! would be the same kind of bug as a change that fails to repaint one.
+//! Nothing here is a drawable component: a press acts on the system's own
+//! menu bar element and never touches an [`crate::alias::Alias`]'s cached
+//! window, so it cannot make a mirrored item look dirty.
 
 use crate::alias::ax;
 
@@ -87,17 +42,12 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// One of the frontmost application's own top-level menus, in on-screen
-/// left-to-right order.
+/// One of the frontmost application's own top-level menus, left to right.
 ///
-/// Index 0 is always the Apple menu (`AXTitle` is the literal string
-/// `"Apple"`, not the logo glyph itself — measured live on this machine,
-/// Ghostty frontmost: `[0] title="Apple"`), index 1 is the application's own
-/// name, and the rest are whatever that application put in its menu bar.
-/// `menus.c`'s `-l` skips index 0 when printing (`for i = 1; i < count`);
-/// this returns every index instead and lets a caller decide, since
-/// `items/menus.lua` draws index 0 as a separate, permanently-visible glyph
-/// rather than part of the refreshed row `-l` feeds.
+/// Index 0 is the Apple menu, whose `AXTitle` is the literal string `"Apple"`
+/// rather than the glyph; index 1 is the application's own name. `menus.c`'s
+/// `-l` skips index 0, but this returns it, because the config draws it as its
+/// own permanently-visible item rather than part of the refreshed row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuTitle {
     pub index: usize,
