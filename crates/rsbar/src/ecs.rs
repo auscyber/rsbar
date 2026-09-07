@@ -47,6 +47,7 @@ use bevy_ecs::prelude::*;
 use objc2_core_foundation::{CFRunLoop, CFRunLoopRunResult, kCFRunLoopDefaultMode};
 use rsbar_protocol::event::{MouseEnter, MouseExit, SpaceChange};
 use rsbar_protocol::{Event, Kind, Request};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::time::Duration;
@@ -195,32 +196,47 @@ pub fn build(
     app
 }
 
-/// Runs until something asks the app to exit.
-pub fn run(mut app: App) -> bevy_app::AppExit {
-    app.finish();
-    app.cleanup();
+#[link(name = "Carbon", kind = "framework")]
+unsafe extern "C" {
+    /// Carbon's own main loop. Never returns until
+    /// [`QuitApplicationEventLoop`] is called.
+    fn RunApplicationEventLoop();
+    fn QuitApplicationEventLoop();
+}
 
-    loop {
-        // Sleeps in the kernel until a run loop source fires, or the tick
-        // elapses. This is both the pump the window server needs and the reason
-        // the process costs nothing at idle.
-        let woke =
-            unsafe { CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, TICK.as_secs_f64(), true) };
-        // `Stopped` means someone called `CFRunLoopStop`; `Finished` means the
-        // loop had no sources left. Either way there is nothing left to pump.
-        if matches!(
-            woke,
-            CFRunLoopRunResult::Stopped | CFRunLoopRunResult::Finished
-        ) {
-            return bevy_app::AppExit::Success;
-        }
+thread_local! {
+    /// The app, reachable from the run loop callbacks that drive it.
+    ///
+    /// `RunApplicationEventLoop` never returns, so a pass cannot be the body
+    /// of a loop the way it was under `CFRunLoopRunInMode` -- it has to be
+    /// something the run loop calls. Everything here is on one thread, and the
+    /// `RefCell` is what makes a callback that re-enters during a pass a panic
+    /// rather than two mutable borrows.
+    static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+}
 
-        // Take everything else already waiting before doing a pass. The sleep
-        // above returns on the *first* source it handles, so without this a
-        // client sending fifty updates gets fifty passes and fifty repaints,
-        // each redrawing one item — sixty window server round trips a second
-        // where one would do. Bounded, so a source firing continuously cannot
-        // hold the pass off forever.
+/// Advances the app once, and quits the event loop if it asked to exit.
+///
+/// Called by the tick timer and by the waker every source and the IPC thread
+/// signal. Doing nothing when the app is absent matters: the waker is
+/// installed before the app is built, so it can fire first.
+pub fn pass() {
+    APP.with(|slot| {
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            // Re-entered from inside a pass -- a Carbon handler dispatched
+            // while we were already updating. The outer pass will see
+            // whatever this one would have.
+            return;
+        };
+        let Some(app) = slot.as_mut() else {
+            return;
+        };
+
+        // Take everything else already waiting before doing a pass. A client
+        // sending fifty updates would otherwise get fifty passes and fifty
+        // repaints, each redrawing one item -- sixty window server round trips
+        // a second where one would do. Bounded, so a source firing
+        // continuously cannot hold the pass off forever.
         for _ in 0..COALESCE_LIMIT {
             let more = unsafe { CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, 0.0, true) };
             if !matches!(more, CFRunLoopRunResult::HandledSource) {
@@ -228,17 +244,41 @@ pub fn run(mut app: App) -> bevy_app::AppExit {
             }
         }
 
-        // The run loop does not serve AppKit's or Carbon's event queues, and a
-        // click on the bar arrives through them. Non-blocking: the sleep
-        // already happened above, so this takes what is there and returns.
-        crate::runloop::pump_platform_events();
-
         app.update();
 
-        if let Some(exit) = app.should_exit() {
-            return exit;
+        if app.should_exit().is_some() {
+            // SAFETY: called on the thread running the event loop.
+            unsafe { QuitApplicationEventLoop() };
         }
-    }
+    });
+}
+
+/// Runs until something asks the app to exit.
+///
+/// `RunApplicationEventLoop` rather than a loop around `CFRunLoopRunInMode`,
+/// because it is the only thing that dispatches a Carbon event to the handlers
+/// installed on the event dispatcher target -- which is how a click on the bar
+/// arrives. It runs the same `CFRunLoop` underneath, so every source, timer and
+/// the window server's own pumping work exactly as before.
+pub fn run(mut app: App) -> bevy_app::AppExit {
+    app.finish();
+    app.cleanup();
+    APP.with(|slot| *slot.borrow_mut() = Some(app));
+
+    // The routine tick, and the reason an idle process wakes at all. Held for
+    // the life of the loop; dropping it would unschedule it.
+    let _tick = crate::runloop::Timer::every(TICK.as_secs_f64(), pass);
+
+    // SAFETY: called once, on the main thread, which owns the run loop and
+    // every window on it.
+    unsafe { RunApplicationEventLoop() };
+
+    APP.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .and_then(|app| app.should_exit())
+            .unwrap_or(bevy_app::AppExit::Success)
+    })
 }
 
 /// Reacts to a display appearing, disappearing or moving.

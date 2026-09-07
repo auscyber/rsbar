@@ -180,20 +180,3 @@ impl Drop for Timer {
         self.timer.invalidate();
     }
 }
-
-/// Takes what the run loop does not deliver.
-///
-/// `CFRunLoopRunInMode` serves run loop sources. A click on the bar is not one:
-/// it lands in Carbon's event queue, and stays there until something pulls it
-/// out. [`crate::sources::mouse`] does that, and takes only mouse events —
-/// draining the queue indiscriminately exits the process, because some of what
-/// arrives means quit.
-///
-/// `AppKit`'s queue is deliberately *not* pumped. Dequeuing from it and calling
-/// `sendEvent:` looked like the obvious companion to this, and it is worse than
-/// useless: no mouse event ever arrives that way for a window server window,
-/// and handing `NSApp` the click it did see terminated the process with a clean
-/// exit status, which is a memorable way to spend an afternoon.
-pub fn pump_platform_events() {
-    crate::sources::mouse::pump();
-}

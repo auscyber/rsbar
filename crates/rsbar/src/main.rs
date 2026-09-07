@@ -75,7 +75,10 @@ fn main() -> std::process::ExitCode {
     // Installed before anything that needs to wake the app. Signalling it is
     // what interrupts the runner's sleep in the run loop, so an event is looked
     // at when it happens rather than at the next routine tick.
-    let waker = Waker::install(|| {});
+    // Every source and the IPC thread signal this. Under the old runner it
+    // only had to break the sleep; the event loop never returns now, so a pass
+    // has to be something it calls.
+    let waker = Waker::install(rsbar::ecs::pass);
 
     let config = rsbar::config::shared();
     let mut registry = Registry::new(rsbar::config::Shared::clone(&config), waker.clone());

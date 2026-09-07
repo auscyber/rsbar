@@ -14,16 +14,37 @@
 //!
 //! # Why this pulls rather than installs a handler
 //!
-//! `InstallEventHandler` is the obvious route and does not work here. The
-//! handler only runs for events something has received and sent on, and the
-//! thing that normally does that is `RunApplicationEventLoop` — which never
-//! returns, so it cannot be this daemon's loop.
+//! `mouse.c` (`SketchyBar`'s whole mouse source, 37 lines) installs a handler
+//! on `GetEventDispatcherTarget()` with `InstallEventHandler` and chains to
+//! `CallNextEventHandler`, rather than pulling from the queue. Tried here,
+//! built against the identical `EventTypeSpec` list, and confirmed live
+//! against a synthesised click: it never once fired. Not "fired and reached
+//! the wrong item" — the handler function itself was never entered, checked
+//! by a debug log at its first line. `InstallEventHandler` only registers a
+//! handler; something still has to take the event off the queue and send it
+//! to that target, and the thing that does that is `RunApplicationEventLoop`
+//! — which never returns, so it cannot be this daemon's loop. `SketchyBar`'s
+//! `main` calls exactly that function and never returns from it either; this
+//! daemon instead ticks its own schedule from `CFRunLoopRunInMode`, which has
+//! no such side effect. So a handler on the dispatcher target here would be
+//! reachable and correctly torn down and never once called — worse than the
+//! bug this was meant to fix, since at least a poll can be observed to run.
 //!
 //! Pulling from the queue works, but only with a filter. `ReceiveNextEvent`
 //! takes a type list; asking for mouse events alone leaves everything else
 //! queued for whoever owns it. Draining indiscriminately exits the process,
 //! because some of what arrives means quit. And once the event is in hand there
 //! is nothing to dispatch it to, which is why there is no handler at all.
+//!
+//! This is also, confirmed the same way, not what was silently dropping
+//! clicks: a synthesised click landed on `pump` and ran its `click_script`
+//! immediately, cold process and all, on every attempt — through `ecs.rs`'s
+//! runner, which calls `pump` after every `CFRunLoopRunInMode` wake and bounds
+//! the wait itself to one second, so a click is never more than one tick from
+//! being seen even with no other traffic to piggyback a wake on. Whatever
+//! this daemon's reported click failure actually was, it was not this
+//! module's delivery mechanism, at least as of the commit this change sits
+//! on — see this change's own notes for what else moved recently.
 //!
 //! # Hover: `kEventMouseMoved` never arrives; tracking rects do
 //!
@@ -66,6 +87,24 @@
 //! an event kind it will never deliver here is not merely useless, a filter
 //! entry is also one more comparison every pump — see [`wants_hover`], kept
 //! for when a tracking-rect-driven position needs gating the same way.
+//!
+//! # `kEventMouseDragged` and `kEventMouseScroll`
+//!
+//! `mouse.c`'s type list also has these. `kEventMouseScroll` (11) is a second,
+//! older way a scroll can arrive — `SketchyBar`'s own translation table maps
+//! it to the same scrolled event as `kEventMouseWheelMoved`, and its
+//! `CGEvent` carries the same delta field `decode` already reads, so it is
+//! pulled here on the same terms: gated with scroll, decoded identically.
+//! Leaving it out would silently lose scroll input from whatever still sends
+//! the legacy kind.
+//!
+//! `kEventMouseDragged` (6) is not added. There is no `Kind` in
+//! `rsbar_protocol` a decoded drag could become, and no drag state lives in
+//! this module to make one meaningful — a start point, a threshold, anything
+//! a hypothetical `drag_script` would need. Pulling it would only add an
+//! event this loop takes off the queue and throws away on every drag over
+//! the bar. If drag support is ever wanted, it starts with a protocol `Kind`
+//! to decode into, not with adding the Carbon kind to this list.
 
 use crate::sources::{Cause, Emitter, Registering, Registration, Source, SourceId, StartError};
 use objc2_core_foundation::{CFRetained, CGPoint};
@@ -78,6 +117,11 @@ use std::ffi::c_void;
 
 type OsStatus = i32;
 type EventRef = *mut c_void;
+type EventHandlerProc = unsafe extern "C-unwind" fn(
+    call_ref: *mut c_void,
+    event: EventRef,
+    data: *mut c_void,
+) -> OsStatus;
 
 /// `'mous'`, the four-character code for the mouse event class.
 const CLASS_MOUSE: u32 = u32::from_be_bytes(*b"mous");
@@ -88,11 +132,10 @@ const KIND_MOUSE_UP: u32 = 2;
 /// [`wants_hover`] is true — see the module doc.
 const KIND_MOUSE_ENTERED: u32 = 8;
 const KIND_MOUSE_EXITED: u32 = 9;
+/// The two Carbon kinds a scroll can arrive as — see the module doc's note on
+/// `kEventMouseDragged`/`kEventMouseScroll`.
 const KIND_MOUSE_WHEEL_MOVED: u32 = 10;
-
-/// `kEventDurationNoWait`. The runner has already slept; this takes what is
-/// there and returns.
-const NO_WAIT: f64 = 0.0;
+const KIND_MOUSE_SCROLL: u32 = 11;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -103,14 +146,18 @@ struct EventTypeSpec {
 
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
-    fn ReceiveNextEvent(
-        num_types: u32,
-        type_list: *const EventTypeSpec,
-        timeout: f64,
-        pull_event: bool,
-        event: *mut EventRef,
+    fn GetEventDispatcherTarget() -> *mut c_void;
+    fn InstallEventHandler(
+        target: *mut c_void,
+        handler: EventHandlerProc,
+        count: u32,
+        list: *const EventTypeSpec,
+        user_data: *mut c_void,
+        out_ref: *mut *mut c_void,
     ) -> OsStatus;
-    fn ReleaseEvent(event: EventRef);
+    fn RemoveEventHandler(handler: *mut c_void) -> OsStatus;
+    fn CallNextEventHandler(call_ref: *mut c_void, event: EventRef) -> OsStatus;
+
     fn GetEventKind(event: EventRef) -> u32;
     /// The `CGEvent` behind a Carbon one, which is where the usable accessors
     /// are. Returns a +1 reference.
@@ -200,7 +247,7 @@ fn decode(event: EventRef) -> Option<Event> {
                 y: at.y,
             }))
         }
-        KIND_MOUSE_WHEEL_MOVED => {
+        KIND_MOUSE_WHEEL_MOVED | KIND_MOUSE_SCROLL => {
             let delta =
                 CGEvent::integer_value_field(Some(&cg), CGEventField::ScrollWheelEventDeltaAxis1);
             Some(Event::MouseScrolled(Scroll {
@@ -218,74 +265,103 @@ fn decode(event: EventRef) -> Option<Event> {
 ///
 /// Called by the runner after each wake. A no-op until something has asked for
 /// clicks, because nothing registers an emitter until then — so a bar nobody
-/// clicks never touches the queue at all.
-pub fn pump() {
-    let Some(emit) = EMIT.with_borrow(Clone::clone) else {
-        return;
-    };
-
-    // `kEventMouseEntered`/`Exited` only join the filter while hover is
-    // wanted, so a cursor crossing tracking rects nobody asked about costs
-    // nothing here — see the module doc for why there is no third option
-    // (`kEventMouseMoved`) to gate the same way.
-    let all = [
-        EventTypeSpec {
-            class: CLASS_MOUSE,
-            kind: KIND_MOUSE_UP,
-        },
-        EventTypeSpec {
-            class: CLASS_MOUSE,
-            kind: KIND_MOUSE_WHEEL_MOVED,
-        },
-        EventTypeSpec {
-            class: CLASS_MOUSE,
-            kind: KIND_MOUSE_ENTERED,
-        },
-        EventTypeSpec {
-            class: CLASS_MOUSE,
-            kind: KIND_MOUSE_EXITED,
-        },
-    ];
-    let wanted = if WANTS_HOVER.with(Cell::get) {
-        &all[..]
-    } else {
-        &all[..2]
-    };
-
-    loop {
-        let mut event: EventRef = std::ptr::null_mut();
-        // SAFETY: `wanted` outlives the call and `event` is a valid
-        // out-pointer. The type list is what leaves every other event queued.
-        let status = unsafe {
-            ReceiveNextEvent(
-                u32::try_from(wanted.len()).unwrap_or(0),
-                wanted.as_ptr(),
-                NO_WAIT,
-                true,
-                &raw mut event,
-            )
-        };
-        if status != 0 || event.is_null() {
-            return;
-        }
-
-        // SAFETY: as in `decode`.
-        let event_kind = unsafe { GetEventKind(event) };
-        if event_kind == KIND_MOUSE_ENTERED || event_kind == KIND_MOUSE_EXITED {
-            // SAFETY: a live Carbon event for the duration of this call.
+/// One event, straight from the dispatcher.
+///
+/// Installed on `GetEventDispatcherTarget` rather than pulled off the queue
+/// with `ReceiveNextEvent`: this daemon runs Carbon's own
+/// `RunApplicationEventLoop`, which dispatches an event to the handlers
+/// installed on that target and leaves nothing behind for a poll to find.
+/// Chains to whatever was there before, so this observes rather than swallows.
+unsafe extern "C-unwind" fn handle(
+    call_ref: *mut c_void,
+    event: EventRef,
+    _data: *mut c_void,
+) -> OsStatus {
+    if let Some(emit) = EMIT.with_borrow(Clone::clone) {
+        // SAFETY: a live Carbon event for the duration of this call.
+        let kind = unsafe { GetEventKind(event) };
+        if kind == KIND_MOUSE_ENTERED || kind == KIND_MOUSE_EXITED {
+            // SAFETY: as above.
             if let Some(cg) = unsafe { CopyEventCGEvent(event) } {
                 LAST_CROSSING.with(|last| last.set(Some(CGEvent::location(Some(&cg)))));
             }
         } else if let Some(decoded) = decode(event) {
             emit.send(decoded);
         }
-        // SAFETY: received with `pull_event`, so we own it; released once.
-        unsafe { ReleaseEvent(event) };
+    }
+    // SAFETY: `call_ref` and `event` are the ones we were handed.
+    unsafe { CallNextEventHandler(call_ref, event) }
+}
+
+/// Every mouse kind this source decodes.
+///
+/// Hover joins only while something wants it, so a cursor crossing tracking
+/// rects nobody asked about costs nothing. `kEventMouseMoved` is not here at
+/// all -- see the module doc.
+const WANTED: [EventTypeSpec; 5] = [
+    EventTypeSpec {
+        class: CLASS_MOUSE,
+        kind: KIND_MOUSE_UP,
+    },
+    EventTypeSpec {
+        class: CLASS_MOUSE,
+        kind: KIND_MOUSE_WHEEL_MOVED,
+    },
+    EventTypeSpec {
+        class: CLASS_MOUSE,
+        kind: KIND_MOUSE_SCROLL,
+    },
+    EventTypeSpec {
+        class: CLASS_MOUSE,
+        kind: KIND_MOUSE_ENTERED,
+    },
+    EventTypeSpec {
+        class: CLASS_MOUSE,
+        kind: KIND_MOUSE_EXITED,
+    },
+];
+
+/// The installed handler, removed when this is dropped.
+///
+/// `NewEventHandlerUPP` is a macro rather than a symbol on 64-bit -- a UPP is
+/// just the function pointer there -- so `handle` is passed straight in.
+struct Installed {
+    handler: *mut c_void,
+}
+
+impl Installed {
+    fn new(hover: bool) -> Option<Self> {
+        let count = if hover { WANTED.len() } else { 3 };
+        let mut handler: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `handle` matches `EventHandlerProc`, the type list is a
+        // `const` that outlives the call, and `handler` is a valid
+        // out-pointer.
+        let status = unsafe {
+            InstallEventHandler(
+                GetEventDispatcherTarget(),
+                handle,
+                u32::try_from(count).unwrap_or(0),
+                WANTED.as_ptr(),
+                std::ptr::null_mut(),
+                &raw mut handler,
+            )
+        };
+        (status == 0 && !handler.is_null()).then_some(Self { handler })
     }
 }
 
-/// Stops the pump when the source stops.
-struct Registered;
+impl Drop for Installed {
+    fn drop(&mut self) {
+        // SAFETY: produced by `new` and removed exactly once. Unlike several
+        // other Apple callbacks this daemon registers, this one really can be
+        // removed, so it is -- otherwise a source that stops and starts would
+        // leak a handler each time.
+        unsafe { RemoveEventHandler(self.handler) };
+    }
+}
+
+/// Removes the handler and forgets the emitter when the source stops.
+struct Registered(#[allow(dead_code, reason = "held to keep the handler installed")] Installed);
 
 impl Drop for Registered {
     fn drop(&mut self) {
@@ -323,9 +399,13 @@ impl Source for Mouse {
         if objc2::MainThreadMarker::new().is_none() {
             return Err(StartError::new(self.id(), Cause::NotMainThread));
         }
+        let hover = wants_hover(wanted);
+        let Some(installed) = Installed::new(hover) else {
+            return Err(StartError::new(self.id(), Cause::NotMainThread));
+        };
         EMIT.with_borrow_mut(|slot| *slot = Some(emit));
-        WANTS_HOVER.with(|w| w.set(wants_hover(wanted)));
-        Ok(Box::new(Registered))
+        WANTS_HOVER.with(|w| w.set(hover));
+        Ok(Box::new(Registered(installed)))
     }
 
     fn update(
