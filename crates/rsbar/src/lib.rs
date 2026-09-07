@@ -12,6 +12,7 @@ pub mod ecs;
 #[cfg(test)]
 mod harness;
 pub mod layout;
+pub mod lock;
 pub mod requests;
 pub mod runloop;
 pub mod script;

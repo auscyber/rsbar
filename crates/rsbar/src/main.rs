@@ -45,6 +45,18 @@ fn main() -> std::process::ExitCode {
     }
 
     let service = service_name();
+
+    // Before anything is created. A second daemon would otherwise get as far
+    // as building its windows before the service name refused it.
+    let lock = match rsbar::lock::acquire(&service) {
+        Ok(lock) => lock,
+        Err(err) => {
+            tracing::error!(%err, "refusing to start a second bar");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    tracing::debug!(lock = %lock.path().display(), "took the lock");
+
     let receiver = match Receiver::<Request>::bind(&service) {
         Ok(receiver) => receiver,
         Err(err) => {
