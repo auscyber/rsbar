@@ -229,9 +229,9 @@ pub enum Cause {
     /// `IOKit` would not create the power notification source.
     #[error("IOKit refused a notification source")]
     IoKit,
-    /// Carbon refused the mouse event handler.
-    #[error("Carbon refused the event handler (status {0})")]
-    Carbon(i32),
+    /// A source that must be on the main thread was started elsewhere.
+    #[error("this source has to be registered on the main thread")]
+    NotMainThread,
 }
 
 /// A source that could not start, and which one.

@@ -31,7 +31,6 @@ const REQUEST_QUEUE: usize = 1024;
 
 fn main() -> std::process::ExitCode {
     init_tracing();
-    become_an_application();
 
     let service = service_name();
     let receiver = match Receiver::<Request>::bind(&service) {
@@ -75,26 +74,6 @@ fn main() -> std::process::ExitCode {
         bevy_app::AppExit::Success => std::process::ExitCode::SUCCESS,
         bevy_app::AppExit::Error(code) => std::process::ExitCode::from(code.get()),
     }
-}
-
-/// Registers this process as an application, without becoming one visibly.
-///
-/// Carbon dispatches mouse events to the *application* event target, and a
-/// process that never announced itself has no such target — the handler
-/// installs happily and then never fires. `NSApp` supplies it.
-///
-/// `Accessory` keeps us out of the Dock and the app switcher, which is what a
-/// bar wants; `finishLaunching` is the part that actually registers, and
-/// `NSApp.run` is deliberately not called — the run loop belongs to the app's
-/// own runner.
-fn become_an_application() {
-    let Some(mtm) = objc2::MainThreadMarker::new() else {
-        tracing::error!("not on the main thread at startup");
-        return;
-    };
-    let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(objc2_app_kit::NSApplicationActivationPolicy::Accessory);
-    app.finishLaunching();
 }
 
 fn init_tracing() {

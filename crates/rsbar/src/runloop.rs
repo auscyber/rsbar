@@ -181,42 +181,19 @@ impl Drop for Timer {
     }
 }
 
-/// Drains the queues the run loop does not.
+/// Takes what the run loop does not deliver.
 ///
-/// Two of them, and neither is served by `CFRunLoopRunInMode`.
+/// `CFRunLoopRunInMode` serves run loop sources. A click on the bar is not one:
+/// it lands in Carbon's event queue, and stays there until something pulls it
+/// out. [`crate::sources::mouse`] does that, and takes only mouse events —
+/// draining the queue indiscriminately exits the process, because some of what
+/// arrives means quit.
 ///
-/// `AppKit` keeps its own queue; a window server window's events arrive there and
-/// are only delivered once something dequeues them.
-///
-/// Carbon keeps a *separate* one, and this does **not** drain it — see
-/// [`crate::sources::mouse`] for why that is still unfinished. Draining it
-/// naively, by sending every received event to the dispatcher target, exits the
-/// process: some of what arrives is a system event that means quit.
+/// `AppKit`'s queue is deliberately *not* pumped. Dequeuing from it and calling
+/// `sendEvent:` looked like the obvious companion to this, and it is worse than
+/// useless: no mouse event ever arrives that way for a window server window,
+/// and handing `NSApp` the click it did see terminated the process with a clean
+/// exit status, which is a memorable way to spend an afternoon.
 pub fn pump_platform_events() {
-    pump_cocoa();
-}
-
-fn pump_cocoa() {
-    let Some(mtm) = objc2::MainThreadMarker::new() else {
-        return;
-    };
-    let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
-    let distant_past = objc2_foundation::NSDate::distantPast();
-
-    // An autorelease pool per pass: dequeuing hands back autoreleased objects,
-    // and without one they accumulate for the life of the process.
-    objc2::rc::autoreleasepool(|_| {
-        // SAFETY: dequeuing and dispatching on the main thread, which the
-        // marker above proves we are on.
-        while let Some(event) = unsafe {
-            app.nextEventMatchingMask_untilDate_inMode_dequeue(
-                objc2_app_kit::NSEventMask::Any,
-                Some(&distant_past),
-                objc2_foundation::NSDefaultRunLoopMode,
-                true,
-            )
-        } {
-            app.sendEvent(&event);
-        }
-    });
+    crate::sources::mouse::pump();
 }

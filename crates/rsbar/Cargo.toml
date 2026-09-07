@@ -20,7 +20,7 @@ async-mach-ports = { workspace = true }
 rsbar-protocol = { workspace = true }
 skylight = { workspace = true }
 objc2-core-foundation = { workspace = true, features = ["CFArray", "CFAttributedString", "CFDictionary", "CFNumber", "CFString", "CFCGTypes", "CFRunLoop"] }
-objc2-core-graphics = { workspace = true, features = ["CGContext", "CGColor", "CGColorSpace", "CGDirectDisplay", "CGDisplayConfiguration", "CGError", "CGPath"] }
+objc2-core-graphics = { workspace = true, features = ["CGContext", "CGColor", "CGColorSpace", "CGDirectDisplay", "CGDisplayConfiguration", "CGError", "CGEvent", "CGEventTypes", "CGPath"] }
 objc2-core-text = { workspace = true, features = ["CTFont", "CTFontDescriptor", "CTLine", "CTStringAttributes", "objc2-core-graphics"] }
 bevy_app = { workspace = true }
 bevy_ecs = { workspace = true }
