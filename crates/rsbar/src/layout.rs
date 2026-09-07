@@ -329,6 +329,33 @@ fn damage(
         return None;
     }
 
+    // The usual pass has the same items in the same order — nothing was added
+    // or removed, something just changed inside one of them. Diffing that
+    // pairwise costs a walk and no allocation, where building a map of every
+    // previous placement to look each one up cost more than drawing the item
+    // that actually changed.
+    if before.items.len() == placed.len()
+        && before
+            .items
+            .iter()
+            .zip(placed)
+            .all(|((was, _), (now, _))| was == now)
+    {
+        let mut rects = Vec::new();
+        for ((entity, was), (_, now)) in before.items.iter().zip(placed) {
+            if was == now {
+                if panel.changed.contains(entity) {
+                    rects.push(*now);
+                }
+            } else {
+                // Both ends: one to erase, one to draw.
+                rects.push(*was);
+                rects.push(*now);
+            }
+        }
+        return Some(rects);
+    }
+
     let was: HashMap<Entity, CGRect> = before.items.iter().copied().collect();
     let mut rects = Vec::new();
     for (entity, now) in placed {

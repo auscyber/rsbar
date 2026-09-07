@@ -47,6 +47,13 @@ use objc2_core_foundation::{CFRunLoop, CFRunLoopRunResult, kCFRunLoopDefaultMode
 use rsbar_protocol::{Event, Kind, Request};
 use std::time::Duration;
 
+/// How many further waiting sources a wake will take before running a pass.
+///
+/// A burst of client requests should cost one repaint rather than one each,
+/// and the bound is what stops a source that never stops firing from starving
+/// the pass entirely.
+const COALESCE_LIMIT: usize = 64;
+
 /// How often a mirrored menu bar item is re-read. Fast enough that a clock
 /// looks live, slow enough not to be the busiest thing in the process.
 const ALIAS_POLL: Duration = Duration::from_millis(500);
@@ -192,6 +199,19 @@ pub fn run(mut app: App) -> bevy_app::AppExit {
             CFRunLoopRunResult::Stopped | CFRunLoopRunResult::Finished
         ) {
             return bevy_app::AppExit::Success;
+        }
+
+        // Take everything else already waiting before doing a pass. The sleep
+        // above returns on the *first* source it handles, so without this a
+        // client sending fifty updates gets fifty passes and fifty repaints,
+        // each redrawing one item — sixty window server round trips a second
+        // where one would do. Bounded, so a source firing continuously cannot
+        // hold the pass off forever.
+        for _ in 0..COALESCE_LIMIT {
+            let more = unsafe { CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, 0.0, true) };
+            if !matches!(more, CFRunLoopRunResult::HandledSource) {
+                break;
+            }
         }
 
         // The run loop does not serve AppKit's or Carbon's event queues, and a
