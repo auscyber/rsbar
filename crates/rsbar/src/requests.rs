@@ -497,9 +497,13 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             tracing::debug!(kind = %event.kind(), "trigger");
             // A triggered event is not aimed anywhere, so it reaches whoever
             // claimed it — the same path a source's event takes.
-            let dependents = sources.dependents(&event, &Target::All);
+            let event = Arc::new(event);
+            let mut dependents = sources.dependents(&event, &Target::All);
+            // Whoever holds a port takes it; only the rest fall back to a
+            // script, exactly as a source's event does.
+            dependents.retain(|item| !subscribers.push(*item, &event));
             Outcome {
-                jobs: items.jobs_for(&Arc::new(event), &dependents),
+                jobs: items.jobs_for(&event, &dependents),
                 ..Outcome::ok()
             }
         }

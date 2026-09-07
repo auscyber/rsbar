@@ -451,6 +451,7 @@ fn route_pointer(
     mut events: MessageReader<EventMessage>,
     placements: Res<Placements>,
     read: ItemsRead,
+    mut subscribers: NonSendMut<crate::subscribers::Subscribers>,
     mut queue: ResMut<Queue>,
 ) {
     for EventMessage(event) in events.read() {
@@ -459,7 +460,9 @@ fn route_pointer(
         };
         match placements.hit(objc2_core_foundation::CGPoint::new(x, y)) {
             Hit::Item { entity, .. } => {
-                queue.0.extend(read.jobs_for_item(entity, event));
+                if !subscribers.push(entity, event) {
+                    queue.0.extend(read.jobs_for_item(entity, event));
+                }
             }
             // On the bar but not on an item. The `.global` events exist for
             // exactly this, and are matched the ordinary way.
@@ -491,6 +494,7 @@ fn tick(
     time: Res<bevy_time::Time<bevy_time::Real>>,
     mut since: Local<Duration>,
     mut items: Query<(Entity, &Name, &mut Routine, Option<&Script>)>,
+    mut subscribers: NonSendMut<crate::subscribers::Subscribers>,
     mut queue: ResMut<Queue>,
 ) {
     *since += time.delta();
@@ -500,16 +504,25 @@ fn tick(
     // Subtract rather than zero, so a late wake does not lose the remainder.
     *since -= TICK;
 
-    for (entity, name, mut routine, script) in &mut items {
+    let routine = std::sync::Arc::new(Event::Routine(rsbar_protocol::event::Routine {}));
+    for (entity, name, mut clock, script) in &mut items {
         // `bypass_change_detection`, because a routine clock ticking is not a
         // reason to repaint — only what the script then sets is.
-        if routine.bypass_change_detection().tick()
-            && let Some(script) = script
-        {
+        if !clock.bypass_change_detection().tick() {
+            continue;
+        }
+        // A client holding a port takes the tick itself. Checked before the
+        // script, and before asking whether there *is* one: an item that only
+        // exists to be updated by a Lua callback has no script at all, and
+        // gating on one meant its tick went nowhere.
+        if subscribers.push(entity, &routine) {
+            continue;
+        }
+        if let Some(script) = script {
             queue.0.push(Job {
                 item: ItemHandle::new(entity, name.0.clone()),
                 script: std::sync::Arc::clone(&script.0),
-                event: std::sync::Arc::new(Event::Routine(rsbar_protocol::event::Routine {})),
+                event: std::sync::Arc::clone(&routine),
             });
         }
     }
