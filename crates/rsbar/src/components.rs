@@ -87,6 +87,15 @@ pub struct Run {
     pub padding_right: f64,
     /// Shifts this half alone, on top of the item's own offset.
     pub y_offset: f64,
+    /// Draw in [`Self::highlight_color`] instead of [`Self::color`].
+    ///
+    /// Per half rather than per item, matching `struct text` in
+    /// `SketchyBar`'s `text.c`, where drawing picks
+    /// `highlight ? highlight_color : color`. A space item's own script sets
+    /// `icon.highlight=$SELECTED`, so which space is current is a thing the
+    /// config decides how to show rather than something drawn for it.
+    pub highlight: bool,
+    pub highlight_color: Color,
     /// Whether this half of the item is shown.
     ///
     /// Separate from the item's own `Drawing` so an icon can be shown without
@@ -109,6 +118,8 @@ impl From<&Run> for rsbar_protocol::Run {
             padding_left: run.padding_left,
             padding_right: run.padding_right,
             y_offset: run.y_offset,
+            highlight: run.highlight,
+            highlight_color: run.highlight_color,
         }
     }
 }
@@ -123,6 +134,8 @@ impl From<&rsbar_protocol::Run> for Run {
             padding_left: run.padding_left,
             padding_right: run.padding_right,
             y_offset: run.y_offset,
+            highlight: run.highlight,
+            highlight_color: run.highlight_color,
         }
     }
 }
@@ -168,6 +181,18 @@ impl Run {
             padding_left: 0.0,
             padding_right: 0.0,
             y_offset: 0.0,
+            highlight: false,
+            highlight_color: Color::BLACK,
+        }
+    }
+
+    /// The colour this half actually draws in.
+    #[must_use]
+    pub fn drawn_color(&self) -> Color {
+        if self.highlight {
+            self.highlight_color
+        } else {
+            self.color
         }
     }
 

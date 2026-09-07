@@ -13,7 +13,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use mlua::{Function, Lua, Table, UserData, UserDataMethods, Value};
-use rsbar_protocol::{ItemName, ItemPatch, Query, Request, Response};
+use rsbar_protocol::{ItemName, ItemPatch, Query, Request, Response, Selector};
 
 use crate::convert::{
     bar_patch_from_table, bar_state_to_table, deep_merge, item_name_from_str,
@@ -43,10 +43,7 @@ impl UserData for Item {
                 let patch = item_patch_from_table(&patch)?;
                 expect_ok(
                     dispatcher
-                        .call(Request::SetItem {
-                            name,
-                            patch: Box::new(patch),
-                        })
+                        .call(Request::Set(Selector::Name(name), Box::new(patch)))
                         .await,
                 )
             }
@@ -55,7 +52,7 @@ impl UserData for Item {
         methods.add_async_method("remove", |_, this, ()| {
             let dispatcher = Rc::clone(&this.dispatcher);
             let name = this.name.clone();
-            async move { expect_ok(dispatcher.call(Request::RemoveItem(name)).await) }
+            async move { expect_ok(dispatcher.call(Request::Remove(Selector::Name(name))).await) }
         });
 
         methods.add_async_method("query", |lua, this, ()| {
@@ -175,7 +172,14 @@ async fn add_item(
     name: ItemName,
     position: rsbar_protocol::Position,
 ) -> mlua::Result<()> {
-    expect_ok(dispatcher.call(Request::AddItem { name, position }).await)
+    expect_ok(
+        dispatcher
+            .call(Request::Add(rsbar_protocol::ComponentKind::Item {
+                name,
+                position,
+            }))
+            .await,
+    )
 }
 
 /// `Request::AddComponent`, degrading to a plain item if the daemon rejects
@@ -185,18 +189,11 @@ async fn add_item(
 /// letting that abort the whole config over one component it cannot draw.
 async fn add_component(
     dispatcher: &Rc<dyn Dispatcher>,
-    name: ItemName,
-    position: rsbar_protocol::Position,
     kind: rsbar_protocol::ComponentKind,
 ) -> mlua::Result<()> {
-    match dispatcher
-        .call(Request::AddComponent {
-            name: name.clone(),
-            position: position.clone(),
-            kind,
-        })
-        .await
-    {
+    let (name, position) = kind.placement();
+    let (name, position) = (name.clone(), position);
+    match dispatcher.call(Request::Add(kind.clone())).await {
         Ok(Response::Ok) => Ok(()),
         Ok(other) => Err(unexpected(&other)),
         Err(crate::error::ApiError::Rejected(message)) => {
@@ -218,10 +215,7 @@ async fn set_item(
 ) -> mlua::Result<()> {
     expect_ok(
         dispatcher
-            .call(Request::SetItem {
-                name,
-                patch: Box::new(patch),
-            })
+            .call(Request::Set(Selector::Name(name), Box::new(patch)))
             .await,
     )
 }
@@ -292,11 +286,15 @@ fn members_from_value(members: &Value) -> mlua::Result<Vec<rsbar_protocol::Selec
 /// yet — real, not a typo, so `add_fn` models them as [`ComponentKind`]
 /// (`Request::AddComponent`) rather than falling back to a plain item, and
 /// logs them differently from a kind it has never heard of.
-fn component_kind_from_str(kind: &str) -> Option<rsbar_protocol::ComponentKind> {
+fn component_kind_from_str(
+    kind: &str,
+    name: ItemName,
+    position: rsbar_protocol::Position,
+) -> Option<rsbar_protocol::ComponentKind> {
     match kind {
-        "space" => Some(rsbar_protocol::ComponentKind::Space),
-        "graph" => Some(rsbar_protocol::ComponentKind::Graph),
-        "slider" => Some(rsbar_protocol::ComponentKind::Slider),
+        "space" => Some(rsbar_protocol::ComponentKind::Space { name, position }),
+        "graph" => Some(rsbar_protocol::ComponentKind::Graph { name, position }),
+        "slider" => Some(rsbar_protocol::ComponentKind::Slider { name, position }),
         _ => None,
     }
 }
@@ -368,7 +366,7 @@ fn add_fn(
                         }
                     } else {
                         if kind != "item" && kind != "alias" {
-                            if component_kind_from_str(&kind).is_some() {
+                            if matches!(kind.as_str(), "space" | "graph" | "slider") {
                                 tracing::error!(
                                     kind = %kind,
                                     "recognised, but rsbar cannot draw a {kind} yet; adding it as a `ComponentKind` the daemon can at least track"
@@ -408,10 +406,9 @@ fn add_fn(
                 let merged = merged_opts(&lua, &defaults, opts_table.as_ref())?;
                 let position = item_position_from_table(&merged)?;
 
-                match component_kind_from_str(&kind) {
+                match component_kind_from_str(&kind, item_name.clone(), position.clone()) {
                     Some(component_kind) => {
-                        add_component(&dispatcher, item_name.clone(), position, component_kind)
-                            .await?;
+                        add_component(&dispatcher, component_kind).await?;
                     }
                     None => add_item(&dispatcher, item_name.clone(), position).await?,
                 }
@@ -448,10 +445,7 @@ fn set_fn(lua: &Lua, dispatcher: &Rc<dyn Dispatcher>) -> mlua::Result<Function> 
             match selector_from_name(&name)? {
                 rsbar_protocol::Selector::Pattern(pattern) => expect_ok(
                     dispatcher
-                        .call(Request::SetMatching {
-                            pattern,
-                            patch: Box::new(patch),
-                        })
+                        .call(Request::Set(Selector::Pattern(pattern), Box::new(patch)))
                         .await,
                 ),
                 rsbar_protocol::Selector::Name(name) => set_item(&dispatcher, name, patch).await,
@@ -529,11 +523,13 @@ fn remove_fn(lua: &Lua, dispatcher: &Rc<dyn Dispatcher>) -> mlua::Result<Functio
         let dispatcher = Rc::clone(&dispatcher);
         async move {
             match selector_from_name(&name)? {
-                rsbar_protocol::Selector::Pattern(pattern) => {
-                    expect_ok(dispatcher.call(Request::RemoveMatching(pattern)).await)
-                }
+                rsbar_protocol::Selector::Pattern(pattern) => expect_ok(
+                    dispatcher
+                        .call(Request::Remove(Selector::Pattern(pattern)))
+                        .await,
+                ),
                 rsbar_protocol::Selector::Name(name) => {
-                    expect_ok(dispatcher.call(Request::RemoveItem(name)).await)
+                    expect_ok(dispatcher.call(Request::Remove(Selector::Name(name))).await)
                 }
             }
         }

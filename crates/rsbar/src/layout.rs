@@ -668,8 +668,8 @@ fn draw_run(
         CGSize::new(w, height),
     );
     match which {
-        Half::Icon => shaped.draw_icon(ctx, box_, run.color),
-        Half::Label => shaped.draw_label(ctx, box_, run.color),
+        Half::Icon => shaped.draw_icon(ctx, box_, run.drawn_color()),
+        Half::Label => shaped.draw_label(ctx, box_, run.drawn_color()),
     }
     w
 }

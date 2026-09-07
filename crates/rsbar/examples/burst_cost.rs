@@ -13,6 +13,8 @@ use std::time::Instant;
 
 fn run(text: &str) -> Run {
     Run {
+        highlight: false,
+        highlight_color: rsbar_protocol::style::Color::BLACK,
         y_offset: 0.0,
         string: text.to_owned(),
         font: FontSpec::default(),

@@ -248,6 +248,8 @@ struct IconOrLabel {
     padding_left: Option<f64>,
     padding_right: Option<f64>,
     y_offset: Option<f64>,
+    highlight: Option<bool>,
+    highlight_color: Option<Color>,
 }
 
 impl IconOrLabel {
@@ -262,6 +264,8 @@ impl IconOrLabel {
             padding_left: self.padding_left,
             padding_right: self.padding_right,
             y_offset: self.y_offset,
+            highlight: self.highlight,
+            highlight_color: self.highlight_color,
         };
         (patch != rsbar_protocol::RunPatch::default()).then_some(patch)
     }
@@ -394,6 +398,8 @@ impl IconOrLabel {
         "padding_left",
         "padding_right",
         "y_offset",
+        "highlight",
+        "highlight_color",
     ];
 
     fn read(table: &Table, key: &str) -> mlua::Result<Self> {
@@ -415,6 +421,8 @@ impl IconOrLabel {
                     padding_left: opt(&sub, "padding_left")?,
                     padding_right: opt(&sub, "padding_right")?,
                     y_offset: opt(&sub, "y_offset")?,
+                    highlight: opt_bool(&sub, "highlight")?,
+                    highlight_color: opt_color(&sub, "highlight_color")?,
                 })
             }
             other => Err(mlua::Error::RuntimeError(format!(
@@ -714,46 +722,41 @@ fn on_off(value: bool) -> &'static str {
 ///
 /// Returns a Lua error only if table creation itself fails.
 pub fn item_state_to_table(lua: &Lua, state: &ItemState) -> mlua::Result<Table> {
-    let table = lua.create_table()?;
-    table.set("name", state.name.as_str())?;
-
-    // Nested the same way `SketchyBar`'s own `--query` is (`bar_item.c`), so
-    // a config's own `geometry.drawing`/`geometry.position` field paths work
-    // unchanged — see `ItemState`'s doc comment. `Geometry` already nests
-    // `background`, so one serialize covers both levels; `serde_table` gets
-    // every `bool` in the tree wrong (a Lua boolean, not `"on"`/`"off"`), so
-    // each one is patched afterwards.
-    let geometry = serde_table(lua, &state.geometry)?;
-    geometry.set("drawing", on_off(state.geometry.drawing))?;
-    let background: Table = geometry.get("background")?;
-    background.set("drawing", on_off(state.geometry.background.drawing))?;
-    table.set("geometry", geometry)?;
-
-    let icon = serde_table(lua, &state.icon)?;
-    icon.set("drawing", on_off(state.icon.drawing))?;
-    table.set("icon", icon)?;
-
-    let label = serde_table(lua, &state.label)?;
-    label.set("drawing", on_off(state.label.drawing))?;
-    table.set("label", label)?;
-
-    let scripting = serde_table(lua, &state.scripting)?;
-    scripting.set("updates", on_off(state.scripting.updates))?;
-    table.set("scripting", scripting)?;
-
-    table.set("alias", state.alias.clone())?;
-    table.set("members", serde_table(lua, &state.members)?)?;
-
-    // `Kind` derives a plain `Serialize` (its variant's Rust name, not the
-    // snake_case string a config actually writes/reads), so this is the one
-    // field `serde_table` would get wrong the other way — built from
-    // `Kind::name` instead.
+    let table = serde_table(lua, state)?;
+    // `Kind` serializes as its Rust variant name, not the snake_case string a
+    // config writes and reads, so it is the one field serde gets wrong.
     let events = lua.create_table()?;
     for (index, kind) in state.events.iter().enumerate() {
         events.set(index + 1, kind.name())?;
     }
     table.set("events", events)?;
+    booleans_as_on_off(lua, &table)?;
     Ok(table)
+}
+
+/// Rewrites every boolean in a table, however deeply nested, as `"on"` or
+/// `"off"`.
+///
+/// `SketchyBar`'s own `--query` prints booleans that way and a config compares
+/// against the strings -- `query().popup.drawing == "on"`. Done by walking the
+/// serialized tree rather than naming each field, because naming them is what
+/// went wrong: `popup` was added to `ItemState` and the hand-written
+/// conversion simply never set it, so `overflow:query().popup` was nil and
+/// indexing it killed the callback.
+fn booleans_as_on_off(lua: &Lua, table: &Table) -> mlua::Result<()> {
+    let mut rewrites = Vec::new();
+    for pair in table.clone().pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        match value {
+            Value::Boolean(b) => rewrites.push((key, on_off(b))),
+            Value::Table(nested) => booleans_as_on_off(lua, &nested)?,
+            _ => {}
+        }
+    }
+    for (key, value) in rewrites {
+        table.set(key, value)?;
+    }
+    Ok(())
 }
 
 /// # Errors
@@ -761,8 +764,7 @@ pub fn item_state_to_table(lua: &Lua, state: &ItemState) -> mlua::Result<Table> 
 /// Returns a Lua error only if table creation itself fails.
 pub fn bar_state_to_table(lua: &Lua, state: &BarState) -> mlua::Result<Table> {
     let table = serde_table(lua, state)?;
-    table.set("topmost", on_off(state.topmost))?;
-    table.set("hidden", on_off(state.hidden))?;
+    booleans_as_on_off(lua, &table)?;
     Ok(table)
 }
 

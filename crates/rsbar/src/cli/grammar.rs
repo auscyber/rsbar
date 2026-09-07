@@ -129,6 +129,7 @@ const DOMAINS: &[&str] = &[
     "default",
     "move",
     "reorder",
+    "push",
     "reload",
     "update",
     "exit",
@@ -294,7 +295,6 @@ const ITEM_GAPS: &[(&str, &str)] = &[
     ("scroll_texts", "no matching ItemPatch field yet"),
     ("align", "no matching ItemPatch field yet"),
     ("associated_display", "no matching ItemPatch field yet"),
-    ("associated_space", "no matching ItemPatch field yet"),
     ("blur_radius", "no matching ItemPatch field yet"),
     ("shadow", "no matching ItemPatch field yet"),
     ("lazy", "no matching ItemPatch field yet"),
@@ -372,7 +372,12 @@ fn parse_add(parser: &mut Parser) -> Result<Vec<Request>, ParseError> {
             let name = required_item_name(parser, domain, "a name")?;
             let position_token = required_string(parser, domain, "a position")?;
             let position = parse_position_value("position", &position_token)?;
-            Ok(vec![Request::AddItem { name, position }])
+            let kind = if kind == "alias" {
+                ComponentKind::Alias { name, position }
+            } else {
+                ComponentKind::Item { name, position }
+            };
+            Ok(vec![Request::Add(kind)])
         }
         "bracket" => {
             let name = required_item_name(parser, "--add bracket", "a name")?;
@@ -388,22 +393,9 @@ fn parse_add(parser: &mut Parser) -> Result<Vec<Request>, ParseError> {
                 .map(|m| m.parse::<Selector>().map_err(ParseError::from))
                 .collect::<Result<Vec<_>, _>>()?;
             // SketchyBar's own `--add bracket` takes no position: a bracket's
-            // frame comes from its members. rsbar's `AddItem` still needs one
-            // to file the item under, so it defaults to `left`, same as
-            // `--add item` without a `--position` used to.
-            Ok(vec![
-                Request::AddItem {
-                    name: name.clone(),
-                    position: Position::Left,
-                },
-                Request::SetItem {
-                    name,
-                    patch: Box::new(ItemPatch {
-                        members: Some(members),
-                        ..Default::default()
-                    }),
-                },
-            ])
+            // frame comes from its members, which is why the kind carries them
+            // instead.
+            Ok(vec![Request::Add(ComponentKind::Bracket { name, members })])
         }
         "space" | "graph" | "slider" => {
             let domain: &'static str = "--add";
@@ -411,9 +403,9 @@ fn parse_add(parser: &mut Parser) -> Result<Vec<Request>, ParseError> {
             let position_token = required_string(parser, domain, "a position")?;
             let position = parse_position_value("position", &position_token)?;
             let component_kind = match kind.as_str() {
-                "space" => ComponentKind::Space,
-                "graph" => ComponentKind::Graph,
-                "slider" => ComponentKind::Slider,
+                "space" => ComponentKind::Space { name, position },
+                "graph" => ComponentKind::Graph { name, position },
+                "slider" => ComponentKind::Slider { name, position },
                 _ => unreachable!("matched above"),
             };
             // `--add graph <name> <position> <width>` and
@@ -422,11 +414,7 @@ fn parse_add(parser: &mut Parser) -> Result<Vec<Request>, ParseError> {
             // the daemon side can draw either component. Consumed and
             // dropped rather than left for the next domain to trip over.
             let _ = greedy_strings(parser)?;
-            Ok(vec![Request::AddComponent {
-                name,
-                position,
-                kind: component_kind,
-            }])
+            Ok(vec![Request::Add(component_kind)])
         }
         "event" => Err(ParseError::KnownGap(
             kind,
@@ -452,10 +440,7 @@ fn parse_set(parser: &mut Parser) -> Result<Request, ParseError> {
     let selector = required_selector(parser, "--set", "an item name")?;
     let pairs = pairs_from_tokens(&greedy_strings(parser)?)?;
     let patch = Box::new(parse_item_patch(&pairs)?);
-    Ok(match selector {
-        Selector::Name(name) => Request::SetItem { name, patch },
-        Selector::Pattern(pattern) => Request::SetMatching { pattern, patch },
-    })
+    Ok(Request::Set(selector, patch))
 }
 
 fn parse_default(parser: &mut Parser) -> Result<Request, ParseError> {
@@ -466,10 +451,7 @@ fn parse_default(parser: &mut Parser) -> Result<Request, ParseError> {
 
 fn parse_remove(parser: &mut Parser) -> Result<Request, ParseError> {
     let selector = required_selector(parser, "--remove", "an item name")?;
-    Ok(match selector {
-        Selector::Name(name) => Request::RemoveItem(name),
-        Selector::Pattern(pattern) => Request::RemoveMatching(pattern),
-    })
+    Ok(Request::Remove(selector))
 }
 
 fn parse_subscribe(parser: &mut Parser) -> Result<Request, ParseError> {
@@ -547,9 +529,11 @@ fn parse_query(parser: &mut Parser) -> Result<Request, ParseError> {
 fn parse_press(parser: &mut Parser) -> Result<Request, ParseError> {
     let token = required_string(parser, "--press", "a menu index or an alias item name")?;
     if let Ok(index) = token.parse::<usize>() {
-        return Ok(Request::PressAppMenu(index));
+        return Ok(Request::Press(rsbar_protocol::PressTarget::AppMenu(index)));
     }
-    Ok(Request::PressAlias(ItemName::new(token.as_str())?))
+    Ok(Request::Press(rsbar_protocol::PressTarget::Alias(
+        ItemName::new(token.as_str())?,
+    )))
 }
 
 fn parse_move(parser: &mut Parser) -> Result<Request, ParseError> {
@@ -589,6 +573,26 @@ fn parse_reorder(parser: &mut Parser) -> Result<Request, ParseError> {
     Ok(Request::Reorder(names))
 }
 
+/// `--push <name> <value>`: one more sample for a graph.
+fn parse_push(parser: &mut Parser) -> Result<Request, ParseError> {
+    let name = match required_selector(parser, "--push", "a graph's name")? {
+        Selector::Name(name) => name,
+        // A sample belongs to one graph's ring buffer; pushing the same value
+        // into every graph matching a pattern is not a thing SketchyBar does.
+        Selector::Pattern(pattern) => {
+            return Err(ParseError::KnownGap(
+                format!("/{pattern}/"),
+                "--push takes one graph, not a pattern",
+            ));
+        }
+    };
+    let value = required_string(parser, "--push", "a sample value")?;
+    let value = value
+        .parse::<f32>()
+        .map_err(|e| invalid("--push", &value, e))?;
+    Ok(Request::Push { name, value })
+}
+
 fn parse_reload(parser: &mut Parser) -> Result<Request, ParseError> {
     let group = greedy_strings(parser)?;
     if let Some(path) = group.into_iter().next() {
@@ -619,6 +623,7 @@ pub fn parse(args: &[String]) -> Result<Vec<Request>, ParseError> {
             Arg::Long("default") => requests.push(parse_default(&mut parser)?),
             Arg::Long("move") => requests.push(parse_move(&mut parser)?),
             Arg::Long("reorder") => requests.push(parse_reorder(&mut parser)?),
+            Arg::Long("push") => requests.push(parse_push(&mut parser)?),
             Arg::Long("press") => requests.push(parse_press(&mut parser)?),
             Arg::Long("reload") => requests.push(parse_reload(&mut parser)?),
             Arg::Long("update") => requests.push(Request::UpdateAll),
@@ -692,9 +697,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             requests,
-            vec![Request::SetItem {
-                name: name("clock"),
-                patch: Box::new(ItemPatch {
+            vec![Request::Set(
+                Selector::Name(name("clock")),
+                Box::new(ItemPatch {
                     label: Some(RunPatch {
                         color: Some(Color(0xffff_ffff)),
                         ..Default::default()
@@ -708,8 +713,8 @@ mod tests {
                         ..Default::default()
                     }),
                     ..Default::default()
-                }),
-            }]
+                })
+            )]
         );
     }
 
@@ -718,9 +723,9 @@ mod tests {
         let requests = parse(&args_(&["--set", "clock", "icon=🕐", "label=09:41"])).unwrap();
         assert_eq!(
             requests,
-            vec![Request::SetItem {
-                name: name("clock"),
-                patch: Box::new(ItemPatch {
+            vec![Request::Set(
+                Selector::Name(name("clock")),
+                Box::new(ItemPatch {
                     icon: Some(RunPatch {
                         text: Some("🕐".into()),
                         ..Default::default()
@@ -730,8 +735,8 @@ mod tests {
                         ..Default::default()
                     }),
                     ..Default::default()
-                }),
-            }]
+                })
+            )]
         );
     }
 
@@ -740,16 +745,16 @@ mod tests {
         let requests = parse(&args_(&["--set", "clock", "icon.string=🕐"])).unwrap();
         assert_eq!(
             requests,
-            vec![Request::SetItem {
-                name: name("clock"),
-                patch: Box::new(ItemPatch {
+            vec![Request::Set(
+                Selector::Name(name("clock")),
+                Box::new(ItemPatch {
                     icon: Some(RunPatch {
                         text: Some("🕐".into()),
                         ..Default::default()
                     }),
                     ..Default::default()
-                }),
-            }]
+                })
+            )]
         );
     }
 
@@ -758,16 +763,16 @@ mod tests {
         let requests = parse(&args_(&["--set", "clock", "icon.padding_left=4"])).unwrap();
         assert_eq!(
             requests,
-            vec![Request::SetItem {
-                name: name("clock"),
-                patch: Box::new(ItemPatch {
+            vec![Request::Set(
+                Selector::Name(name("clock")),
+                Box::new(ItemPatch {
                     icon: Some(RunPatch {
                         padding_left: Some(4.0),
                         ..Default::default()
                     }),
                     ..Default::default()
-                }),
-            }]
+                })
+            )]
         );
     }
 
@@ -783,9 +788,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             requests,
-            vec![Request::SetItem {
-                name: name("clock"),
-                patch: Box::new(ItemPatch {
+            vec![Request::Set(
+                Selector::Name(name("clock")),
+                Box::new(ItemPatch {
                     background: Some(BackgroundPatch {
                         height: Some(20.0),
                         border_color: Some(Color(0xff00_ff00)),
@@ -793,8 +798,8 @@ mod tests {
                         ..Default::default()
                     }),
                     ..Default::default()
-                }),
-            }]
+                })
+            )]
         );
     }
 
@@ -814,15 +819,15 @@ mod tests {
         .unwrap();
         assert_eq!(
             requests,
-            vec![Request::SetItem {
-                name: name("clock"),
-                patch: Box::new(ItemPatch {
+            vec![Request::Set(
+                Selector::Name(name("clock")),
+                Box::new(ItemPatch {
                     updates: Some(false),
                     width: Some(40.0),
                     display: Some("2".into()),
                     ..Default::default()
-                }),
-            }]
+                })
+            )]
         );
     }
 
@@ -853,29 +858,29 @@ mod tests {
         assert_eq!(
             requests,
             vec![
-                Request::AddItem {
+                Request::Add(ComponentKind::Item {
                     name: name("clock"),
-                    position: Position::Right,
-                },
-                Request::SetItem {
-                    name: name("clock"),
-                    patch: Box::new(ItemPatch {
+                    position: Position::Right
+                }),
+                Request::Set(
+                    Selector::Name(name("clock")),
+                    Box::new(ItemPatch {
                         update_freq: Some(1),
                         script: Some("/plugins/clock.sh".into()),
                         ..Default::default()
-                    }),
-                },
-                Request::AddItem {
+                    })
+                ),
+                Request::Add(ComponentKind::Item {
                     name: name("battery"),
-                    position: Position::Right,
-                },
-                Request::SetItem {
-                    name: name("battery"),
-                    patch: Box::new(ItemPatch {
+                    position: Position::Right
+                }),
+                Request::Set(
+                    Selector::Name(name("battery")),
+                    Box::new(ItemPatch {
                         script: Some("/plugins/battery.sh".into()),
                         ..Default::default()
-                    }),
-                },
+                    })
+                ),
                 Request::Subscribe {
                     name: name("battery"),
                     events: vec![Kind::PowerSourceChanged],
@@ -885,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn add_bracket_sets_members_via_a_second_request() {
+    fn add_bracket_carries_its_members() {
         let requests = parse(&args_(&[
             "--add",
             "bracket",
@@ -896,19 +901,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             requests,
-            vec![
-                Request::AddItem {
-                    name: name("group"),
-                    position: Position::Left,
-                },
-                Request::SetItem {
-                    name: name("group"),
-                    patch: Box::new(ItemPatch {
-                        members: Some(vec![sel("left_item"), sel("right_item")]),
-                        ..Default::default()
-                    }),
-                },
-            ]
+            vec![Request::Add(ComponentKind::Bracket {
+                name: name("group"),
+                members: vec![sel("left_item"), sel("right_item")],
+            })]
         );
     }
 
@@ -919,24 +915,15 @@ mod tests {
         let requests = parse(&args_(&["--add", "bracket", "group", r"/menu\..*/"])).unwrap();
         assert_eq!(
             requests,
-            vec![
-                Request::AddItem {
-                    name: name("group"),
-                    position: Position::Left,
-                },
-                Request::SetItem {
-                    name: name("group"),
-                    patch: Box::new(ItemPatch {
-                        members: Some(vec![sel(r"/menu\..*/")]),
-                        ..Default::default()
-                    }),
-                },
-            ]
+            vec![Request::Add(ComponentKind::Bracket {
+                name: name("group"),
+                members: vec![sel(r"/menu\..*/")],
+            })]
         );
     }
 
     #[test]
-    fn add_alias_creates_a_plain_item_for_a_chained_set_to_target() {
+    fn add_alias_is_its_own_kind_and_takes_a_chained_set() {
         let requests = parse(&args_(&[
             "--add",
             "alias",
@@ -950,17 +937,17 @@ mod tests {
         assert_eq!(
             requests,
             vec![
-                Request::AddItem {
+                Request::Add(ComponentKind::Alias {
                     name: name("mirror"),
                     position: Position::Right,
-                },
-                Request::SetItem {
-                    name: name("mirror"),
-                    patch: Box::new(ItemPatch {
+                }),
+                Request::Set(
+                    Selector::Name(name("mirror")),
+                    Box::new(ItemPatch {
                         alias: Some("Control Center,Battery".into()),
                         ..Default::default()
-                    }),
-                },
+                    })
+                ),
             ]
         );
     }
@@ -970,21 +957,19 @@ mod tests {
         let requests = parse(&args_(&["--add", "graph", "cpu", "right", "50"])).unwrap();
         assert_eq!(
             requests,
-            vec![Request::AddComponent {
+            vec![Request::Add(ComponentKind::Graph {
                 name: name("cpu"),
-                position: Position::Right,
-                kind: ComponentKind::Graph,
-            }]
+                position: Position::Right
+            })]
         );
 
         let requests = parse(&args_(&["--add", "space", "space.1", "left"])).unwrap();
         assert_eq!(
             requests,
-            vec![Request::AddComponent {
+            vec![Request::Add(ComponentKind::Space {
                 name: name("space.1"),
-                position: Position::Left,
-                kind: ComponentKind::Space,
-            }]
+                position: Position::Left
+            })]
         );
     }
 
@@ -1075,11 +1060,13 @@ mod tests {
         // passed to its helper.
         assert_eq!(
             parse(&args_(&["--press", "0"])).unwrap(),
-            vec![Request::PressAppMenu(0)]
+            vec![Request::Press(rsbar_protocol::PressTarget::AppMenu(0))]
         );
         assert_eq!(
             parse(&args_(&["--press", "Amphetamine,Amphetamine"])).unwrap(),
-            vec![Request::PressAlias(name("Amphetamine,Amphetamine"))]
+            vec![Request::Press(rsbar_protocol::PressTarget::Alias(name(
+                "Amphetamine,Amphetamine"
+            )))]
         );
     }
 
@@ -1087,7 +1074,7 @@ mod tests {
     fn remove_reload_update_and_exit() {
         assert_eq!(
             parse(&args_(&["--remove", "clock"])).unwrap(),
-            vec![Request::RemoveItem(name("clock"))]
+            vec![Request::Remove(Selector::Name(name("clock")))]
         );
         assert_eq!(parse(&args_(&["--reload"])).unwrap(), vec![Request::Reload]);
         assert_eq!(
@@ -1104,20 +1091,23 @@ mod tests {
         let requests = parse(&args_(&["--set", r"/menu\..*/", "drawing=off"])).unwrap();
         assert_eq!(
             requests,
-            vec![Request::SetMatching {
-                pattern: r"menu\..*".into(),
-                patch: Box::new(ItemPatch {
+            vec![Request::Set(
+                Selector::Pattern(r"menu\..*".into()),
+                Box::new(ItemPatch {
                     drawing: Some(rsbar_protocol::Toggle::Off),
                     ..Default::default()
-                }),
-            }]
+                })
+            )]
         );
     }
 
     #[test]
     fn remove_on_a_pattern_is_now_implemented_rather_than_a_gap() {
         let requests = parse(&args_(&["--remove", "/clock.*/"])).unwrap();
-        assert_eq!(requests, vec![Request::RemoveMatching("clock.*".into())]);
+        assert_eq!(
+            requests,
+            vec![Request::Remove(Selector::Pattern("clock.*".into()))]
+        );
     }
 
     #[test]
@@ -1211,13 +1201,13 @@ mod tests {
         let requests = parse(&args_(&["--set", "clock", "y_offset=-5"])).unwrap();
         assert_eq!(
             requests,
-            vec![Request::SetItem {
-                name: name("clock"),
-                patch: Box::new(ItemPatch {
+            vec![Request::Set(
+                Selector::Name(name("clock")),
+                Box::new(ItemPatch {
                     y_offset: Some(-5.0),
                     ..Default::default()
-                }),
-            }]
+                })
+            )]
         );
     }
 

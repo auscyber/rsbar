@@ -23,7 +23,7 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::system::RunSystemOnce as _;
 use bevy_ecs::system::SystemState;
 use rsbar_protocol::event::SpaceChange;
-use rsbar_protocol::{Event, ItemName, Kind, Request};
+use rsbar_protocol::{Event, ItemName, Kind, Request, Selector};
 use std::num::NonZeroU64;
 
 /// What [`crate::ecs::recompute_space_selection`] needs from the world.
@@ -164,10 +164,10 @@ impl Harness {
     /// Convenience: add an item and set it in one go.
     pub fn add(&mut self, name: &str, position: rsbar_protocol::Position) -> ItemName {
         let name = ItemName::new(name).expect("valid name");
-        self.apply(Request::AddItem {
+        self.apply(Request::Add(rsbar_protocol::ComponentKind::Item {
             name: name.clone(),
             position,
-        });
+        }));
         name
     }
 
@@ -250,6 +250,7 @@ mod tests {
     use rsbar_protocol::event::{Forced, FrontApp, VolumeChange};
     use rsbar_protocol::{
         ComponentKind, Event, ItemName, ItemPatch, Kind, Position, Relative, Request, Response,
+        Selector,
     };
     use std::num::NonZeroU64;
 
@@ -275,7 +276,7 @@ mod tests {
         });
         assert!(bar.running(WORKSPACE));
 
-        bar.apply(Request::RemoveItem(item));
+        bar.apply(Request::Remove(Selector::Name(item)));
         assert!(
             !bar.running(WORKSPACE),
             "the last item wanting it went, so it should have stopped"
@@ -408,14 +409,14 @@ mod tests {
         }
         assert_eq!(bar.registered_for(WORKSPACE), vec![Kind::FrontAppSwitched]);
 
-        bar.apply(Request::RemoveItem(first));
+        bar.apply(Request::Remove(Selector::Name(first)));
         assert_eq!(
             bar.registered_for(WORKSPACE),
             vec![Kind::FrontAppSwitched],
             "the other item still holds a claim on it"
         );
 
-        bar.apply(Request::RemoveItem(second));
+        bar.apply(Request::Remove(Selector::Name(second)));
         assert!(bar.registered_for(WORKSPACE).is_empty());
         assert!(!bar.running(WORKSPACE));
     }
@@ -450,12 +451,12 @@ mod tests {
 
         // The first item goes. Nothing wants the front application any more,
         // so the source stops observing it — and keeps observing wakes.
-        bar.apply(Request::RemoveItem(front));
+        bar.apply(Request::Remove(Selector::Name(front)));
         assert_eq!(bar.registered_for(WORKSPACE), vec![Kind::SystemWoke]);
         assert!(bar.running(WORKSPACE));
 
         // The second goes too. Nothing wants anything off it, so it stops.
-        bar.apply(Request::RemoveItem(sleep));
+        bar.apply(Request::Remove(Selector::Name(sleep)));
         assert!(bar.registered_for(WORKSPACE).is_empty());
         assert!(!bar.running(WORKSPACE));
     }
@@ -468,13 +469,13 @@ mod tests {
 
         bar.apply(Request::BeginConfig);
         // The new config mentions one of them and not the other.
-        bar.apply(Request::SetItem {
-            name: kept.clone(),
-            patch: Box::new(ItemPatch {
+        bar.apply(Request::Set(
+            Selector::Name(kept.clone()),
+            Box::new(ItemPatch {
                 label: Some("still here".into()),
                 ..patch()
             }),
-        });
+        ));
         bar.apply(Request::EndConfig);
 
         let names: Vec<String> = bar
@@ -519,18 +520,18 @@ mod tests {
         let mut bar = Harness::new();
         let clock = bar.add("clock", Position::Right);
 
-        bar.apply(Request::SetItem {
-            name: clock.clone(),
-            patch: Box::new(ItemPatch {
+        bar.apply(Request::Set(
+            Selector::Name(clock.clone()),
+            Box::new(ItemPatch {
                 label: Some("09:41".into()),
                 ..patch()
             }),
-        });
+        ));
         let items = bar.items();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label.text, "09:41");
 
-        bar.apply(Request::RemoveItem(clock));
+        bar.apply(Request::Remove(Selector::Name(clock)));
         assert!(bar.items().is_empty());
     }
 
@@ -538,11 +539,8 @@ mod tests {
     fn naming_an_item_that_does_not_exist_is_an_error_not_a_panic() {
         let mut bar = Harness::new();
         for request in [
-            Request::SetItem {
-                name: name("ghost"),
-                patch: Box::new(patch()),
-            },
-            Request::RemoveItem(name("ghost")),
+            Request::Set(Selector::Name(name("ghost")), Box::new(patch())),
+            Request::Remove(Selector::Name(name("ghost"))),
             Request::Subscribe {
                 name: name("ghost"),
                 events: vec![Kind::SystemWoke],
@@ -578,13 +576,13 @@ mod tests {
             bar.add(name, Position::Left);
         }
 
-        bar.apply(Request::SetMatching {
-            pattern: r"menu\..*".into(),
-            patch: Box::new(ItemPatch {
+        bar.apply(Request::Set(
+            Selector::Pattern(r"menu\..*".into()),
+            Box::new(ItemPatch {
                 drawing: Some(rsbar_protocol::Toggle::Off),
                 ..Default::default()
             }),
-        });
+        ));
 
         for item in bar.items() {
             let hidden = !item.geometry.drawing;
@@ -604,7 +602,7 @@ mod tests {
             bar.add(name, Position::Left);
         }
 
-        bar.apply(Request::RemoveMatching(r"space\..*".into()));
+        bar.apply(Request::Remove(Selector::Pattern(r"space\..*".into())));
 
         let left: Vec<_> = bar.items().into_iter().map(|item| item.name).collect();
         assert_eq!(left.len(), 1);
@@ -682,13 +680,13 @@ mod tests {
         let mut bar = Harness::new();
 
         let listener = bar.add("listener", Position::Left);
-        bar.apply(Request::SetItem {
-            name: listener,
-            patch: Box::new(ItemPatch {
+        bar.apply(Request::Set(
+            Selector::Name(listener),
+            Box::new(ItemPatch {
                 script: Some("true".into()),
                 ..patch()
             }),
-        });
+        ));
         bar.apply(Request::Subscribe {
             name: name("listener"),
             events: vec![Kind::VolumeChanged],
@@ -703,13 +701,13 @@ mod tests {
 
         // A script, but not subscribed to this event.
         let unrelated = bar.add("unrelated", Position::Left);
-        bar.apply(Request::SetItem {
-            name: unrelated,
-            patch: Box::new(ItemPatch {
+        bar.apply(Request::Set(
+            Selector::Name(unrelated),
+            Box::new(ItemPatch {
                 script: Some("true".into()),
                 ..patch()
             }),
-        });
+        ));
 
         let jobs = bar.jobs_for(&Event::VolumeChanged(VolumeChange { volume: 42 }));
         assert_eq!(jobs.len(), 1);
@@ -724,13 +722,13 @@ mod tests {
         // errored. The two must stay distinguishable.
         let mut bar = Harness::new();
         let item = bar.add("item", Position::Left);
-        bar.apply(Request::SetItem {
-            name: item,
-            patch: Box::new(ItemPatch {
+        bar.apply(Request::Set(
+            Selector::Name(item),
+            Box::new(ItemPatch {
                 click_script: Some("clicked".into()),
                 ..patch()
             }),
-        });
+        ));
         bar.apply(Request::Subscribe {
             name: name("item"),
             events: vec![Kind::VolumeChanged],
@@ -742,13 +740,13 @@ mod tests {
             "a click script must not run on an unrelated event"
         );
 
-        bar.apply(Request::SetItem {
-            name: name("item"),
-            patch: Box::new(ItemPatch {
+        bar.apply(Request::Set(
+            Selector::Name(name("item")),
+            Box::new(ItemPatch {
                 script: Some("updated".into()),
                 ..patch()
             }),
-        });
+        ));
         let jobs = bar.jobs_for(&Event::VolumeChanged(VolumeChange { volume: 1 }));
         assert_eq!(jobs.len(), 1);
         assert_eq!(
@@ -766,13 +764,13 @@ mod tests {
     fn a_job_carries_the_event_that_caused_it() {
         let mut bar = Harness::new();
         let front = bar.add("front", Position::Left);
-        bar.apply(Request::SetItem {
-            name: front,
-            patch: Box::new(ItemPatch {
+        bar.apply(Request::Set(
+            Selector::Name(front),
+            Box::new(ItemPatch {
                 script: Some("true".into()),
                 ..patch()
             }),
-        });
+        ));
         bar.apply(Request::Subscribe {
             name: name("front"),
             events: vec![Kind::FrontAppSwitched],
@@ -790,13 +788,13 @@ mod tests {
     fn subscribing_replaces_rather_than_accumulates() {
         let mut bar = Harness::new();
         let item = bar.add("item", Position::Left);
-        bar.apply(Request::SetItem {
-            name: item,
-            patch: Box::new(ItemPatch {
+        bar.apply(Request::Set(
+            Selector::Name(item),
+            Box::new(ItemPatch {
                 script: Some("true".into()),
                 ..patch()
             }),
-        });
+        ));
 
         bar.apply(Request::Subscribe {
             name: name("item"),
@@ -820,13 +818,13 @@ mod tests {
         let mut bar = Harness::new();
         for name in ["a", "b"] {
             let item = bar.add(name, Position::Left);
-            bar.apply(Request::SetItem {
-                name: item,
-                patch: Box::new(ItemPatch {
+            bar.apply(Request::Set(
+                Selector::Name(item),
+                Box::new(ItemPatch {
                     script: Some("true".into()),
                     ..patch()
                 }),
-            });
+            ));
         }
         bar.add("no-script", Position::Left);
 
@@ -844,13 +842,13 @@ mod tests {
     fn a_trigger_reaches_the_items_subscribed_to_it_by_name() {
         let mut bar = Harness::new();
         let mine = bar.add("mine", Position::Left);
-        bar.apply(Request::SetItem {
-            name: mine,
-            patch: Box::new(ItemPatch {
+        bar.apply(Request::Set(
+            Selector::Name(mine),
+            Box::new(ItemPatch {
                 script: Some("true".into()),
                 ..patch()
             }),
-        });
+        ));
         bar.apply(Request::Subscribe {
             name: name("mine"),
             events: vec![Kind::Custom("my.event".into())],
@@ -897,22 +895,20 @@ mod tests {
 
     fn space(bar: &mut Harness, item: &str) -> ItemName {
         let name = name(item);
-        bar.apply(Request::AddComponent {
+        bar.apply(Request::Add(ComponentKind::Space {
             name: name.clone(),
             position: Position::Left,
-            kind: ComponentKind::Space,
-        });
+        }));
         name
     }
 
     #[test]
     fn re_pushing_a_graphs_current_value_changes_nothing() {
         let mut bar = Harness::new();
-        bar.apply(Request::AddComponent {
+        bar.apply(Request::Add(ComponentKind::Graph {
             name: name("cpu"),
             position: Position::Right,
-            kind: ComponentKind::Graph,
-        });
+        }));
         let cpu = name("cpu");
 
         assert_eq!(bar.push(&cpu, 1.0).response, Response::Ok);

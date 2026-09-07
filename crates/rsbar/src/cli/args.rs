@@ -111,13 +111,18 @@ fn join_path(path: &str, segment: &str) -> String {
 /// top-level call has an empty prefix, a nested `icon.*` group has already
 /// had `icon.` removed from every key. Deserializes as a map/struct: each
 /// distinct first remaining segment is one field.
-struct GroupDeserializer<'de> {
+///
+/// `pub(crate)` so [`super::grammar`]'s own argv deserializer can hand a
+/// domain's trailing `key=value` tokens straight to this, the same way
+/// [`from_pairs`] does, without going through a function that expects to
+/// fully deserialize `T` itself rather than drive a borrowed `Visitor`.
+pub(crate) struct GroupDeserializer<'de> {
     /// Owned so a nested group can be handed down without leaking or
     /// borrowing from a temporary: the strings inside still borrow from the
     /// original `'de` input, only the `Vec` itself is fresh.
-    pairs: Vec<(&'de str, &'de str)>,
+    pub(crate) pairs: Vec<(&'de str, &'de str)>,
     /// The dotted path to this group, for error messages.
-    path: String,
+    pub(crate) path: String,
 }
 
 /// One first-segment group: either a leaf (a single pair whose key equals
@@ -337,6 +342,29 @@ impl<'de> Deserializer<'de> for ScalarDeserializer<'de> {
         visitor.visit_i32(self.parse_num()?)
     }
 
+    // A slider's percentage is a `u8`, and a graph sample an `f32`. Without
+    // these they fell through to `deserialize_any`, which reports that the
+    // shape is unsupported -- a confusing answer to `percentage=60`.
+    fn deserialize_u8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        visitor.visit_u8(self.parse_num()?)
+    }
+
+    fn deserialize_u16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        visitor.visit_u16(self.parse_num()?)
+    }
+
+    fn deserialize_u64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        visitor.visit_u64(self.parse_num()?)
+    }
+
+    fn deserialize_i64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        visitor.visit_i64(self.parse_num()?)
+    }
+
+    fn deserialize_f32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        visitor.visit_f32(self.parse_num()?)
+    }
+
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         visitor.visit_borrowed_str(self.value)
     }
@@ -387,7 +415,7 @@ impl<'de> Deserializer<'de> for ScalarDeserializer<'de> {
     }
 
     serde::forward_to_deserialize_any! {
-        i8 i16 i64 i128 u8 u16 u64 u128 f32 char bytes byte_buf unit
+        i8 i16 i128 u128 char bytes byte_buf unit
         unit_struct tuple tuple_struct map struct identifier ignored_any
     }
 }

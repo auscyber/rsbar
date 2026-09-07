@@ -13,6 +13,7 @@ pub use event::{Event, Kind, Modifiers, MouseButton, PowerSource};
 pub use json::Json;
 pub use style::{Color, FontSpec};
 
+use serde::de::DeserializeSeed;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
@@ -518,6 +519,11 @@ mod parts {
         /// Shifts this half alone, on top of the item's own offset -- how a
         /// config nudges a glyph into line with the text beside it.
         pub y_offset: f64,
+        /// Draw in `highlight_color` rather than `color`. Per half, matching
+        /// `struct text` in `SketchyBar`'s `text.c`: a space item's script
+        /// sets `icon.highlight=$SELECTED`.
+        pub highlight: bool,
+        pub highlight_color: Color,
     }
 
     /// A bare string is sugar for the text, which is how every config writes the
@@ -561,8 +567,7 @@ pub use parts::{Background, BackgroundPatch, Run, RunPatch};
 /// `struct_patch` directly — the derive lives here, so the trait should too.
 pub use struct_patch::Patch;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Query {
     Bar,
     Items,
@@ -579,6 +584,155 @@ pub enum Query {
     Defaults,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidQuery {
+    #[error("`{0}` is not `bar`, `items`, `menu-items`, `app-menus`, `defaults` or an item name")]
+    Unknown(String),
+    /// A real `SketchyBar` query this daemon does not support yet — distinct
+    /// from [`Self::Unknown`] so a config gets told the difference between a
+    /// typo and a thing genuinely not implemented.
+    #[error("`{0}` is a real SketchyBar query rsbar does not support yet: {1}")]
+    Unsupported(String, &'static str),
+    #[error(transparent)]
+    Name(#[from] InvalidName),
+}
+
+/// Through [`FromStr`] rather than a derived enum tag, the same reason
+/// [`Position`] is: `menu-items`/`menu_items`/`default_menu_items` are all
+/// one query, and any other word is an item name, which a derived
+/// externally-tagged enum cannot express as a fallback.
+impl FromStr for Query {
+    type Err = InvalidQuery;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "bar" => Ok(Self::Bar),
+            "items" => Ok(Self::Items),
+            "menu-items" | "menu_items" | "default_menu_items" => Ok(Self::MenuItems),
+            "app-menus" | "app_menus" => Ok(Self::AppMenus),
+            "defaults" => Ok(Self::Defaults),
+            "events" => Err(InvalidQuery::Unsupported(
+                s.to_owned(),
+                "rsbar does not track registered custom events",
+            )),
+            "displays" => Err(InvalidQuery::Unsupported(
+                s.to_owned(),
+                "querying displays is not implemented",
+            )),
+            _ => Ok(Self::Item(ItemName::new(s)?)),
+        }
+    }
+}
+
+impl fmt::Display for Query {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bar => f.write_str("bar"),
+            Self::Items => f.write_str("items"),
+            Self::Item(name) => name.fmt(f),
+            Self::MenuItems => f.write_str("menu_items"),
+            Self::AppMenus => f.write_str("app_menus"),
+            Self::Defaults => f.write_str("defaults"),
+        }
+    }
+}
+
+impl Serialize for Query {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Query {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// `--press <index>` opens one of the frontmost application's own menus;
+/// `--press <name>` opens the real menu behind a mirrored item. Told apart by
+/// shape, not by a tag: an index is never a valid item name in the configs
+/// that use this — it is what a config's own menu-opening helper passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PressTarget {
+    AppMenu(usize),
+    Alias(ItemName),
+}
+
+impl fmt::Display for PressTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AppMenu(index) => index.fmt(f),
+            Self::Alias(name) => name.fmt(f),
+        }
+    }
+}
+
+impl FromStr for PressTarget {
+    type Err = InvalidName;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.parse::<usize>() {
+            Ok(index) => Ok(Self::AppMenu(index)),
+            Err(_) => ItemName::new(s).map(Self::Alias),
+        }
+    }
+}
+
+impl Serialize for PressTarget {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for PressTarget {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Reconstructs an already-known value as if it had just been deserialized.
+///
+/// The CLI's hand-written argv deserializer resolves a couple of leaf values
+/// — an event's [`Kind`], the [`Event`] a `--trigger` builds — through this
+/// crate's own ordinary Rust API (`Kind::from_str`, `Kind::into_event`)
+/// rather than by re-deriving their shape from a token, because their
+/// derived [`Deserialize`] expects a self-describing tag matching the Rust
+/// variant name, not `SketchyBar`'s own spelling (dashes, a missing `d`,
+/// aliases). This hands such a value back through `serde`'s generic
+/// [`DeserializeSeed`] contract via a JSON round trip, so the CLI never has
+/// to re-match the type's variants by name itself.
+///
+/// # Errors
+///
+/// Only if `T`'s `Serialize` and `Deserialize` impls disagree about its
+/// shape.
+pub fn reify<'de, T: Serialize, S: DeserializeSeed<'de>>(
+    value: &T,
+    seed: S,
+) -> Result<S::Value, serde_json::Error> {
+    seed.deserialize(serde_json::to_value(value)?)
+}
+
+impl ComponentKind {
+    /// The name every kind has, and where it goes.
+    ///
+    /// A bracket has no position of its own -- its frame comes from the items
+    /// it names -- so it is filed under the left bucket and takes no space
+    /// there, the same as any other bracket.
+    #[must_use]
+    pub fn placement(&self) -> (&ItemName, Position) {
+        match self {
+            Self::Item { name, position }
+            | Self::Alias { name, position }
+            | Self::Space { name, position }
+            | Self::Graph { name, position }
+            | Self::Slider { name, position } => (name, position.clone()),
+            Self::Bracket { name, .. } => (name, Position::Left),
+        }
+    }
+}
+
 /// `before`/`after` in `--move <item> before|after <reference>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -587,56 +741,69 @@ pub enum Relative {
     After,
 }
 
-/// A component kind `--add` accepts but rsbar cannot yet draw.
+/// What `--add` builds, and its own shape — `SketchyBar`'s own
+/// `TYPE_ITEM`/`TYPE_BRACKET`/`TYPE_ALIAS`/`TYPE_SPACE`/`TYPE_GRAPH`/
+/// `TYPE_SLIDER` in `defines.h`. One [`Request::Add`] variant per kind
+/// rather than a shared shape, because their arguments genuinely differ: a
+/// bracket takes members instead of a position, and nothing on the daemon
+/// side can draw a space, graph or slider yet.
 ///
-/// Modelled rather than rejected at parse time, so a config using one gets a
-/// clear "not implemented" from the daemon instead of never reaching it —
-/// see `TYPE_GRAPH`/`TYPE_SPACE`/`TYPE_SLIDER` in `SketchyBar`'s own
-/// `defines.h`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// `Alias` is spelled out separately from `Item` even though rsbar treats
+/// them identically — the mirror target is set afterward, by a chained
+/// `--set <name> alias=...` — because that is what `--add` itself spells.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentKind {
-    Space,
-    Graph,
-    Slider,
+    Item {
+        name: ItemName,
+        position: Position,
+    },
+    Alias {
+        name: ItemName,
+        position: Position,
+    },
+    /// No position: a bracket's frame comes from its members.
+    Bracket {
+        name: ItemName,
+        members: Vec<Selector>,
+    },
+    Space {
+        name: ItemName,
+        position: Position,
+    },
+    Graph {
+        name: ItemName,
+        position: Position,
+    },
+    Slider {
+        name: ItemName,
+        position: Position,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Request {
+    #[serde(rename = "bar")]
     SetBar(BarPatch),
-    AddItem {
-        name: ItemName,
-        position: Position,
-    },
-    /// `--add space|graph|slider ...`: recognised, but nothing on the daemon
-    /// side can draw one yet.
-    AddComponent {
-        name: ItemName,
-        position: Position,
-        kind: ComponentKind,
-    },
-    SetItem {
-        name: ItemName,
-        /// Boxed: an item patch is a dozen options and dwarfs every other
-        /// variant, so every request would be as big as the largest one.
-        patch: Box<ItemPatch>,
-    },
-    /// `--set /pattern/ ...`: every item the daemon's own live list matches,
-    /// resolved here rather than by the caller — see [`Selector`].
-    SetMatching {
-        pattern: String,
-        patch: Box<ItemPatch>,
-    },
-    RemoveItem(ItemName),
-    /// `--remove /pattern/`, resolved the same way as [`Request::SetMatching`].
-    RemoveMatching(String),
+    Add(ComponentKind),
+    /// `--set <selector> ...`. A [`Selector::Pattern`] is resolved against
+    /// the daemon's own live item list, not by whoever built this request —
+    /// see [`Selector`]'s own doc comment for why only the daemon may.
+    ///
+    /// Boxed: an item patch is a dozen options and dwarfs every other
+    /// variant, so every request would be as big as the largest one.
+    Set(Selector, Box<ItemPatch>),
+    /// `--remove <selector>`, resolved the same way as [`Request::Set`].
+    Remove(Selector),
     /// `--default ...`: properties the daemon copies onto every item added
     /// from here on, the way `SketchyBar`'s own `default_item` does.
     ///
     /// Never expanded into a fully-populated [`ItemPatch`] by a client: only
     /// the fields a `--default` invocation actually named are `Some` here,
-    /// same as [`Request::SetItem`]'s own patch, so the daemon's damage
-    /// tracking still sees only what really changed.
+    /// same as [`Request::Set`]'s own patch, so the daemon's damage tracking
+    /// still sees only what really changed.
+    #[serde(rename = "default")]
     SetDefault(Box<ItemPatch>),
     /// `--move <item> before|after <reference>`.
     Move {
@@ -660,6 +827,7 @@ pub enum Request {
     /// Fires an event now, as if a source had produced it.
     Trigger(Event),
     /// Runs every item's script immediately, ignoring update frequency.
+    #[serde(rename = "update")]
     UpdateAll,
     /// Re-runs the config from scratch, as a file change does.
     Reload,
@@ -674,12 +842,10 @@ pub enum Request {
     /// Sweeps every item untouched since [`Request::BeginConfig`].
     EndConfig,
     Query(Query),
-    /// Opens one of the frontmost application's own menus, by the index
-    /// [`Query::AppMenus`] reported.
-    PressAppMenu(usize),
-    /// Opens the real menu behind a mirrored menu bar item, so a click on an
-    /// alias does what a click on the thing it mirrors would.
-    PressAlias(ItemName),
+    /// `--press <index-or-alias-name>`, told apart by shape — see
+    /// [`PressTarget`].
+    Press(PressTarget),
+    #[serde(rename = "exit")]
     Shutdown,
 }
 
@@ -846,9 +1012,9 @@ mod tests {
 
     #[test]
     fn requests_round_trip_through_postcard() {
-        let request = Request::SetItem {
-            name: ItemName::new("clock").unwrap(),
-            patch: Box::new(ItemPatch {
+        let request = Request::Set(
+            Selector::Name(ItemName::new("clock").unwrap()),
+            Box::new(ItemPatch {
                 label: Some(RunPatch {
                     text: Some("09:41".into()),
                     color: Some(Color(0xffff_ffff)),
@@ -856,7 +1022,7 @@ mod tests {
                 }),
                 ..Default::default()
             }),
-        };
+        );
         let bytes = postcard::to_allocvec(&request).unwrap();
         assert_eq!(postcard::from_bytes::<Request>(&bytes).unwrap(), request);
     }
@@ -870,18 +1036,22 @@ mod tests {
         // sake, so every one needs both halves checked against the real wire
         // format rather than against JSON, which forgives the mismatch.
         let requests = [
-            Request::AddItem {
+            Request::Add(ComponentKind::Item {
                 name: ItemName::new("clock").unwrap(),
                 position: Position::CenterLeft,
-            },
+            }),
+            Request::Add(ComponentKind::Bracket {
+                name: ItemName::new("group").unwrap(),
+                members: vec![Selector::Pattern(r"menu\..*".into())],
+            }),
             Request::SetBar(BarPatch {
                 edge: Some(Edge::Bottom),
                 color: Some(Color(0xff00_ff00)),
                 ..Default::default()
             }),
-            Request::SetItem {
-                name: ItemName::new("clock").unwrap(),
-                patch: Box::new(ItemPatch {
+            Request::Set(
+                Selector::Name(ItemName::new("clock").unwrap()),
+                Box::new(ItemPatch {
                     position: Some(Position::Right),
                     icon: Some(RunPatch {
                         font: Some(FontSpec::parse("Menlo:Bold:15")),
@@ -889,7 +1059,14 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
-            },
+            ),
+            Request::Remove(Selector::Pattern(r"clock.*".into())),
+            Request::Query(Query::Item(ItemName::new("clock").unwrap())),
+            Request::Query(Query::MenuItems),
+            Request::Press(PressTarget::AppMenu(0)),
+            Request::Press(PressTarget::Alias(
+                ItemName::new("Amphetamine,Amphetamine").unwrap(),
+            )),
         ];
         for request in requests {
             let bytes = postcard::to_allocvec(&request).unwrap();

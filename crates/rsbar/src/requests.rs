@@ -22,7 +22,7 @@ use bevy_ecs::query::QueryData;
 use bevy_ecs::system::SystemParam;
 use rsbar_protocol::{
     BackgroundPatch, ComponentKind, Event, ItemName, ItemPatch, ItemState, Kind, Patch, Position,
-    Query as ProtocolQuery, Relative, Request, Response, RunPatch, Selector,
+    PressTarget, Query as ProtocolQuery, Relative, Request, Response, RunPatch, Selector,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -57,6 +57,8 @@ pub struct ItemWrite {
     pub alias: Option<&'static AliasSpec>,
     pub members: Option<&'static Members>,
     pub popup: Option<&'static PopupConfig>,
+    pub slider: Option<&'static mut Slider>,
+    pub associated_space: Option<&'static mut AssociatedSpace>,
 }
 
 /// Every component a query or a dispatch reads.
@@ -647,7 +649,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             }
         }
 
-        Request::AddItem { name, position } => {
+        Request::Add(ComponentKind::Item { name, position }) => {
             tracing::debug!(%name, ?position, "add item");
             if let Some(entity) = items.index.get(&name) {
                 // Re-adding an item that exists moves it rather than replacing
@@ -680,12 +682,10 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             Outcome::ok()
         }
 
-        Request::AddComponent {
-            name,
-            position,
-            kind,
-        } => {
-            tracing::debug!(%name, ?position, ?kind, "add component");
+        Request::Add(kind) => {
+            let (name, position) = kind.placement();
+            let (name, position) = (name.clone(), position);
+            tracing::debug!(%name, ?position, ?kind, "add");
             if let Some(entity) = items.index.get(&name) {
                 // Same re-add-moves-it semantics as `AddItem`: entity identity
                 // survives, so a reload only touches what actually changed.
@@ -703,15 +703,28 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             // subscribe to: they are driven by `--push`/a percentage set, not
             // an event.
             let watch: Vec<Kind> = match kind {
-                ComponentKind::Space => {
+                ComponentKind::Item { .. } | ComponentKind::Alias { .. } => Vec::new(),
+                ComponentKind::Bracket { members, .. } => {
+                    spawned.insert(Members(
+                        members
+                            .iter()
+                            .filter_map(|m| match m {
+                                Selector::Name(name) => Some(name.clone()),
+                                Selector::Pattern(_) => None,
+                            })
+                            .collect(),
+                    ));
+                    Vec::new()
+                }
+                ComponentKind::Space { .. } => {
                     spawned.insert((AssociatedSpace::default(), Selected::default()));
                     vec![Kind::SpaceChanged]
                 }
-                ComponentKind::Graph => {
+                ComponentKind::Graph { .. } => {
                     spawned.insert(Graph::new(DEFAULT_GRAPH_SAMPLES));
                     Vec::new()
                 }
-                ComponentKind::Slider => {
+                ComponentKind::Slider { .. } => {
                     spawned.insert(Slider::new(DEFAULT_SLIDER_WIDTH));
                     Vec::new()
                 }
@@ -735,7 +748,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             Outcome::ok()
         }
 
-        Request::SetItem { name, patch } => {
+        Request::Set(Selector::Name(name), patch) => {
             tracing::trace!(%name, ?patch, "set item");
             let Some(entity) = items.index.get(&name) else {
                 return no_such(&name);
@@ -758,7 +771,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             Outcome::ok()
         }
 
-        Request::RemoveItem(name) => {
+        Request::Remove(Selector::Name(name)) => {
             tracing::debug!(%name, "remove item");
             let Some(entity) = items.index.remove(&name) else {
                 return no_such(&name);
@@ -772,7 +785,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             Outcome::ok()
         }
 
-        Request::SetMatching { pattern, patch } => {
+        Request::Set(Selector::Pattern(pattern), patch) => {
             let matched = match matching(&pattern, items) {
                 Ok(matched) => matched,
                 Err(err) => return Outcome::error(err.to_string()),
@@ -788,7 +801,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             Outcome::ok()
         }
 
-        Request::RemoveMatching(pattern) => {
+        Request::Remove(Selector::Pattern(pattern)) => {
             let matched = match matching(&pattern, items) {
                 Ok(matched) => matched,
                 Err(err) => return Outcome::error(err.to_string()),
@@ -939,12 +952,12 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             Outcome::answer(Response::Defaults(Box::new(defaults.0.clone())))
         }
 
-        Request::PressAppMenu(index) => match crate::menus::press(index) {
+        Request::Press(PressTarget::AppMenu(index)) => match crate::menus::press(index) {
             Ok(()) => Outcome::ok(),
             Err(err) => Outcome::error(err.to_string()),
         },
 
-        Request::PressAlias(name) => {
+        Request::Press(PressTarget::Alias(name)) => {
             // The item's own `alias` is what names the thing to press, not the
             // item's name: the two are usually equal, but a config is free to
             // call a mirrored item anything it likes.
@@ -1108,6 +1121,22 @@ fn set_item(
         // A changed frequency restarts the clock, so setting it twice does not
         // fire early on the second set.
         routine.elapsed = 0;
+    }
+    // Kind-specific properties, written only where they differ so a script
+    // re-setting one to what it already is repaints nothing.
+    if let Some(percentage) = patch.percentage
+        && let Some(mut slider) = row.slider.as_mut()
+    {
+        let next = Slider {
+            percentage: percentage.min(100),
+            ..slider.clone()
+        };
+        slider.set_if_neq(next);
+    }
+    if let Some(space) = patch.associated_space
+        && let Some(mut current) = row.associated_space.as_mut()
+    {
+        current.set_if_neq(AssociatedSpace(space));
     }
     if let Some(popup) = &patch.popup {
         apply_popup(entity, row.popup, popup, commands);
@@ -1313,11 +1342,10 @@ mod component_tests {
         // item is created (`bar_item_set_type` in `bar_item.c`) -- a config
         // never has to `--subscribe` it itself.
         let mut bar = Harness::new();
-        let outcome = bar.apply(Request::AddComponent {
+        let outcome = bar.apply(Request::Add(ComponentKind::Space {
             name: name("space.1"),
             position: Position::Left,
-            kind: ComponentKind::Space,
-        });
+        }));
         assert_eq!(outcome.response, Response::Ok);
         assert_eq!(bar.order(), ["space.1"]);
         assert!(
@@ -1336,15 +1364,18 @@ mod component_tests {
         // Neither is driven by an event: a graph is driven by `--push`, a
         // slider by a percentage set. Nothing here should start a source.
         let mut bar = Harness::new();
-        for (item, kind) in [
-            ("cpu", ComponentKind::Graph),
-            ("volume_options", ComponentKind::Slider),
-        ] {
-            let outcome = bar.apply(Request::AddComponent {
-                name: name(item),
-                position: Position::Right,
-                kind,
-            });
+        for (item, kind) in [("cpu", "graph"), ("volume_options", "slider")] {
+            let kind = match kind {
+                "graph" => ComponentKind::Graph {
+                    name: name(item),
+                    position: Position::Right,
+                },
+                _ => ComponentKind::Slider {
+                    name: name(item),
+                    position: Position::Right,
+                },
+            };
+            let outcome = bar.apply(Request::Add(kind));
             assert_eq!(outcome.response, Response::Ok);
         }
         assert_eq!(bar.order(), ["cpu", "volume_options"]);
@@ -1355,16 +1386,14 @@ mod component_tests {
     fn re_adding_a_component_by_name_moves_it_rather_than_duplicating_it() {
         // Same identity-survives-a-reload contract `AddItem` already has.
         let mut bar = Harness::new();
-        bar.apply(Request::AddComponent {
+        bar.apply(Request::Add(ComponentKind::Graph {
             name: name("cpu"),
             position: Position::Left,
-            kind: ComponentKind::Graph,
-        });
-        bar.apply(Request::AddComponent {
+        }));
+        bar.apply(Request::Add(ComponentKind::Graph {
             name: name("cpu"),
             position: Position::Right,
-            kind: ComponentKind::Graph,
-        });
+        }));
 
         let items = bar.items();
         assert_eq!(items.len(), 1, "the same name is the same item");

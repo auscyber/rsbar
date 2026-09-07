@@ -73,8 +73,11 @@ impl Default for Settings {
             blur_radius: 0,
             hidden: false,
             topmost: false,
-            padding_left: 0.0,
-            padding_right: 0.0,
+            // `SketchyBar`'s own defaults (`bar_manager_init`), not zero:
+            // a config that sets neither expects its items inset from the
+            // screen edges, and the reference bar visibly is.
+            padding_left: 20.0,
+            padding_right: 20.0,
             display: DisplayTarget::All,
             sticky: true,
             show_in_fullscreen: true,
