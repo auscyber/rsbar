@@ -39,19 +39,42 @@ pub struct Font {
     font: CFRetained<CTFont>,
 }
 
+// Fonts already looked up, by family, style and size.
+//
+// Thread local rather than shared: a `CTFont` is `!Send`, and shaping happens
+// on whichever thread is doing it — one cache each is correct and needs no
+// lock. A bar uses a handful of specs, so this stops growing almost at once.
+thread_local! {
+    static RESOLVED: std::cell::RefCell<
+        std::collections::HashMap<(String, String, u64), CFRetained<CTFont>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 impl Font {
     /// Resolves a spec. Falls back to the system font at the requested size if
     /// the family is not installed — a missing font should cost the user a
     /// wrong typeface, not an empty bar.
     #[must_use]
     pub fn resolve(spec: &FontSpec) -> Self {
-        let name = if spec.style.is_empty() {
-            spec.family.clone()
-        } else {
-            format!("{}-{}", spec.family, spec.style)
-        };
-        let font =
-            Self::create(&name, &spec.family, spec.size).unwrap_or_else(|| Self::system(spec.size));
+        // Resolving is a font lookup — a descriptor, a font, and a family name
+        // read back to check `CoreText` did not substitute silently. That was
+        // being paid per item per reshape, twice, for the same three specs a
+        // bar uses, and measured at about a third of the cost of shaping.
+        let key = (spec.family.clone(), spec.style.clone(), spec.size.to_bits());
+        let font = RESOLVED.with_borrow_mut(|resolved| {
+            if let Some(font) = resolved.get(&key) {
+                return font.clone();
+            }
+            let name = if spec.style.is_empty() {
+                spec.family.clone()
+            } else {
+                format!("{}-{}", spec.family, spec.style)
+            };
+            let font = Self::create(&name, &spec.family, spec.size)
+                .unwrap_or_else(|| Self::system(spec.size));
+            resolved.insert(key, font.clone());
+            font
+        });
         Self {
             spec: spec.clone(),
             font,

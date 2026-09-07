@@ -24,7 +24,8 @@ pub struct Shaped {
 }
 
 impl Shaped {
-    fn new(icon: &Run, label: &Run) -> Self {
+    #[must_use]
+    pub fn new(icon: &Run, label: &Run) -> Self {
         Self {
             icon: Text::new(icon.string.clone(), Font::resolve(&icon.font)),
             label: Text::new(label.string.clone(), Font::resolve(&label.font)),
