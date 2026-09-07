@@ -483,9 +483,10 @@ pub fn apply_defaults(
     defaults: Res<Defaults>,
     fresh: Query<Entity, With<NeedsDefaults>>,
 ) {
+    let known: Vec<ItemName> = items.index.names().cloned().collect();
     for entity in &fresh {
         if let Ok(mut row) = items.write.get_mut(entity) {
-            set_item(entity, &mut row, &defaults.0, &mut items.commands);
+            set_item(entity, &mut row, &defaults.0, &known, &mut items.commands);
         }
         items.commands.entity(entity).remove::<NeedsDefaults>();
     }
@@ -749,6 +750,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
         }
 
         Request::Set(Selector::Name(name), patch) => {
+            let known: Vec<ItemName> = items.index.names().cloned().collect();
             tracing::trace!(%name, ?patch, "set item");
             let Some(entity) = items.index.get(&name) else {
                 return no_such(&name);
@@ -758,7 +760,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             };
             let wants_clicks = patch.click_script.as_ref().is_some_and(|s| !s.is_empty());
             let subscribed = wants_clicks.then(|| row.subscriptions.0.clone());
-            set_item(entity, &mut row, &patch, &mut items.commands);
+            set_item(entity, &mut row, &patch, &known, &mut items.commands);
             // Touching an item during a reload is what keeps it: a config that
             // only sets an existing item, without re-adding it, must not have
             // it swept up as stale.
@@ -791,11 +793,12 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
                 Err(err) => return Outcome::error(err.to_string()),
             };
             tracing::debug!(pattern, matched = matched.len(), "set matching");
+            let known: Vec<ItemName> = items.index.names().cloned().collect();
             for entity in matched {
                 let Ok(mut row) = items.write.get_mut(entity) else {
                     continue;
                 };
-                set_item(entity, &mut row, &patch, &mut items.commands);
+                set_item(entity, &mut row, &patch, &known, &mut items.commands);
                 items.commands.entity(entity).remove::<Stale>();
             }
             Outcome::ok()
@@ -1056,6 +1059,7 @@ fn set_item(
     entity: Entity,
     row: &mut ItemWriteItem<'_, '_>,
     patch: &ItemPatch,
+    known: &[ItemName],
     commands: &mut Commands,
 ) {
     let (icon, label, background, padding, offset, placement, drawing, routine) = (
@@ -1140,7 +1144,7 @@ fn set_item(
     if let Some(popup) = &patch.popup {
         apply_popup(entity, row.popup, popup, commands);
     }
-    set_item_components(entity, row, patch, commands);
+    set_item_components(entity, patch, known, commands);
 }
 
 /// The half of a patch that adds or removes whole components rather than
@@ -1148,11 +1152,10 @@ fn set_item(
 /// readable in one function.
 fn set_item_components(
     entity: Entity,
-    row: &mut ItemWriteItem<'_, '_>,
     patch: &ItemPatch,
+    known: &[ItemName],
     commands: &mut Commands,
 ) {
-    let _ = row;
     if let Some(script) = &patch.script {
         if script.is_empty() {
             commands.entity(entity).remove::<Script>();
@@ -1172,21 +1175,26 @@ fn set_item_components(
         }
     }
     if let Some(members) = &patch.members {
-        // A member named by pattern would have to be re-resolved against the
-        // live item list on every change to it, not just when the bracket
-        // itself is set — nothing here does that yet, so a pattern is
-        // reported and dropped rather than silently matching nothing forever.
+        // A pattern is resolved against the items that exist now, which is
+        // what a config means by it: `sbar.add("bracket", { "/menu\\..*/" })`
+        // comes after the items it names. An item added later does not join
+        // the bracket -- SketchyBar's own `--add bracket` is likewise a
+        // one-time membership, not a standing query.
         let names: Vec<ItemName> = members
             .iter()
-            .filter_map(|selector| match selector {
-                Selector::Name(name) => Some(name.clone()),
-                Selector::Pattern(pattern) => {
-                    tracing::warn!(
-                        pattern,
-                        "bracket membership by pattern is not implemented yet; ignoring"
-                    );
-                    None
-                }
+            .flat_map(|selector| match selector {
+                Selector::Name(name) => vec![name.clone()],
+                Selector::Pattern(pattern) => match regex::Regex::new(pattern) {
+                    Ok(regex) => known
+                        .iter()
+                        .filter(|name| regex.is_match(name.as_str()))
+                        .cloned()
+                        .collect(),
+                    Err(err) => {
+                        tracing::warn!(pattern, %err, "a bracket's member pattern is not a regex");
+                        Vec::new()
+                    }
+                },
             })
             .collect();
         if names.is_empty() {

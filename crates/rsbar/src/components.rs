@@ -504,6 +504,12 @@ impl Index {
         self.names.remove(name)
     }
 
+    /// Every item's name, for anything that has to resolve a pattern against
+    /// what exists.
+    pub fn names(&self) -> impl Iterator<Item = &ItemName> {
+        self.names.keys()
+    }
+
     /// The next place in the bar, for an item being added now.
     pub fn next_order(&mut self) -> Order {
         let order = Order(self.next_order);

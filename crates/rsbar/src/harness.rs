@@ -567,6 +567,35 @@ mod tests {
     }
 
     #[test]
+    fn a_bracket_takes_the_items_its_pattern_names() {
+        // ~/dendritic/sketchybar/items/menus.lua:
+        // sbar.add("bracket", { "/menu\\..*/" }, { ... })
+        let mut bar = Harness::new();
+        for name in ["menu.1", "menu.2", "clock"] {
+            bar.add(name, Position::Left);
+        }
+        let group = bar.add("group", Position::Left);
+
+        bar.apply(Request::Set(
+            Selector::Name(group.clone()),
+            Box::new(ItemPatch {
+                members: Some(vec![Selector::Pattern(r"menu\..*".into())]),
+                ..Default::default()
+            }),
+        ));
+
+        let members: Vec<String> = bar
+            .items()
+            .into_iter()
+            .find(|item| item.name == group)
+            .map(|item| item.members.iter().map(ToString::to_string).collect())
+            .unwrap();
+        let mut members = members;
+        members.sort();
+        assert_eq!(members, ["menu.1", "menu.2"]);
+    }
+
+    #[test]
     fn a_pattern_selects_by_name_and_leaves_everything_else_alone() {
         // What the real config does constantly: sbar.set("/menu\\..*/", ...).
         // Resolved against the daemon's own live list, because a client
