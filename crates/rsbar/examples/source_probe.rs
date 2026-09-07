@@ -11,7 +11,19 @@
 //! cargo run -p rsbar --example source_probe -- space_changed
 //! cargo run -p rsbar --example source_probe -- space_windows_changed
 //! cargo run -p rsbar --example source_probe -- media_changed
+//! RUST_LOG=rsbar=info cargo run -p rsbar --example source_probe -- power_source_changed
 //! ```
+//!
+//! `power_source_changed` needs `RUST_LOG=rsbar=info` to show anything: the
+//! event itself only carries `power_source` today (task #16 asks
+//! `rsbar-protocol` to widen it with charge, time remaining and adapter
+//! wattage), so `power.rs` additionally logs the full snapshot it computed —
+//! including the fields not on the wire yet — at `info` on every real change.
+//! Unplug and replug the charger while this runs to see both: the real
+//! `[power] PowerSourceChanged` event (fires only on an AC/battery flip) and
+//! the `power snapshot changed` log line (fires on that and on every
+//! battery-percent/wattage move `IOKit` reports, deduplicated against the
+//! last snapshot so an unchanged reading logs nothing).
 //!
 //! `brightness_changed` and `space_changed` additionally trigger the real
 //! event themselves a couple of seconds in, rather than waiting on a human:
@@ -59,6 +71,7 @@ fn parse_kind(name: &str) -> Option<Kind> {
         "space_changed" => Kind::SpaceChanged,
         "space_windows_changed" => Kind::SpaceWindowsChanged,
         "media_changed" => Kind::MediaChanged,
+        "power_source_changed" => Kind::PowerSourceChanged,
         other => {
             eprintln!("unknown kind: {other}");
             return None;
@@ -163,7 +176,7 @@ fn main() {
     let arg = std::env::args().nth(1).unwrap_or_default();
     let Some(kind) = parse_kind(&arg) else {
         eprintln!(
-            "usage: source_probe <brightness_changed|wifi_changed|space_changed|space_windows_changed|media_changed>"
+            "usage: source_probe <brightness_changed|wifi_changed|space_changed|space_windows_changed|media_changed|power_source_changed>"
         );
         std::process::exit(1);
     };
@@ -206,11 +219,24 @@ fn main() {
     match kind {
         Kind::BrightnessChanged => trigger_brightness(),
         Kind::SpaceChanged => trigger_space_switch(),
+        Kind::PowerSourceChanged => {
+            println!(
+                "[trigger] no synthetic power event exists -- unplug/replug the charger now to \
+                 exercise this live; set RUST_LOG=rsbar=info to see the full snapshot (charge, \
+                 watts, time remaining) that power.rs computed but cannot put on the wire yet"
+            );
+        }
         _ => {}
     }
 
-    println!("watching {kind} for 20s (Ctrl-C to stop early)...");
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    // PROBE_SECS overrides the watch window -- the default is plenty for a
+    // synthetic trigger, but a human unplugging a charger needs longer.
+    let secs = std::env::var("PROBE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    println!("watching {kind} for {secs}s (Ctrl-C to stop early)...");
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
     while std::time::Instant::now() < deadline {
         // SAFETY: matches the daemon's own runner in `ecs::run`.
         let woke = unsafe {
@@ -240,6 +266,7 @@ fn source_id_for(kind: &Kind) -> &'static str {
         Kind::WifiChanged => "wifi",
         Kind::SpaceChanged | Kind::SpaceWindowsChanged => "spaces",
         Kind::MediaChanged => "media",
+        Kind::PowerSourceChanged => "power",
         _ => "?",
     }
 }

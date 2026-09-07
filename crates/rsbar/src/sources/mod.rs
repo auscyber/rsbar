@@ -502,6 +502,9 @@ impl Payload for Emitter {}
 impl sealed::Sealed for spaces::Sink {}
 impl Payload for spaces::Sink {}
 
+impl sealed::Sealed for power::State {}
+impl Payload for power::State {}
+
 impl<T: Payload> CallbackState<T> {
     pub fn new(value: T) -> Self {
         Self(std::sync::Arc::new(value))
