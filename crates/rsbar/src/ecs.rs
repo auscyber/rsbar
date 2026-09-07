@@ -33,7 +33,8 @@
 
 use crate::bar::{Panels, Settings};
 use crate::components::{
-    AliasContent, AliasSpec, Icon, Index, Item, ItemHandle, Label, Name, Routine, Script, Stale,
+    AliasContent, AliasSpec, ClickScript, Icon, Index, Item, ItemHandle, Label, Name, Routine,
+    Script, Stale,
 };
 use crate::config::Shared as SharedConfig;
 use crate::layout::{self, ForceRepaint, Hit, Placements};
@@ -493,6 +494,7 @@ fn route_pointer(
     mut events: MessageReader<EventMessage>,
     placements: Res<Placements>,
     read: ItemsRead,
+    mirrors: Query<(Option<&AliasSpec>, Option<&ClickScript>)>,
     mut subscribers: NonSendMut<crate::subscribers::Subscribers>,
     mut queue: ResMut<Queue>,
 ) {
@@ -502,6 +504,9 @@ fn route_pointer(
         };
         match placements.hit(objc2_core_foundation::CGPoint::new(x, y)) {
             Hit::Item { entity, .. } => {
+                if matches!(**event, Event::MouseClicked(_)) {
+                    press_mirrored(entity, &mirrors);
+                }
                 if !subscribers.push(entity, event) {
                     queue.0.extend(read.jobs_for_item(entity, event));
                 }
@@ -510,6 +515,22 @@ fn route_pointer(
             // exactly this, and are matched the ordinary way.
             Hit::Bar { .. } | Hit::Nothing => {}
         }
+    }
+}
+
+/// Opens the real menu behind a clicked alias.
+///
+/// An alias is a picture of someone else's menu bar item, so clicking one and
+/// having nothing happen is the obvious wrong behaviour. A config that set its
+/// own `click_script` means something more specific by the click than "do what
+/// the real one does", so that wins and this stays out of the way.
+fn press_mirrored(entity: Entity, mirrors: &Query<(Option<&AliasSpec>, Option<&ClickScript>)>) {
+    let Ok((Some(alias), None)) = mirrors.get(entity) else {
+        return;
+    };
+    let (owner, name) = alias.0.split_once(',').unwrap_or((&alias.0, &alias.0));
+    if let Err(err) = crate::alias::press_item(owner, name) {
+        tracing::warn!(spec = %alias.0, %err, "could not press the mirrored item");
     }
 }
 
