@@ -11,6 +11,7 @@ use crate::shaping::Cache;
 use bevy_ecs::prelude::*;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use rsbar_protocol::Position;
+use std::collections::{HashMap, HashSet};
 
 /// Everything laying out one item needs.
 pub type ItemQuery<'w, 's> = Query<
@@ -225,24 +226,107 @@ fn contains(rect: CGRect, point: CGPoint) -> bool {
 /// Runs only when something changed — see [`needs_repaint`].
 pub fn repaint(
     items: ItemQuery,
+    dirty: DirtyItems,
     cache: NonSend<Cache>,
     panels: NonSend<Panels>,
     settings: Res<Settings>,
+    force: Res<ForceRepaint>,
     mut placements: ResMut<Placements>,
 ) {
-    placements.0.clear();
+    // Taken, not cleared: where every item was last time is what says which
+    // pixels an item that has moved left behind.
+    let previous = std::mem::take(&mut placements.0);
     if settings.hidden {
         return;
     }
 
-    // One window server update for every panel, not one per panel. Each
-    // `draw` publishes its window as it finishes, so without this a second
-    // display shows the previous frame until its own turn comes round — and
-    // every panel erases to the background before its items go back down,
-    // which is a flash of empty bar if that lands on screen by itself.
-    skylight::batched(|| {
-        paint_panels(&items, &cache, &panels, &settings, &mut placements);
-    });
+    // A bar-wide change moves everything, so working out what moved is wasted
+    // effort — and a forced repaint is by definition one nothing tracked.
+    let redraw_everything = force.0 || settings.is_changed();
+    let changed: HashSet<Entity> = dirty.iter().collect();
+
+    // Deliberately not wrapped in `skylight::batched`. `SLSDisableUpdate`
+    // suspends compositing for the whole display, and holding it across work
+    // this open-ended — a draw per panel, per repaint, forever — is how a bar
+    // freezes the desktop rather than just itself. `SketchyBar` stopped
+    // calling it altogether on macOS 26, and even before that only ever held
+    // it across window *geometry* changes, never across drawing.
+    //
+    // Nothing needs it here any more: a partial repaint no longer erases the
+    // panel before putting the items back, so there is no half-drawn state
+    // that batching was hiding.
+    paint_panels(
+        &items,
+        &cache,
+        &panels,
+        &settings,
+        &Repaint {
+            previous: &previous,
+            changed: &changed,
+            everything: redraw_everything,
+        },
+        &mut placements,
+    );
+}
+
+/// What the last pass left on screen, and what has moved since.
+struct Repaint<'a> {
+    previous: &'a [PanelPlacements],
+    changed: &'a HashSet<Entity>,
+    everything: bool,
+}
+
+/// The rects of one panel that may look different this pass.
+///
+/// `None` means the whole panel: either something bar-wide changed, or this
+/// panel was not on screen last time and there is no before to compare with.
+fn damage(
+    panel: &Repaint,
+    display: u32,
+    frame: CGRect,
+    placed: &[(Entity, CGRect)],
+) -> Option<Vec<CGRect>> {
+    if panel.everything {
+        return None;
+    }
+    let before = panel.previous.iter().find(|p| p.display == display)?;
+    // A panel that moved or resized invalidates every position in it.
+    if before.frame != frame {
+        return None;
+    }
+
+    let was: HashMap<Entity, CGRect> = before.items.iter().copied().collect();
+    let mut rects = Vec::new();
+    for (entity, now) in placed {
+        match was.get(entity) {
+            // New here: only where it landed needs painting.
+            None => rects.push(*now),
+            // Moved or resized. Both ends: one to erase, one to draw. This is
+            // also what catches an item shifted along by a *neighbour* growing,
+            // which no amount of change detection on the item itself would.
+            Some(before) if before != now => {
+                rects.push(*before);
+                rects.push(*now);
+            }
+            // Sitting still, but repainted itself.
+            Some(_) if panel.changed.contains(entity) => rects.push(*now),
+            Some(_) => {}
+        }
+    }
+    // Gone: what it used to cover goes back to bar.
+    for (entity, before) in &before.items {
+        if !placed.iter().any(|(here, _)| here == entity) {
+            rects.push(*before);
+        }
+    }
+    Some(rects)
+}
+
+fn intersects(a: CGRect, b: CGRect) -> bool {
+    a.origin.x < b.origin.x + b.size.width
+        && b.origin.x < a.origin.x + a.size.width
+        && a.origin.y < b.origin.y + b.size.height
+        && b.origin.y < a.origin.y + a.size.height
 }
 
 fn paint_panels(
@@ -250,19 +334,29 @@ fn paint_panels(
     cache: &Cache,
     panels: &Panels,
     settings: &Settings,
+    pass: &Repaint,
     placements: &mut Placements,
 ) {
     for panel in panels.iter() {
         let size = panel.frame.size;
         // Layout depends on the panel's width, so it is per display.
         let placed = place(items, cache, size);
+        let torn = damage(pass, panel.display.id, panel.frame, &placed);
         placements.0.push(PanelPlacements {
             display: panel.display.id,
             frame: panel.frame,
             items: placed.clone(),
         });
 
-        skylight::draw(panel.window.id(), size, |ctx| {
+        // Nothing on this display looks different. The common case on a
+        // multi-display bar, where one panel's clock ticks and the rest do not.
+        if torn.as_ref().is_some_and(Vec::is_empty) {
+            continue;
+        }
+
+        let total = placed.len();
+        let mut drawn = 0usize;
+        skylight::draw_damaged(panel.window.id(), size, torn.as_deref(), |ctx| {
             fill_rounded_rect(
                 ctx,
                 CGRect::new(CGPoint::new(0.0, 0.0), size),
@@ -271,6 +365,14 @@ fn paint_panels(
             );
 
             for (entity, frame) in placed {
+                // Everything overlapping the damage, not only what changed: the
+                // damaged pixels were cleared, so an untouched item sitting in
+                // them has to go back down too.
+                if let Some(torn) = &torn
+                    && !torn.iter().any(|rect| intersects(*rect, frame))
+                {
+                    continue;
+                }
                 let Ok((_, icon, label, background, padding, offset, _, _)) = items.get(entity)
                 else {
                     continue;
@@ -278,6 +380,7 @@ fn paint_panels(
                 let Some(shaped) = cache.get(entity) else {
                     continue;
                 };
+                drawn += 1;
 
                 if !background.color.is_invisible() {
                     fill_rounded_rect(ctx, frame, background.corner_radius, background.color);
@@ -298,6 +401,15 @@ fn paint_panels(
                 }
             }
         });
+
+        tracing::debug!(
+            display = panel.display.id,
+            whole = torn.is_none(),
+            rects = torn.as_ref().map_or(0, Vec::len),
+            drawn,
+            total,
+            "repainted"
+        );
     }
 }
 
@@ -308,6 +420,24 @@ type AnythingVisibleChanged<'w, 's> = Query<
     'w,
     's,
     (),
+    Or<(
+        Changed<Icon>,
+        Changed<Label>,
+        Changed<Background>,
+        Changed<Padding>,
+        Changed<Offset>,
+        Changed<Placement>,
+        Changed<Drawing>,
+    )>,
+>;
+
+/// The items that changed since the last repaint, as opposed to whether any
+/// did. Same components as [`AnythingVisibleChanged`], because a change that
+/// forces a repaint and a change that damages a rect are the same change.
+pub type DirtyItems<'w, 's> = Query<
+    'w,
+    's,
+    Entity,
     Or<(
         Changed<Icon>,
         Changed<Label>,
@@ -534,5 +664,188 @@ mod hit_tests {
             Placements::default().hit(CGPoint::new(0.0, 0.0)),
             Hit::Nothing
         );
+    }
+}
+
+#[cfg(test)]
+mod damage_tests {
+    use super::{PanelPlacements, Repaint, damage, intersects};
+    use bevy_ecs::entity::Entity;
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+    use std::collections::HashSet;
+
+    const DISPLAY: u32 = 1;
+
+    fn entity(index: u32) -> Entity {
+        Entity::from_raw_u32(index).expect("a valid entity index")
+    }
+
+    fn rect(x: f64, width: f64) -> CGRect {
+        CGRect::new(CGPoint::new(x, 0.0), CGSize::new(width, 32.0))
+    }
+
+    fn panel() -> CGRect {
+        CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1000.0, 32.0))
+    }
+
+    fn was(items: Vec<(Entity, CGRect)>) -> Vec<PanelPlacements> {
+        vec![PanelPlacements {
+            display: DISPLAY,
+            frame: panel(),
+            items,
+        }]
+    }
+
+    fn pass<'a>(previous: &'a [PanelPlacements], changed: &'a HashSet<Entity>) -> Repaint<'a> {
+        Repaint {
+            previous,
+            changed,
+            everything: false,
+        }
+    }
+
+    #[test]
+    fn a_pass_where_nothing_moved_damages_nothing() {
+        let before = was(vec![(entity(1), rect(0.0, 100.0))]);
+        let nothing = HashSet::new();
+        let torn = damage(
+            &pass(&before, &nothing),
+            DISPLAY,
+            panel(),
+            &[(entity(1), rect(0.0, 100.0))],
+        );
+        assert_eq!(torn, Some(Vec::new()), "no rect should be repainted");
+    }
+
+    #[test]
+    fn an_item_repainting_in_place_damages_only_itself() {
+        let before = was(vec![
+            (entity(1), rect(0.0, 100.0)),
+            (entity(2), rect(100.0, 50.0)),
+        ]);
+        let changed = HashSet::from([entity(2)]);
+        let torn = damage(
+            &pass(&before, &changed),
+            DISPLAY,
+            panel(),
+            &[
+                (entity(1), rect(0.0, 100.0)),
+                (entity(2), rect(100.0, 50.0)),
+            ],
+        );
+        assert_eq!(torn, Some(vec![rect(100.0, 50.0)]));
+    }
+
+    #[test]
+    fn an_item_shifted_by_its_neighbour_growing_is_damaged_at_both_ends() {
+        // The one that earns this. Change detection says only the first item
+        // changed, but the second one moved because of it — damaging only what
+        // Bevy called changed would leave the second drawn at its old x as
+        // well as its new one.
+        let before = was(vec![
+            (entity(1), rect(0.0, 100.0)),
+            (entity(2), rect(100.0, 50.0)),
+        ]);
+        let changed = HashSet::from([entity(1)]);
+        let torn = damage(
+            &pass(&before, &changed),
+            DISPLAY,
+            panel(),
+            &[
+                (entity(1), rect(0.0, 140.0)),
+                (entity(2), rect(140.0, 50.0)),
+            ],
+        )
+        .expect("a partial repaint");
+
+        assert!(torn.contains(&rect(0.0, 100.0)), "erase the old width");
+        assert!(torn.contains(&rect(0.0, 140.0)), "draw the new width");
+        assert!(torn.contains(&rect(100.0, 50.0)), "erase where it sat");
+        assert!(torn.contains(&rect(140.0, 50.0)), "draw where it sits now");
+    }
+
+    #[test]
+    fn an_item_that_went_away_leaves_damage_where_it_was() {
+        let before = was(vec![
+            (entity(1), rect(0.0, 100.0)),
+            (entity(2), rect(100.0, 50.0)),
+        ]);
+        let nothing = HashSet::new();
+        let torn = damage(
+            &pass(&before, &nothing),
+            DISPLAY,
+            panel(),
+            &[(entity(1), rect(0.0, 100.0))],
+        );
+        assert_eq!(torn, Some(vec![rect(100.0, 50.0)]));
+    }
+
+    #[test]
+    fn a_new_item_damages_where_it_landed() {
+        let before = was(vec![(entity(1), rect(0.0, 100.0))]);
+        let nothing = HashSet::new();
+        let torn = damage(
+            &pass(&before, &nothing),
+            DISPLAY,
+            panel(),
+            &[
+                (entity(1), rect(0.0, 100.0)),
+                (entity(2), rect(100.0, 50.0)),
+            ],
+        );
+        assert_eq!(torn, Some(vec![rect(100.0, 50.0)]));
+    }
+
+    #[test]
+    fn a_panel_that_resized_is_repainted_whole() {
+        let before = was(vec![(entity(1), rect(0.0, 100.0))]);
+        let nothing = HashSet::new();
+        let narrower = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(800.0, 32.0));
+        let torn = damage(
+            &pass(&before, &nothing),
+            DISPLAY,
+            narrower,
+            &[(entity(1), rect(0.0, 100.0))],
+        );
+        assert_eq!(torn, None, "every position in it is invalid");
+    }
+
+    #[test]
+    fn a_panel_with_nothing_before_it_is_repainted_whole() {
+        let nothing = HashSet::new();
+        let torn = damage(
+            &pass(&[], &nothing),
+            DISPLAY,
+            panel(),
+            &[(entity(1), rect(0.0, 100.0))],
+        );
+        assert_eq!(torn, None, "there is no before to diff against");
+    }
+
+    #[test]
+    fn a_bar_wide_change_is_repainted_whole() {
+        let before = was(vec![(entity(1), rect(0.0, 100.0))]);
+        let nothing = HashSet::new();
+        let everything = Repaint {
+            previous: &before,
+            changed: &nothing,
+            everything: true,
+        };
+        assert_eq!(
+            damage(
+                &everything,
+                DISPLAY,
+                panel(),
+                &[(entity(1), rect(0.0, 100.0))]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn only_overlapping_rects_intersect() {
+        assert!(intersects(rect(0.0, 100.0), rect(50.0, 100.0)));
+        assert!(!intersects(rect(0.0, 100.0), rect(100.0, 50.0)));
+        assert!(!intersects(rect(0.0, 100.0), rect(200.0, 50.0)));
     }
 }

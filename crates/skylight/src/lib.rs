@@ -31,6 +31,6 @@ mod window;
 
 pub use error::{Error, Result};
 pub use ffi::{ConnectionId, SpaceId, WindowId};
-pub use render::{draw, present, without_implicit_animations};
+pub use render::{draw, draw_damaged, present, without_implicit_animations};
 pub use tags::WindowTags;
 pub use window::{Window, batched, level};
