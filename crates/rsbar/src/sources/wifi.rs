@@ -17,6 +17,13 @@
 //! interface, which is what `wifi_changed` promises. A process with Location
 //! access (Terminal, granted through System Settings) sees the real name
 //! through this identical path.
+//!
+//! `SCDynamicStore` notifies on more than a join or leave — signal-quality and
+//! other `AirPort` sub-keys live under the same wildcard — so [`State`] keeps
+//! the last SSID seen per interface key and only emits when it actually moved.
+//! Per registration, not process-wide: unlike `brightness`'s passthrough, this
+//! callback's context is a real pointer, so the dedup state can live where
+//! every other multi-registration source keeps it, alongside the sink.
 
 use crate::sources::{
     CallbackState, Cause, Emitter, Registering, Registration, Source, SourceId, StartError,
@@ -26,7 +33,7 @@ use objc2_core_foundation::{
 };
 use rsbar_protocol::event::WifiChange;
 use rsbar_protocol::{Event, Kind};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
@@ -106,9 +113,19 @@ fn read_ssid(store: *mut CFType, key: &CFString) -> Option<String> {
     Some(ssid.to_string())
 }
 
+/// The sink and the dedup state a registration is handed a pointer to.
+pub struct State {
+    emit: Emitter,
+    /// The last SSID seen per interface key, so a notification that did not
+    /// actually change the joined network — `SCDynamicStore` fires this for
+    /// more than a join or leave — does not turn into a script run and a
+    /// repaint for a value nobody would see move.
+    last: tokio::sync::Mutex<HashMap<String, Option<String>>>,
+}
+
 extern "C-unwind" fn changed(store: *mut CFType, changed_keys: *mut CFArray, context: *mut c_void) {
-    // SAFETY: the registration passed a `CallbackState<Emitter>` pointer.
-    let Some(emit) = (unsafe { CallbackState::<Emitter>::recover(context) }) else {
+    // SAFETY: the registration passed a `CallbackState<State>` pointer.
+    let Some(state) = (unsafe { CallbackState::<State>::recover(context) }) else {
         return;
     };
     let Some(keys) = NonNull::new(changed_keys) else {
@@ -126,8 +143,20 @@ extern "C-unwind" fn changed(store: *mut CFType, changed_keys: *mut CFArray, con
         };
         // SAFETY: as above.
         let key = unsafe { key.cast::<CFString>().as_ref() };
-        if let Some(ssid) = read_ssid(store, key) {
-            emit.send(Event::WifiChanged(WifiChange { ssid }));
+        let ssid = read_ssid(store, key);
+        let key_name = key.to_string();
+
+        // `blocking_lock`, not an await: this runs inside `SCDynamicStore`'s
+        // own callback, never inside a polled task.
+        let mut last = state.last.blocking_lock();
+        let worth_reporting = last.get(&key_name) != Some(&ssid);
+        last.insert(key_name, ssid.clone());
+        drop(last);
+
+        if worth_reporting {
+            state.emit.send(Event::WifiChanged(WifiChange {
+                ssid: ssid.unwrap_or_default(),
+            }));
         }
     }
 }
@@ -142,7 +171,7 @@ struct Watch {
     run_loop: CFRetained<CFRunLoop>,
     /// Outlives the store: `SCDynamicStore` may still be draining a callback
     /// when this drops, and the state must still be there to recover.
-    _state: CallbackState<Emitter>,
+    _state: CallbackState<State>,
 }
 
 impl Drop for Watch {
@@ -170,7 +199,10 @@ impl Source for Wifi {
         cx: &mut Registering<'_>,
     ) -> Result<Registration, StartError> {
         let emit = cx.emitter();
-        let state = CallbackState::new(emit);
+        let state = CallbackState::new(State {
+            emit,
+            last: tokio::sync::Mutex::new(HashMap::new()),
+        });
 
         let name = CFString::from_str("rsbar-wifi");
         let mut context = StoreContext {

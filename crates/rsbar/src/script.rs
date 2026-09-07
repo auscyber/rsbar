@@ -15,6 +15,28 @@
 //! wait then fails with `ECHILD` even though the program ran perfectly. What
 //! the pipes produced is the truth, and a lost reap is logged at debug rather
 //! than reported as a failure.
+//!
+//! # `sbar.exec` and captured output — task #16
+//!
+//! The other half of task #16 asked for a daemon-side "run a command, capture
+//! its stdout, hand it back" primitive behind `sbar.exec(cmd, callback)`, on
+//! the reasoning that it should live once here rather than per client.
+//! `rsbar-lua`'s `exec_fn` (`crates/rsbar-lua/src/api.rs`) already covers the
+//! config's actual need for this, entirely on its own side: it spawns through
+//! `tokio::process::Command` in the Lua process itself and never calls the
+//! `Dispatcher`, by its own module doc's admission. Two things make that the
+//! right call rather than a gap to close here: real `SketchyBar` has no
+//! `exec` primitive at all — grep its C sources — so this is a Lua-config
+//! convenience, not a bar feature a daemon owns; and every actual `sbar.exec`
+//! call in the real config (`~/dendritic/sketchybar`, `menus.lua`,
+//! `right.lua`) already works today through that local path with no daemon
+//! involvement needed. Adding a `Request::Exec` here with nothing that calls
+//! it would be dead plumbing for a problem already solved. If a future
+//! client cannot spawn its own subprocess (a sandboxed config format, say),
+//! the primitive to add is a straight `sh -c` capture kept coherent with
+//! `exec_fn`'s own semantics (lossy UTF-8 stdout, a warning rather than a
+//! hard failure on a nonzero exit) — but that also needs a new
+//! `rsbar_protocol::Request` variant, which is not this file's crate to add.
 
 use crate::components::ItemHandle;
 use rsbar_protocol::Event;

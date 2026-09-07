@@ -482,10 +482,12 @@ pub struct CallbackState<T: Payload>(std::sync::Arc<T>);
 /// The states a C callback can be handed a pointer to.
 ///
 /// Sealed, because the set is small and known: an [`Emitter`] for the sources
-/// that only need to report something happened, and the volume source's
-/// listener state, which also has to remember which device it is watching.
-/// Adding a third is a deliberate act here rather than an accident at a call
-/// site.
+/// that only need to report something happened, and a source's own state —
+/// `volume`'s listener, which remembers which device it is watching, `power`'s
+/// and `wifi`'s, which each remember the last snapshot they reported to dedup
+/// against — for one that needs more than a sink. Adding to it is a
+/// deliberate act here (or, for a source that keeps its own `Sealed` impl
+/// local, at its own definition) rather than an accident at a call site.
 ///
 /// `Send + Sync` is a requirement, not an assumption: `CoreAudio` calls back on
 /// a thread of its own, so state that was not safe to share would be a data
@@ -504,6 +506,9 @@ impl Payload for spaces::Sink {}
 
 impl sealed::Sealed for power::State {}
 impl Payload for power::State {}
+
+impl sealed::Sealed for wifi::State {}
+impl Payload for wifi::State {}
 
 impl<T: Payload> CallbackState<T> {
     pub fn new(value: T) -> Self {

@@ -15,11 +15,12 @@
 //! second event to subscribe to and a second script run for the same
 //! moment.
 //!
-//! `PowerChange` does not carry charge, time or wattage yet — see this
-//! crate's task-#16 report for the exact fields asked for. Until it does,
-//! [`changed`] tracks the full [`Snapshot`] and only forwards the field the
-//! wire format has today, logging the rest so the read and the dedup are
-//! provably correct ahead of the payload landing.
+//! `PowerChange` now carries all of it — `watts`, `charge`, `charging`,
+//! `time_to_empty_minutes` and `time_to_full_minutes` — each `Maybe`, since
+//! hardware with no battery (a Mac mini, a Studio) has none of them and an
+//! adapter is free not to report its wattage. [`Snapshot::differs_from`]
+//! still excludes the two time estimates from the dedup: see its own doc for
+//! why.
 
 use crate::sources::{
     CallbackState, Cause, Emitter, Registering, Registration, Source, SourceId, StartError,

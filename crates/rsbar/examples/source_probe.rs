@@ -14,16 +14,11 @@
 //! RUST_LOG=rsbar=info cargo run -p rsbar --example source_probe -- power_source_changed
 //! ```
 //!
-//! `power_source_changed` needs `RUST_LOG=rsbar=info` to show anything: the
-//! event itself only carries `power_source` today (task #16 asks
-//! `rsbar-protocol` to widen it with charge, time remaining and adapter
-//! wattage), so `power.rs` additionally logs the full snapshot it computed —
-//! including the fields not on the wire yet — at `info` on every real change.
-//! Unplug and replug the charger while this runs to see both: the real
-//! `[power] PowerSourceChanged` event (fires only on an AC/battery flip) and
-//! the `power snapshot changed` log line (fires on that and on every
-//! battery-percent/wattage move `IOKit` reports, deduplicated against the
-//! last snapshot so an unchanged reading logs nothing).
+//! `power_source_changed` carries the full picture — `power_source`, `watts`,
+//! `charge`, `charging` and the two time-remaining estimates — but the event
+//! itself only fires on a change worth drawing (see `power.rs`'s
+//! `Snapshot::differs_from`), so unplug and replug the charger while this
+//! runs to see it: nothing synthesizes this one.
 //!
 //! `brightness_changed` and `space_changed` additionally trigger the real
 //! event themselves a couple of seconds in, rather than waiting on a human:
@@ -222,8 +217,7 @@ fn main() {
         Kind::PowerSourceChanged => {
             println!(
                 "[trigger] no synthetic power event exists -- unplug/replug the charger now to \
-                 exercise this live; set RUST_LOG=rsbar=info to see the full snapshot (charge, \
-                 watts, time remaining) that power.rs computed but cannot put on the wire yet"
+                 exercise this live"
             );
         }
         _ => {}

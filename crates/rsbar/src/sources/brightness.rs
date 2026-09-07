@@ -77,6 +77,14 @@ type Callback = extern "C-unwind" fn(
 /// registration, not just the first.
 static EMITTER: tokio::sync::Mutex<Option<Emitter>> = tokio::sync::Mutex::const_new(None);
 
+/// The last percentage reported, so a callback that fires without the value
+/// actually moving — `DisplayServices` does, e.g. auto-brightness settling
+/// back on the same rounded percent it started at — does not turn into a
+/// script run and a repaint for a number nobody would see change. Reset
+/// alongside `EMITTER` on every registration, for the same reason: a stale
+/// value here would suppress the first real event after a restart.
+static LAST_PERCENT: tokio::sync::Mutex<Option<u8>> = tokio::sync::Mutex::const_new(None);
+
 /// A 0.0-1.0 scalar as a whole percentage, following `volume`'s reading of one.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn percent(scalar: f32) -> u8 {
@@ -105,6 +113,14 @@ extern "C-unwind" fn changed(
     let Some(brightness) = current_brightness(display) else {
         return;
     };
+
+    let mut last = LAST_PERCENT.blocking_lock();
+    if *last == Some(brightness) {
+        return;
+    }
+    *last = Some(brightness);
+    drop(last);
+
     emit.send(Event::BrightnessChanged(BrightnessChange { brightness }));
 }
 
@@ -153,6 +169,10 @@ impl Source for Brightness {
         // Repointed on every registration — see the module docs for why a
         // one-shot `OnceCell` would go stale across a stop/start cycle.
         *EMITTER.blocking_lock() = Some(emit);
+        // A stale value here would wrongly suppress the first event after a
+        // restart, if the display happens to have settled back on the exact
+        // percent it was last seen at.
+        *LAST_PERCENT.blocking_lock() = None;
 
         // SAFETY: `display` is passed back as the passthrough, which is what
         // the callback's `display` parameter recovers it from.
