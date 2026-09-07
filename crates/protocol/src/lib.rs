@@ -26,8 +26,12 @@ pub fn service_name() -> String {
 
 /// An item's identity. A newtype so an item name and a stray string cannot be
 /// swapped for one another.
+///
+/// The string is shared rather than owned: a name is cloned constantly — into
+/// the index, into every job, into every response — and none of those want a
+/// copy of the bytes. Cloning this is a reference count.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct ItemName(String);
+pub struct ItemName(std::sync::Arc<str>);
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidName {
@@ -56,7 +60,7 @@ impl ItemName {
         {
             return Err(InvalidName::Character(name));
         }
-        Ok(Self(name))
+        Ok(Self(name.into()))
     }
 
     #[must_use]

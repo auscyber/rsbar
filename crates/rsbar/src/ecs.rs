@@ -68,7 +68,7 @@ pub struct IpcRequest {
 /// This one *is* a message: an event legitimately has several readers, and a
 /// reader missing a frame beats acting on a backlog.
 #[derive(Message)]
-pub struct EventMessage(pub Event);
+pub struct EventMessage(pub std::sync::Arc<Event>);
 
 /// The request queue, which is `!Sync` and so cannot be a plain resource.
 ///
@@ -254,7 +254,10 @@ fn refresh_aliases(
 fn drain_events(mut sources: NonSendMut<Sources>, mut out: MessageWriter<EventMessage>) {
     sources.0.drain(|id, event| {
         tracing::trace!(source = %id, kind = %event.kind(), "drained");
-        out.write(EventMessage(event));
+        // Shared from here on. Everything downstream — the reactions, the
+        // routing, the job handed to a worker — takes a reference count
+        // rather than a copy of the payload.
+        out.write(EventMessage(std::sync::Arc::new(event)));
     });
 }
 
@@ -318,10 +321,7 @@ fn dispatch_events(
         sources
             .0
             .dependents_into(event, &Target::All, &mut dependents);
-        // One allocation for the event, then a reference count per item that
-        // wants it, rather than a deep copy of the payload each.
-        let shared = std::sync::Arc::new(event.clone());
-        read.push_jobs(&shared, &dependents, &mut queue.0);
+        read.push_jobs(event, &dependents, &mut queue.0);
     }
 }
 
@@ -416,7 +416,7 @@ fn route_pointer(
             Hit::Item { entity, .. } => {
                 queue
                     .0
-                    .extend(read.jobs_for_item(entity, &std::sync::Arc::new(event.clone())));
+                    .extend(read.jobs_for_item(entity, event));
             }
             // On the bar but not on an item. The `.global` events exist for
             // exactly this, and are matched the ordinary way.
