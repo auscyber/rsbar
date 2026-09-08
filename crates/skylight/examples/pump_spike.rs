@@ -32,7 +32,8 @@ fn main() {
     let bounds = CGDisplayBounds(CGMainDisplayID());
     let frame = CGRect::new(bounds.origin, CGSize::new(bounds.size.width, HEIGHT));
 
-    let window = Window::new(frame).expect("create");
+    let mtm = objc2::MainThreadMarker::new().expect("an example runs on the main thread");
+    let window = Window::new(frame, mtm).expect("create");
     window.set_scale(2.0).expect("scale");
     window.set_opaque(false).expect("opaque");
     window.set_alpha(1.0).expect("alpha");
@@ -42,7 +43,7 @@ fn main() {
         .expect("tags");
     window.order_above(None).expect("order");
 
-    skylight::draw(window.id(), frame.size, |ctx| {
+    skylight::draw(&window, frame.size, |ctx| {
         CGContext::set_rgb_fill_color(Some(ctx), 0.05, 0.05, 0.08, 0.9);
         CGContext::fill_rect(Some(ctx), CGRect::new(CGPoint::new(0.0, 0.0), frame.size));
         CGContext::set_rgb_fill_color(Some(ctx), 0.4, 1.0, 0.5, 1.0);

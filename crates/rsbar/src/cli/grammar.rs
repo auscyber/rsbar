@@ -22,18 +22,17 @@
 //! from the *target field's* type — `padding_left=4` parses as `f64` because
 //! that is what [`ItemPatch::padding_left`] is, not because this module knows
 //! it — so a new field on those patch structs is accepted here with no
-//! grammar change at all, and `#[serde(deny_unknown_fields)]` turns a typo
-//! into a named error by itself. What is left to this module by hand is
-//! exactly what a type cannot express: which `SketchyBar` properties are real
-//! but not modelled yet ([`ParseError::KnownGap`], checked against a short
-//! list before deserializing), the bare `icon=`/`label=` sugar, and telling a
+//! grammar change at all. A key no patch has a field for is named through
+//! `tracing` and skipped by the patch itself, so a typo costs one property
+//! rather than the whole command. What is left to this module by hand is
+//! exactly what a type cannot express: which verb was written, and telling a
 //! `/pattern/` bulk selector from a literal name by shape.
 
 use lexopt::{Arg, Parser, ValueExt};
 use rsbar_protocol::event::Custom;
 use rsbar_protocol::{
-    BarPatch, ComponentKind, Event, ItemName, ItemPatch, Json, Kind, Position, Query, Relative,
-    Request, Selector,
+    BarPatch, ComponentTag, Event, EventName, GeometryPatch, ItemName, ItemPatch, Kind,
+    NotificationName, Position, Query, Relative, Request, Selector,
 };
 
 use super::args::{self, ArgsError};
@@ -60,8 +59,12 @@ pub enum ParseError {
     #[error("`{0}` is not `key=value`: expected e.g. `label.color=0xffffffff`")]
     NotKeyValue(String),
 
-    #[error("`{0}` names a real SketchyBar property that rsbar does not have yet: {1}")]
-    KnownGap(String, &'static str),
+    /// A real `SketchyBar` *verb* rsbar does not implement — `--query
+    /// events`, a `--push` to a pattern. Properties are not in here: an
+    /// unknown one is the patch's own business, and it warns and carries on
+    /// rather than failing the command.
+    #[error("`{0}` names something real that rsbar does not do yet: {1}")]
+    Unsupported(String, &'static str),
 
     #[error("`{value}` is not valid for `{key}`: {reason}")]
     InvalidValue {
@@ -73,7 +76,20 @@ pub enum ParseError {
     #[error(transparent)]
     InvalidName(#[from] rsbar_protocol::InvalidName),
 
-    #[error("`{0}` is not `item`, `bracket`, `alias`, `space`, `graph` or `slider`")]
+    /// A property `--add` cannot do without and the command did not name —
+    /// `--add item clock` with no position. The same error the Lua host
+    /// raises for the same omission, since both ask the patch rather than
+    /// deciding for themselves.
+    #[error(transparent)]
+    Missing(#[from] rsbar_protocol::Missing),
+
+    #[error(transparent)]
+    InvalidEventName(#[from] rsbar_protocol::event::InvalidEventName),
+
+    #[error(transparent)]
+    InvalidNotificationName(#[from] rsbar_protocol::event::InvalidNotificationName),
+
+    #[error("`{0}` is not `item`, `bracket`, `alias`, `space`, `graph`, `slider` or `event`")]
     UnknownAddKind(String),
 
     #[error(
@@ -238,113 +254,15 @@ fn parse_event_name(token: &str) -> Result<Kind, ParseError> {
         .map_err(|e| invalid("event", token, e))
 }
 
-/// The bare `icon=`/`label=` sugar rewritten into its dotted form before a
-/// token list becomes the `(path, value)` pairs [`super::args::from_pairs`]
-/// deserializes: a config's own `icon=🔋` sets the same field as
-/// `icon.string=🔋`/`icon.text=🔋`, and neither [`ItemPatch`] nor `serde` has
-/// anywhere else to put that alias, since `icon` itself names a nested
-/// component, not a string.
-fn rewrite_bare_sugar(key: &str) -> &str {
-    match key {
-        "icon" => "icon.text",
-        "label" => "label.text",
-        other => other,
-    }
-}
-
 fn pairs_from_tokens(tokens: &[String]) -> Result<Vec<(String, String)>, ParseError> {
     tokens
         .iter()
         .map(|token| {
             let (key, value) = split_kv(token)?;
-            Ok((rewrite_bare_sugar(key).to_owned(), value.to_owned()))
+            Ok((key.to_owned(), value.to_owned()))
         })
         .collect()
 }
-
-/// A real `SketchyBar` property with no home on the target patch struct yet.
-/// `(dotted key, reason)`. Checked before deserializing, so these still get a
-/// [`ParseError::KnownGap`] naming the struct rather than `serde`'s generic
-/// "unknown field" from `#[serde(deny_unknown_fields)]` — that message is
-/// exactly right for a typo, but wrong for a property `SketchyBar` really
-/// has.
-fn known_gap(pairs: &[(String, String)], gaps: &[(&str, &'static str)]) -> Result<(), ParseError> {
-    for (key, _) in pairs {
-        if let Some((_, reason)) = gaps.iter().find(|(gap, _)| gap == key) {
-            return Err(ParseError::KnownGap(key.clone(), reason));
-        }
-    }
-    Ok(())
-}
-
-const BAR_GAPS: &[(&str, &str)] = &[
-    ("space", "no matching BarPatch field yet"),
-    ("font_smoothing", "no matching BarPatch field yet"),
-    ("shadow", "no matching BarPatch field yet"),
-    ("align", "no matching BarPatch field yet"),
-    ("horizontal", "no matching BarPatch field yet"),
-    ("border_color", "no matching BarPatch field yet"),
-    ("border_width", "no matching BarPatch field yet"),
-    ("x_offset", "no matching BarPatch field yet"),
-    ("image", "no matching BarPatch field yet"),
-    ("clip", "no matching BarPatch field yet"),
-    ("drawing", "no matching BarPatch field yet"),
-];
-
-const ITEM_GAPS: &[(&str, &str)] = &[
-    ("scroll_texts", "no matching ItemPatch field yet"),
-    ("align", "no matching ItemPatch field yet"),
-    ("associated_display", "no matching ItemPatch field yet"),
-    ("blur_radius", "no matching ItemPatch field yet"),
-    ("shadow", "no matching ItemPatch field yet"),
-    ("lazy", "no matching ItemPatch field yet"),
-    ("cache_scripts", "no matching ItemPatch field yet"),
-    ("ignore_association", "no matching ItemPatch field yet"),
-    ("max_chars", "no matching ItemPatch field yet"),
-    ("icon.highlight", "no matching RunPatch field yet"),
-    ("icon.highlight_color", "no matching RunPatch field yet"),
-    ("icon.scroll_duration", "no matching RunPatch field yet"),
-    ("icon.width", "no matching RunPatch field yet"),
-    ("icon.align", "no matching RunPatch field yet"),
-    ("icon.max_chars", "no matching RunPatch field yet"),
-    ("label.highlight", "no matching RunPatch field yet"),
-    ("label.highlight_color", "no matching RunPatch field yet"),
-    ("label.scroll_duration", "no matching RunPatch field yet"),
-    ("label.width", "no matching RunPatch field yet"),
-    ("label.align", "no matching RunPatch field yet"),
-    ("label.max_chars", "no matching RunPatch field yet"),
-    (
-        "background.drawing",
-        "no matching BackgroundPatch field yet",
-    ),
-    ("background.clip", "no matching BackgroundPatch field yet"),
-    (
-        "background.x_offset",
-        "no matching BackgroundPatch field yet",
-    ),
-    ("background.image", "no matching BackgroundPatch field yet"),
-    (
-        "popup",
-        "no matching ItemPatch field yet: popups are not modelled",
-    ),
-    (
-        "slider",
-        "no matching ItemPatch field yet: no matching component",
-    ),
-    (
-        "knob",
-        "no matching ItemPatch field yet: no matching component",
-    ),
-    (
-        "graph",
-        "no matching ItemPatch field yet: no matching component",
-    ),
-    (
-        "image",
-        "no matching ItemPatch field yet: no matching component",
-    ),
-    ("alias.pid", "no matching ItemPatch field yet"),
-];
 
 /// `--add item|bracket|alias|space|graph|slider ...`. See `DOMAIN_ADD` in
 /// `defines.h`.
@@ -356,83 +274,85 @@ const ITEM_GAPS: &[(&str, &str)] = &[
 /// and usually spaces). So the name given here is the new item's own name,
 /// and the target is set the way any other property is: chained, with
 /// `--set <name> alias="Owner,Name"` right after.
+///
+/// The positional arguments become an [`ItemPatch`] and
+/// [`ComponentTag::build`] decides whether that is enough, rather than this
+/// module deciding for itself: `--add item foo` with no position and
+/// `rsbar.add("item", "foo", {})` are the same omission and now get the same
+/// sentence. What a bare `--add` may leave out is [`Geometry`]'s own
+/// `#[changes(required)]`, not a rule spelled here.
+///
+/// [`Geometry`]: rsbar_protocol::Geometry
 fn parse_add(parser: &mut Parser) -> Result<Vec<Request>, ParseError> {
-    let kind = required_string(
+    let word = required_string(
         parser,
         "--add",
-        "item, bracket, alias, space, graph or slider",
+        "item, bracket, alias, space, graph, slider or event",
     )?;
-    match kind.as_str() {
-        "item" | "alias" => {
-            let domain: &'static str = if kind == "item" {
-                "--add item"
-            } else {
-                "--add alias"
-            };
-            let name = required_item_name(parser, domain, "a name")?;
-            let position_token = required_string(parser, domain, "a position")?;
-            let position = parse_position_value("position", &position_token)?;
-            let kind = if kind == "alias" {
-                ComponentKind::Alias { name, position }
-            } else {
-                ComponentKind::Item { name, position }
-            };
-            Ok(vec![Request::Add(kind)])
-        }
-        "bracket" => {
-            let name = required_item_name(parser, "--add bracket", "a name")?;
-            let member_group = greedy_strings(parser)?;
-            if member_group.is_empty() {
-                return Err(ParseError::MissingArgument {
-                    domain: "--add bracket",
-                    expected: "at least one member",
-                });
-            }
-            let members = member_group
-                .iter()
-                .map(|m| m.parse::<Selector>().map_err(ParseError::from))
-                .collect::<Result<Vec<_>, _>>()?;
-            // SketchyBar's own `--add bracket` takes no position: a bracket's
-            // frame comes from its members, which is why the kind carries them
-            // instead.
-            Ok(vec![Request::Add(ComponentKind::Bracket { name, members })])
-        }
-        "space" | "graph" | "slider" => {
-            let domain: &'static str = "--add";
-            let name = required_item_name(parser, domain, "a name")?;
-            let position_token = required_string(parser, domain, "a position")?;
-            let position = parse_position_value("position", &position_token)?;
-            let component_kind = match kind.as_str() {
-                "space" => ComponentKind::Space { name, position },
-                "graph" => ComponentKind::Graph { name, position },
-                "slider" => ComponentKind::Slider { name, position },
-                _ => unreachable!("matched above"),
-            };
-            // `--add graph <name> <position> <width>` and
-            // `--add slider <name> <position> <width>` carry an extra
-            // positional width rsbar has nowhere to put yet, since nothing on
-            // the daemon side can draw either component. Consumed and
-            // dropped rather than left for the next domain to trip over.
-            let _ = greedy_strings(parser)?;
-            Ok(vec![Request::Add(component_kind)])
-        }
-        "event" => Err(ParseError::KnownGap(
-            kind,
-            "custom events need no registration in rsbar: --trigger accepts any name directly",
-        )),
-        _ => Err(ParseError::UnknownAddKind(kind)),
+    if word == "event" {
+        return parse_add_event(parser).map(|request| vec![request]);
     }
+    let tag: ComponentTag = word
+        .parse()
+        .map_err(|_| ParseError::UnknownAddKind(word.clone()))?;
+    let name = required_item_name(parser, "--add", "a name")?;
+    // Everything up to the next domain flag: a position, or a bracket's
+    // members. `--add graph <name> <position> <width>` and `--add slider`
+    // carry a trailing width rsbar has nowhere to put yet, since nothing on
+    // the daemon side draws either; it is consumed here rather than left for
+    // the next domain to trip over.
+    let tail = greedy_strings(parser)?;
+    let mut patch = ItemPatch::default();
+    if tag == ComponentTag::Bracket {
+        // SketchyBar's own `--add bracket` takes no position: a bracket's
+        // frame comes from its members, which is why the patch carries them
+        // instead.
+        patch.members = Some(
+            tail.iter()
+                .map(|member| member.parse::<Selector>().map_err(ParseError::from))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    } else if let Some(token) = tail.first() {
+        patch.geometry = Some(GeometryPatch {
+            position: Some(parse_position_value("position", token)?),
+            ..Default::default()
+        });
+    }
+    Ok(vec![Request::Add(tag.build(name, &patch)?)])
+}
+
+/// `--add event <name> [<NSDistributedNotificationName>]`.
+///
+/// The name goes through [`parse_event_name`] first, so `--add event
+/// volume_change` is refused as the built-in it names rather than quietly
+/// declaring a second event spelled almost like one. A second positional is
+/// the distributed notification to bridge from; without it the event is one
+/// only `--trigger` ever fires.
+fn parse_add_event(parser: &mut Parser) -> Result<Request, ParseError> {
+    let token = required_string(parser, "--add event", "an event name")?;
+    let name: EventName = parse_event_name(&token)?.name().parse()?;
+    let mut rest = greedy_strings(parser)?.into_iter();
+    let notification = rest
+        .next()
+        .map(|n| n.parse::<NotificationName>())
+        .transpose()?;
+    if let Some(extra) = rest.next() {
+        return Err(invalid(
+            "--add event",
+            &extra,
+            "an event takes a name and at most one notification to bridge it from",
+        ));
+    }
+    Ok(Request::AddEvent { name, notification })
 }
 
 fn parse_bar(parser: &mut Parser) -> Result<Request, ParseError> {
     let pairs = pairs_from_tokens(&greedy_strings(parser)?)?;
-    known_gap(&pairs, BAR_GAPS)?;
     let patch: BarPatch = args::from_pairs(&pairs)?;
     Ok(Request::SetBar(patch))
 }
 
 fn parse_item_patch(pairs: &[(String, String)]) -> Result<ItemPatch, ParseError> {
-    known_gap(pairs, ITEM_GAPS)?;
     Ok(args::from_pairs(pairs)?)
 }
 
@@ -480,14 +400,14 @@ fn parse_trigger(parser: &mut Parser) -> Result<Request, ParseError> {
     } else if is_builtin {
         return Err(ParseError::BuiltinEventHasNoPayload(kind.name().to_owned()));
     } else {
-        let mut fields = Vec::with_capacity(group.len());
+        let mut vars = std::collections::BTreeMap::new();
         for token in &group {
             let (key, value) = split_kv(token)?;
-            fields.push((key.to_owned(), Json::parse_or_string(value)));
+            vars.insert(key.to_owned(), value.to_owned());
         }
         Event::Custom(Custom {
             name: kind.name().to_owned(),
-            data: Json::Object(fields),
+            vars,
         })
     };
     Ok(Request::Trigger(event))
@@ -506,13 +426,13 @@ fn parse_query(parser: &mut Parser) -> Result<Request, ParseError> {
         "app-menus" | "app_menus" => Query::AppMenus,
         "defaults" => Query::Defaults,
         "events" => {
-            return Err(ParseError::KnownGap(
+            return Err(ParseError::Unsupported(
                 token,
                 "rsbar does not track registered custom events",
             ));
         }
         "displays" => {
-            return Err(ParseError::KnownGap(
+            return Err(ParseError::Unsupported(
                 token,
                 "querying displays is not implemented",
             ));
@@ -580,7 +500,7 @@ fn parse_push(parser: &mut Parser) -> Result<Request, ParseError> {
         // A sample belongs to one graph's ring buffer; pushing the same value
         // into every graph matching a pattern is not a thing SketchyBar does.
         Selector::Pattern(pattern) => {
-            return Err(ParseError::KnownGap(
+            return Err(ParseError::Unsupported(
                 format!("/{pattern}/"),
                 "--push takes one graph, not a pattern",
             ));
@@ -646,7 +566,9 @@ pub fn parse(args: &[String]) -> Result<Vec<Request>, ParseError> {
 mod tests {
     use super::*;
     use rsbar_protocol::event::PowerChange;
-    use rsbar_protocol::{BackgroundPatch, Color, FontSpec, RunPatch};
+    use rsbar_protocol::{
+        BackgroundPatch, Color, ComponentKind, FontSpec, GeometryPatch, RunPatch, ScriptingPatch,
+    };
 
     fn args_(tokens: &[&str]) -> Vec<String> {
         tokens.iter().map(|s| (*s).to_owned()).collect()
@@ -708,8 +630,11 @@ mod tests {
                         font: Some(FontSpec::parse("Hack:Bold:14")),
                         ..Default::default()
                     }),
-                    background: Some(BackgroundPatch {
-                        corner_radius: Some(6.0),
+                    geometry: Some(GeometryPatch {
+                        background: Some(BackgroundPatch {
+                            corner_radius: Some(6.0),
+                            ..Default::default()
+                        }),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -791,10 +716,13 @@ mod tests {
             vec![Request::Set(
                 Selector::Name(name("clock")),
                 Box::new(ItemPatch {
-                    background: Some(BackgroundPatch {
-                        height: Some(20.0),
-                        border_color: Some(Color(0xff00_ff00)),
-                        border_width: Some(2.0),
+                    geometry: Some(GeometryPatch {
+                        background: Some(BackgroundPatch {
+                            height: Some(20.0),
+                            border_color: Some(Color(0xff00_ff00)),
+                            border_width: Some(2.0),
+                            ..Default::default()
+                        }),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -805,10 +733,8 @@ mod tests {
 
     #[test]
     fn fields_added_to_the_patch_types_need_no_grammar_change() {
-        // `updates`, `width` and `display` used to be `ParseError::KnownGap`
-        // entries here, restating a field list `ItemPatch` already owns —
-        // exactly the drift deriving from the type is meant to remove. They
-        // are real fields now, and nothing in this module named them.
+        // Nothing in this module names `updates`, `width` or `display`: they
+        // reach the patch by deriving from `ItemPatch`'s own field list.
         let requests = parse(&args_(&[
             "--set",
             "clock",
@@ -822,9 +748,15 @@ mod tests {
             vec![Request::Set(
                 Selector::Name(name("clock")),
                 Box::new(ItemPatch {
-                    updates: Some(false),
-                    width: Some(40.0),
-                    display: Some("2".parse().unwrap()),
+                    scripting: Some(ScriptingPatch {
+                        updates: Some(rsbar_protocol::BoolChange::False),
+                        ..Default::default()
+                    }),
+                    geometry: Some(GeometryPatch {
+                        width: Some(40.0),
+                        display: Some("2".parse().unwrap()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 })
             )]
@@ -865,8 +797,11 @@ mod tests {
                 Request::Set(
                     Selector::Name(name("clock")),
                     Box::new(ItemPatch {
-                        update_freq: Some(1),
-                        script: Some("/plugins/clock.sh".into()),
+                        scripting: Some(ScriptingPatch {
+                            update_freq: Some(1),
+                            script: Some("/plugins/clock.sh".into()),
+                            ..Default::default()
+                        }),
                         ..Default::default()
                     })
                 ),
@@ -877,7 +812,10 @@ mod tests {
                 Request::Set(
                     Selector::Name(name("battery")),
                     Box::new(ItemPatch {
-                        script: Some("/plugins/battery.sh".into()),
+                        scripting: Some(ScriptingPatch {
+                            script: Some("/plugins/battery.sh".into()),
+                            ..Default::default()
+                        }),
                         ..Default::default()
                     })
                 ),
@@ -886,6 +824,65 @@ mod tests {
                     events: vec![Kind::PowerSourceChanged],
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn adding_without_a_position_says_which_property_is_missing() {
+        // The requirement lives on the state type, so the CLI and the Lua
+        // host ask the same patch about it rather than each deciding for
+        // itself.
+        let err = parse(&args_(&["--add", "item", "clock"])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "`position`: required to build an item, and not set"
+        );
+        // And the next domain is not eaten looking for one.
+        let err = parse(&args_(&[
+            "--add", "item", "clock", "--set", "clock", "label=x",
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains("position"), "{err}");
+    }
+
+    #[test]
+    fn a_bracket_with_no_members_says_so_in_the_same_words() {
+        let err = parse(&args_(&["--add", "bracket", "group"])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "`members`: required to build an item, and not set"
+        );
+    }
+
+    #[test]
+    fn a_bare_value_and_a_nested_one_for_the_same_property_are_one_set() {
+        // The command that failed live:
+        //   rsbard --set clock label=12:34 icon=T label.color=0xff00ff00
+        let requests = parse(&args_(&[
+            "--set",
+            "clock",
+            "label=12:34",
+            "icon=T",
+            "label.color=0xff00ff00",
+        ]))
+        .unwrap();
+        assert_eq!(
+            requests,
+            vec![Request::Set(
+                Selector::Name(name("clock")),
+                Box::new(ItemPatch {
+                    label: Some(RunPatch {
+                        text: Some("12:34".into()),
+                        color: Some(Color(0xff00_ff00)),
+                        ..Default::default()
+                    }),
+                    icon: Some(RunPatch {
+                        text: Some("T".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+            )]
         );
     }
 
@@ -1003,17 +1000,95 @@ mod tests {
     }
 
     #[test]
-    fn trigger_on_a_custom_event_collects_key_value_pairs_into_one_object() {
-        let requests = parse(&args_(&["--trigger", "my.event", "foo=1", "bar=hello"])).unwrap();
+    fn trigger_on_a_custom_event_carries_its_variables_by_name() {
+        // SketchyBar: `--trigger demo VAR=Test` sets `$VAR` for the script.
+        let requests = parse(&args_(&["--trigger", "demo", "VAR=Test", "OTHER=2"])).unwrap();
         assert_eq!(
             requests,
             vec![Request::Trigger(Event::Custom(Custom {
-                name: "my.event".into(),
-                data: Json::Object(vec![
-                    ("foo".into(), Json::Int(1)),
-                    ("bar".into(), Json::String("hello".into())),
+                name: "demo".into(),
+                vars: std::collections::BTreeMap::from([
+                    ("VAR".to_owned(), "Test".to_owned()),
+                    ("OTHER".to_owned(), "2".to_owned()),
                 ]),
             }))]
+        );
+    }
+
+    #[test]
+    fn add_event_declares_an_event_the_config_fires_itself() {
+        let requests = parse(&args_(&["--add", "event", "demo"])).unwrap();
+        assert_eq!(
+            requests,
+            vec![Request::AddEvent {
+                name: "demo".parse().unwrap(),
+                notification: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn add_event_with_a_notification_bridges_one_the_system_fires() {
+        let requests = parse(&args_(&["--add", "event", "demo", "com.example.thing"])).unwrap();
+        assert_eq!(
+            requests,
+            vec![Request::AddEvent {
+                name: "demo".parse().unwrap(),
+                notification: Some("com.example.thing".parse().unwrap()),
+            }]
+        );
+    }
+
+    #[test]
+    fn add_event_refuses_a_builtin_name() {
+        // Including SketchyBar's own shorter spelling, which would otherwise
+        // become a second event named almost like the real one.
+        for token in ["volume_changed", "volume_change"] {
+            let err = parse(&args_(&["--add", "event", token])).unwrap_err();
+            assert_eq!(
+                err,
+                ParseError::InvalidEventName(rsbar_protocol::event::InvalidEventName::BuiltIn(
+                    "volume_changed".into()
+                )),
+                "{token}"
+            );
+        }
+    }
+
+    #[test]
+    fn add_event_needs_a_name() {
+        let err = parse(&args_(&["--add", "event"])).unwrap_err();
+        assert_eq!(
+            err,
+            ParseError::MissingArgument {
+                domain: "--add event",
+                expected: "an event name",
+            }
+        );
+    }
+
+    #[test]
+    fn add_event_takes_at_most_one_notification() {
+        let err = parse(&args_(&[
+            "--add",
+            "event",
+            "demo",
+            "com.example.thing",
+            "com.example.other",
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(&err, ParseError::InvalidValue { value, .. } if value == "com.example.other"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn trigger_without_variables_carries_none() {
+        let requests = parse(&args_(&["--trigger", "demo"])).unwrap();
+        assert_eq!(
+            requests,
+            vec![Request::Trigger(Event::Custom(Custom::new("demo")))]
         );
     }
 
@@ -1094,7 +1169,10 @@ mod tests {
             vec![Request::Set(
                 Selector::Pattern(r"menu\..*".into()),
                 Box::new(ItemPatch {
-                    drawing: Some(rsbar_protocol::Toggle::Off),
+                    geometry: Some(GeometryPatch {
+                        drawing: Some(rsbar_protocol::BoolChange::False),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 })
             )]
@@ -1124,7 +1202,10 @@ mod tests {
         assert_eq!(
             requests,
             vec![Request::SetDefault(Box::new(ItemPatch {
-                padding_left: Some(5.0),
+                geometry: Some(GeometryPatch {
+                    padding_left: Some(5.0),
+                    ..Default::default()
+                }),
                 icon: Some(RunPatch {
                     color: Some(Color(0xffff_ffff)),
                     ..Default::default()
@@ -1204,7 +1285,10 @@ mod tests {
             vec![Request::Set(
                 Selector::Name(name("clock")),
                 Box::new(ItemPatch {
-                    y_offset: Some(-5.0),
+                    geometry: Some(GeometryPatch {
+                        y_offset: Some(-5.0),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 })
             )]
@@ -1218,32 +1302,42 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_item_property_names_itself() {
-        let err = parse(&args_(&["--set", "clock", "wat=1"])).unwrap_err();
-        assert!(matches!(err, ParseError::Args(msg) if msg.contains("wat")));
-    }
-
-    #[test]
-    fn an_unknown_subdomain_is_an_unknown_property_not_a_known_gap() {
-        let err = parse(&args_(&["--set", "clock", "wat.color=1"])).unwrap_err();
-        assert!(matches!(err, ParseError::Args(msg) if msg.contains("wat")));
-    }
-
-    #[test]
-    fn a_real_but_unmapped_property_is_a_known_gap() {
-        let err = parse(&args_(&[
-            "--set",
-            "clock",
-            "icon.highlight_color=0xffffffff",
-        ]))
-        .unwrap_err();
+    fn an_unknown_property_costs_that_property_and_nothing_else() {
+        // The patch names it through `tracing` and skips it; the command
+        // still runs, so the forty properties that were right still apply.
+        // A config being ported is the case this is for, and it is the same
+        // answer `item:set{ wat = 1 }` gets from the same type.
+        let requests = parse(&args_(&["--set", "clock", "wat=1", "y_offset=3"])).unwrap();
+        let [Request::Set(_, patch)] = &requests[..] else {
+            panic!("one --set, not {requests:?}");
+        };
         assert_eq!(
-            err,
-            ParseError::KnownGap(
-                "icon.highlight_color".into(),
-                "no matching RunPatch field yet"
-            )
+            patch
+                .geometry
+                .as_ref()
+                .and_then(|geometry| geometry.y_offset),
+            Some(3.0)
         );
+    }
+
+    #[test]
+    fn an_unknown_subdomain_is_skipped_the_same_way_a_bare_key_is() {
+        let requests = parse(&args_(&["--set", "clock", "wat.color=1"])).unwrap();
+        let [Request::Set(_, patch)] = &requests[..] else {
+            panic!("one --set, not {requests:?}");
+        };
+        assert_eq!(**patch, ItemPatch::default());
+    }
+
+    #[test]
+    fn a_real_but_unmapped_property_is_skipped_rather_than_listed_by_hand() {
+        // A generic warning, not a hand-kept list of SketchyBar properties
+        // rsbar has no field for: it cannot rot when a field is added.
+        let requests = parse(&args_(&["--set", "clock", "scroll_texts=on"])).unwrap();
+        let [Request::Set(_, patch)] = &requests[..] else {
+            panic!("one --set, not {requests:?}");
+        };
+        assert_eq!(**patch, ItemPatch::default());
     }
 
     #[test]
@@ -1253,14 +1347,44 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_value_names_its_dotted_property_the_way_a_lua_config_is_told() {
+        // The same mistake through the other door reads the same:
+        // `rsbar_lua::convert` prints this shape too, from the path
+        // `serde_path_to_error` tracks over `mlua`'s bridge. A config being
+        // ported is read by one person moving between the two, and a
+        // property name they can search for is most of the fix.
+        let err = parse(&args_(&["--set", "clock", "label.color=puce"])).unwrap_err();
+        let ParseError::Args(message) = err else {
+            panic!("a value error, not {err:?}");
+        };
+        assert!(message.starts_with("`label.color`: "), "{message}");
+        assert!(message.contains("puce"), "{message}");
+    }
+
+    #[test]
     fn reload_with_a_path_is_reported_rather_than_silently_dropped() {
         let err = parse(&args_(&["--reload", "/tmp/other.rc"])).unwrap_err();
         assert_eq!(err, ParseError::ReloadTakesNoPath("/tmp/other.rc".into()));
     }
 
     #[test]
-    fn toggle_is_still_rejected_since_a_one_shot_cli_has_no_current_value() {
-        let err = parse(&args_(&["--bar", "hidden=toggle"])).unwrap_err();
-        assert!(matches!(err, ParseError::Args(msg) if msg.contains("hidden")));
+    fn toggle_is_carried_for_the_daemon_to_resolve() {
+        // `hidden` is a `BoolChange`: the CLI carries the intent and the
+        // daemon, which knows the current value, resolves it — the same way
+        // `--set <item> drawing=toggle` works.
+        let requests = parse(&args_(&["--bar", "hidden=toggle"])).unwrap();
+        let [Request::SetBar(patch)] = requests.as_slice() else {
+            panic!("expected one --bar request, got {requests:?}");
+        };
+        assert_eq!(patch.hidden, Some(rsbar_protocol::BoolChange::Toggle));
+    }
+
+    #[test]
+    fn a_negated_boolean_is_accepted_wherever_a_boolean_is() {
+        let requests = parse(&args_(&["--bar", "hidden=!on"])).unwrap();
+        let [Request::SetBar(patch)] = requests.as_slice() else {
+            panic!("expected one --bar request, got {requests:?}");
+        };
+        assert_eq!(patch.hidden, Some(rsbar_protocol::BoolChange::False));
     }
 }

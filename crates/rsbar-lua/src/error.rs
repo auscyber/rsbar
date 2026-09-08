@@ -1,7 +1,8 @@
 //! Typed errors, all of which end up as a Lua error with a real message —
 //! never a silent `nil` or a swallowed failure.
 
-use rsbar_protocol::{InvalidName, InvalidPosition, Response, event::InvalidEvent};
+use rsbar_protocol::event::{InvalidEvent, InvalidEventName, InvalidNotificationName};
+use rsbar_protocol::{InvalidName, InvalidPosition, Response};
 
 /// Anything that can go wrong issuing a request or waiting on events, from
 /// either dispatcher.
@@ -13,6 +14,10 @@ pub enum ApiError {
     InvalidPosition(String, InvalidPosition),
     #[error("`{0}` is not an event name: {1}")]
     InvalidEvent(String, InvalidEvent),
+    #[error("`{0}` cannot be added as an event: {1}")]
+    InvalidEventName(String, InvalidEventName),
+    #[error("`{0}` is not a notification to bridge an event from: {1}")]
+    InvalidNotificationName(String, InvalidNotificationName),
     #[error("`{0}` is not a colour: expected 0xaarrggbb, 0xrrggbb or \"#rrggbb\"")]
     InvalidColor(String),
     #[error("`{0}` is not a valid item-name pattern: {1}")]

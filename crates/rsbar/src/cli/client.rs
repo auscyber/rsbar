@@ -1,6 +1,7 @@
 //! Sends a plan of requests to the daemon over one connection.
 
-use async_mach_ports::{SendPort, Sender};
+use async_mach_ports::SendPort;
+use rsbar_protocol::wire::{MessagePack, Sender};
 use rsbar_protocol::{Request, Response, service_name};
 use std::process::ExitCode;
 
@@ -14,7 +15,7 @@ use super::json::to_sketchybar_json;
 /// process still exits with failure if anything did.
 pub(super) fn send_all(requests: &[Request]) -> ExitCode {
     let service = service_name();
-    let sender = match Sender::<Request>::connect(&service) {
+    let sender = match Sender::<Request>::connect(&service, MessagePack) {
         Ok(sender) => sender,
         Err(err) => {
             eprintln!("rsbar is not running ({err})");

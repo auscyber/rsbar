@@ -29,16 +29,39 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-mach-ports"
-version = "0.1.0"
+name = "async-channel"
+version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6aaffd73cf16e62693c6ec05ac6eacac6adf538cd11cdd69a871d30d6f8b4bbb"
+checksum = "924ed96dd52d1b75e9c1a3e6275715fd320f5f9439fb5a4a11fa51f4221158d2"
+dependencies = [
+ "concurrent-queue",
+ "event-listener-strategy",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-executor"
+version = "1.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c96bf972d85afc50bf5ab8fe2d54d1586b4e0b46c97c50a0c9e71e2f7bcd812a"
+dependencies = [
+ "async-task",
+ "concurrent-queue",
+ "fastrand",
+ "futures-lite",
+ "pin-project-lite",
+ "slab",
+]
+
+[[package]]
+name = "async-mach-ports"
+version = "0.3.0"
 dependencies = [
  "bitflags",
  "futures-lite",
  "libc",
  "mach2",
- "postcard",
  "serde",
  "serde_repr",
 ]
@@ -180,6 +203,7 @@ dependencies = [
  "critical-section",
  "foldhash",
  "futures-channel",
+ "futures-lite",
  "hashbrown 0.16.1",
  "js-sys",
  "portable-atomic",
@@ -244,9 +268,12 @@ version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f787d4ba7237b64b30bd2d690a8cbae1ba775e0eec326711c446654cb720e7c"
 dependencies = [
+ "async-channel",
+ "async-executor",
  "async-task",
  "atomic-waker",
  "bevy_platform",
+ "concurrent-queue",
  "crossbeam-queue",
  "derive_more",
  "futures-lite",
@@ -528,6 +555,26 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "event-listener"
+version = "5.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
+dependencies = [
+ "parking",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "event-listener-strategy"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
+dependencies = [
+ "event-listener",
+ "pin-project-lite",
 ]
 
 [[package]]
@@ -997,6 +1044,7 @@ checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
  "bitflags",
  "dispatch2",
+ "libc",
  "objc2",
 ]
 
@@ -1229,12 +1277,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "rmp"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "rmp-serde"
+version = "1.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
+dependencies = [
+ "rmp",
+ "serde",
+]
+
+[[package]]
 name = "rsbar"
 version = "0.1.0"
 dependencies = [
+ "async-executor",
  "async-mach-ports",
  "bevy_app",
  "bevy_ecs",
+ "bevy_tasks",
  "bevy_time",
  "bitflags",
  "block2",
@@ -1270,6 +1339,7 @@ dependencies = [
  "regex",
  "rsbar-protocol",
  "serde",
+ "serde_path_to_error",
  "thiserror",
  "tokio",
  "tracing",
@@ -1280,13 +1350,25 @@ dependencies = [
 name = "rsbar-protocol"
 version = "0.1.0"
 dependencies = [
+ "async-mach-ports",
  "bitflags",
  "libc",
  "postcard",
+ "rmp-serde",
+ "rsbar-protocol-macros",
  "serde",
  "serde_json",
- "struct-patch",
  "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "rsbar-protocol-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1385,6 +1467,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_repr"
 version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1425,11 +1518,27 @@ name = "skylight"
 version = "0.1.0"
 dependencies = [
  "bitflags",
+ "futures-core",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-application-services",
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-quartz-core",
+ "skylight-macros",
  "thiserror",
+ "tokio",
  "tracing",
+]
+
+[[package]]
+name = "skylight-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "uuid",
 ]
 
 [[package]]
@@ -1485,26 +1594,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "struct-patch"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "562b5d730abba4c29316f65c76f4939ae63ac998a761fbd99c61ed543d183e23"
-dependencies = [
- "struct-patch-derive",
-]
-
-[[package]]
-name = "struct-patch-derive"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4761d4848bf2b974f0a5a93fc69ee63c9f89816c618b3c3c12b8b13690524f1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.5",
-]
 
 [[package]]
 name = "syn"

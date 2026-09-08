@@ -1,0 +1,23 @@
+[package]
+name = "skylight-macros"
+description = "The `#[main_thread]` attribute behind skylight's main-thread proof."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true }
+# Added here and by hand at the same moment; the version is the stricter of the
+# two. Only ever used at expansion time, to name a binding nobody can write.
+uuid = { version = "1.3", features = ["v4"] }
+
+[lints]
+workspace = true

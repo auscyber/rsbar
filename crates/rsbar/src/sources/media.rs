@@ -33,11 +33,11 @@
 //!
 //! If a future build of this daemon carries the entitlement Apple grants
 //! `Music.app`, `Podcasts.app` and a handful of others, the fix is to delete
-//! this file's `register` body and write the real one — the framework calls
+//! this file's `run` body and write the real one — the framework calls
 //! above are the ones to use, and the notification and dictionary key names
 //! are unchanged.
 
-use crate::sources::{Cause, Registering, Registration, Source, SourceId, StartError};
+use crate::sources::{Cause, Registering, Source, SourceId, StartError};
 use rsbar_protocol::Kind;
 use std::collections::BTreeSet;
 
@@ -52,11 +52,11 @@ impl Source for Media {
         vec![Kind::MediaChanged]
     }
 
-    fn register(
+    fn run(
         &mut self,
         _wanted: &BTreeSet<Kind>,
-        _cx: &mut Registering<'_>,
-    ) -> Result<Registration, StartError> {
+        _cx: Registering,
+    ) -> Result<crate::pool::Task, StartError> {
         Err(StartError::new(self.id(), Cause::MediaRemoteBlocked))
     }
 }

@@ -7,9 +7,14 @@
 //! Every item's stream is merged into one [`SelectAll`] and driven from a
 //! single `async fn` — no threads, no cross-thread channel. That is only
 //! possible because `Dispatcher` is `async`-all-the-way-down: awaiting N
-//! streams concurrently on one thread is what an executor is for, and
-//! `async-mach-ports`' streams are already waker-driven, so this costs
-//! nothing while idle.
+//! streams concurrently on one thread is what an executor is for, and both
+//! dispatchers' streams are already waker-driven, so this costs nothing while
+//! idle.
+//!
+//! The callback map is behind a [`Mutex`] rather than a `RefCell` because
+//! mlua's `send` feature makes every registered callback `Send`, so the
+//! registry an `item:subscribe` closure holds has to be too. It is never
+//! contended: the VM runs one thread at a time.
 //!
 //! A script that calls `item:subscribe` for a *new* item only after
 //! `rsbar.run()` is already looping will not see it take effect — the item's
@@ -17,10 +22,9 @@
 //! start. Registering every subscription before calling `rsbar.run()` is the
 //! supported shape, matching how such a config is written in practice.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use futures_util::stream::{SelectAll, StreamExt as _};
 use mlua::{Function, Lua};
@@ -36,19 +40,19 @@ struct ItemSubs {
 
 /// One item's tagged event stream, boxed so every item's stream can share one
 /// [`SelectAll`] despite each closure in [`Registry::run`] having its own type.
-type TaggedStream = Pin<Box<dyn futures_lite::Stream<Item = (ItemName, Event)>>>;
+type TaggedStream = Pin<Box<dyn futures_lite::Stream<Item = (ItemName, Event)> + Send>>;
 
 pub struct Registry {
-    dispatcher: Rc<dyn Dispatcher>,
-    items: RefCell<HashMap<ItemName, ItemSubs>>,
+    dispatcher: Arc<dyn Dispatcher>,
+    items: Mutex<HashMap<ItemName, ItemSubs>>,
 }
 
 impl Registry {
     #[must_use]
-    pub fn new(dispatcher: Rc<dyn Dispatcher>) -> Self {
+    pub fn new(dispatcher: Arc<dyn Dispatcher>) -> Self {
         Self {
             dispatcher,
-            items: RefCell::new(HashMap::new()),
+            items: Mutex::new(HashMap::new()),
         }
     }
 
@@ -56,7 +60,8 @@ impl Registry {
     /// registered for that same pair.
     pub fn subscribe(&self, item: &ItemName, kind: Kind, callback: Function) {
         self.items
-            .borrow_mut()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .entry(item.clone())
             .or_default()
             .callbacks
@@ -80,7 +85,8 @@ impl Registry {
     pub async fn run(&self, lua: &Lua) -> mlua::Result<()> {
         let snapshot: Vec<(ItemName, Vec<Kind>)> = self
             .items
-            .borrow()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .map(|(item, subs)| (item.clone(), subs.callbacks.keys().cloned().collect()))
             .collect();
@@ -100,7 +106,8 @@ impl Registry {
             let kind = event.kind();
             let callback = self
                 .items
-                .borrow()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
                 .get(&item)
                 .and_then(|subs| subs.callbacks.get(&kind).cloned());
             let Some(callback) = callback else { continue };

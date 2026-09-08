@@ -8,7 +8,7 @@
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{CGColor, CGDisplayBounds, CGMainDisplayID};
 use objc2_quartz_core::CALayer;
-use skylight::{Window, WindowTags, level, present, without_implicit_animations};
+use skylight::{Window, WindowTags, level};
 
 const BAR_HEIGHT: f64 = 40.0;
 
@@ -20,7 +20,8 @@ fn main() {
         CGSize::new(bounds.size.width, BAR_HEIGHT),
     );
 
-    let window = Window::new(frame).expect("create window");
+    let mtm = objc2::MainThreadMarker::new().expect("an example runs on the main thread");
+    let window = Window::new(frame, mtm).expect("create window");
     window.set_scale(2.0).expect("scale");
     window.set_opaque(false).expect("opacity");
     window.set_alpha(1.0).expect("alpha");
@@ -32,7 +33,7 @@ fn main() {
         .expect("tags");
 
     let root = CALayer::new();
-    without_implicit_animations(|| {
+    skylight::without_implicit_animations(mtm, || {
         root.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), frame.size));
         root.setContentsScale(2.0);
         root.setBackgroundColor(Some(&CGColor::new_srgb(0.05, 0.05, 0.08, 0.85)));
@@ -53,7 +54,7 @@ fn main() {
     // Order in *before* drawing: the window server hands out a drawing context
     // for a window that is on screen.
     window.order_above(None).expect("order in");
-    present(window.id(), frame.size, &root);
+    skylight::present(&window, frame.size, &root);
 
     println!(
         "window {} up on display {display} at {frame:?}",

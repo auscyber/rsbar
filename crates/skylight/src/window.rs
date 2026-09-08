@@ -23,16 +23,20 @@ pub mod level {
     pub const POPUP_MENU: c_int = 101;
 }
 
-/// The process-wide window server connection.
-pub(crate) fn connection_id() -> ConnectionId {
-    connection()
+/// The process-wide window server connection, for a caller that already knows
+/// it has been made — see [`established`].
+pub(crate) fn connection_id() -> ffi::ConnectionId {
+    crate::connection::established()
 }
 
-fn connection() -> ConnectionId {
-    use std::sync::LazyLock;
-    static CONNECTION: LazyLock<ConnectionId> =
-        LazyLock::new(|| unsafe { ffi::SLSMainConnectionID() });
-    *CONNECTION
+/// The connection, asked for once.
+///
+/// `SLSMainConnectionID` wants the main thread — it is what establishes the
+/// process's connection — so the first ask carries proof. What comes back is a
+/// plain id any thread may carry; see [`crate::connection`] for why using it
+/// needs a lock rather than a thread.
+fn connection(proof: impl crate::MainThreadProof) -> ConnectionId {
+    crate::connection::establish(proof)
 }
 
 /// `kCGBackingStoreBuffered`.
@@ -52,21 +56,59 @@ const WINDOW_OPTIONS: std::ffi::c_int = 13;
 ///
 /// This is what lets a bar sit above the menu bar, on every space, and over
 /// fullscreen apps — none of which `AppKit` will grant a borderless `NSWindow`.
-#[derive(Debug)]
+///
+/// # Why this is proof of the thread it is on
+///
+/// Every method here mutates window server state, and all of it belongs on the
+/// thread pumping the run loop that composites it. That is enforced rather
+/// than asked for, in two halves that only work together:
+///
+/// - [`Window::new`] takes a [`MainThreadMarker`], which cannot be obtained
+///   anywhere else. So a `Window` can only come into existence on the main
+///   thread.
+/// - the [`crate::OnlyOnMain`] field makes it neither `Send` nor `Sync`, so it
+///   cannot leave the thread that made it. `#[derive(MainThreadOnly)]` turns
+///   that into the `MainThreadProof` impl, and refuses to compile if the
+///   field ever stops doing its job.
+///
+/// Together those say: *if you are holding one of these, you are on the main
+/// thread* — checked once at creation, then carried by the type. No method
+/// needs a marker of its own and none of it costs anything at runtime.
+///
+/// A window this process did not create is [`Foreign`] instead, which offers
+/// only what is safe to do from a worker.
+///
+/// The half of that a compiler can be asked to confirm, as a test rather than
+/// a claim — sending one to a thread does not build:
+///
+/// ```compile_fail,E0277
+/// fn onto_a_worker<T: Send>(_: T) {}
+/// fn check(window: skylight::Window) {
+///     onto_a_worker(window);
+/// }
+/// ```
+///
+/// while the id it is known by does — which is what the capture pool carries
+/// to a worker, and all it needs:
+///
+/// ```
+/// fn onto_a_worker<T: Send>(_: T) {}
+/// fn check(window: skylight::WindowId) {
+///     onto_a_worker(window);
+/// }
+/// ```
+#[derive(Debug, skylight_macros::MainThreadOnly)]
 pub struct Window {
     id: WindowId,
     connection: ConnectionId,
-    /// A window adopted with [`Window::from_existing`] belongs to someone else
-    /// and must not be released on drop.
-    owned: bool,
     /// What this process has asked the window server for, so
     /// [`Self::set_tags`]/[`Self::clear_tags`] can skip a syscall — and the
     /// repaint/reframe it can trigger downstream — when asked to apply a
-    /// value that is already in effect. Starts empty even for
-    /// [`Self::from_existing`], where the window's real tags are unknown
-    /// until read with [`Self::tags`]; a first `set_tags`/`clear_tags` call
-    /// on such a window is therefore not skipped even if it would be a no-op.
+    /// value that is already in effect.
     known_tags: Cell<WindowTags>,
+    /// Not `Send`, not `Sync`: see the type's own doc comment. This is the
+    /// half of the proof that keeps a window on the thread that made it.
+    _main: crate::OnlyOnMain,
 }
 
 impl Window {
@@ -74,11 +116,14 @@ impl Window {
     ///
     /// The caller still has to give it a level, tags and a resolution, then
     /// order it in; a freshly created window is not yet on screen.
+    ///
+    /// The marker is the whole main-thread check for the life of this window —
+    /// see the type's doc comment.
     // Window server coordinates are `float`. Screen geometry is far inside
     // f32's exact-integer range, so the narrowing is lossless in practice.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn new(frame: CGRect) -> Result<Self> {
-        let connection = connection();
+    pub fn new(frame: CGRect, proof: impl crate::MainThreadProof) -> Result<Self> {
+        let connection = connection(&proof);
         let shape = Region::from_rect(&CGRect::new(CGPoint::new(0.0, 0.0), frame.size))?;
         // An empty opaque shape is what makes every pixel alpha-blended.
         let opaque = Region::empty()?;
@@ -107,20 +152,9 @@ impl Window {
         Ok(Self {
             id,
             connection,
-            owned: true,
             known_tags: Cell::new(WindowTags::empty()),
+            _main: crate::OnlyOnMain::NEW,
         })
-    }
-
-    /// Adopts a window this process did not create. Never released on drop.
-    #[must_use]
-    pub fn from_existing(id: WindowId) -> Self {
-        Self {
-            id,
-            connection: connection(),
-            owned: false,
-            known_tags: Cell::new(WindowTags::empty()),
-        }
     }
 
     #[must_use]
@@ -354,66 +388,68 @@ impl Window {
         ok(unsafe { ffi::SLSOrderWindow(self.connection, self.id, mode, relative_to) })
             .map_err(Error::Order)
     }
+}
 
-    /// Renders this window's current on-screen contents to a still image.
-    ///
-    /// This is how `alias` items mirror another process's menu bar item. It
-    /// needs Screen Recording permission; without it the window server leaves
-    /// the image null rather than reporting an error, which surfaces here as
-    /// [`Error::NoCapture`].
-    pub fn capture(&self) -> Result<CFRetained<CGImage>> {
-        // The full-resolution capture bit, cross-checked against SketchyBar's
-        // `window.c`.
-        const FULL_RESOLUTION: u32 = 1 << 8;
+/// Renders a window's current on-screen contents to a still image.
+///
+/// Takes an id rather than a [`Window`], and needs no proof: this is how
+/// `alias` items mirror another process's menu bar item, and it runs on the
+/// capture pool. Doing it on the thread that composites cost a measured 115ms
+/// of every second.
+///
+/// Needs Screen Recording permission; without it the window server leaves the
+/// image null rather than reporting an error, which surfaces here as
+/// [`Error::NoCapture`].
+pub fn capture(connected: &crate::Connected, window: WindowId) -> Result<CFRetained<CGImage>> {
+    // The full-resolution capture bit, cross-checked against SketchyBar's
+    // `window.c`.
+    const FULL_RESOLUTION: u32 = 1 << 8;
 
-        // `CGRectNull` reconstructed by hand: `objc2-core-graphics` does not
-        // bind the extern symbol, but the null rect's definition — infinite
-        // origin, zero size — is a stable, documented constant, and this is
-        // what tells the window server to capture the whole window.
-        let whole_window = CGRect::new(
-            CGPoint::new(f64::INFINITY, f64::INFINITY),
-            CGSize::new(0.0, 0.0),
+    // `CGRectNull` reconstructed by hand: `objc2-core-graphics` does not bind
+    // the extern symbol, but the null rect's definition -- infinite origin,
+    // zero size -- is a stable, documented constant, and this is what tells
+    // the window server to capture the whole window.
+    let whole_window = CGRect::new(
+        CGPoint::new(f64::INFINITY, f64::INFINITY),
+        CGSize::new(0.0, 0.0),
+    );
+
+    let wide_id = u64::from(window);
+    let mut image: *mut CGImage = ptr::null_mut();
+    // SAFETY: `wide_id` outlives the call, and `image` is a valid
+    // out-pointer.
+    unsafe {
+        ffi::SLSCaptureWindowsContentsToRectWithOptions(
+            connected.id(),
+            &raw const wide_id,
+            true,
+            whole_window,
+            FULL_RESOLUTION,
+            &raw mut image,
         );
-
-        let wide_id = u64::from(self.id);
-        let mut image: *mut CGImage = ptr::null_mut();
-        // SAFETY: `wide_id` outlives the call, and `image` is a valid
-        // out-pointer.
-        unsafe {
-            ffi::SLSCaptureWindowsContentsToRectWithOptions(
-                self.connection,
-                &raw const wide_id,
-                true,
-                whole_window,
-                FULL_RESOLUTION,
-                &raw mut image,
-            );
-        }
-
-        let image = NonNull::new(image).ok_or(Error::NoCapture)?;
-        // SAFETY: a non-null result carries a +1 reference, ownership of
-        // which transfers to `CFRetained`.
-        Ok(unsafe { CFRetained::from_raw(image) })
     }
 
-    /// This window's true size in screen points.
-    ///
-    /// The window list's own bounds can disagree with this; this is the
-    /// value `SketchyBar` actually draws a capture at.
-    pub fn true_rect(&self) -> Result<CGRect> {
-        let mut rect = CGRect::ZERO;
-        // SAFETY: `rect` is a valid out-pointer.
-        ok(unsafe { ffi::SLSGetScreenRectForWindow(self.connection, self.id, &raw mut rect) })
-            .map_err(Error::ScreenRect)?;
-        Ok(rect)
-    }
+    let image = NonNull::new(image).ok_or(Error::NoCapture)?;
+    // SAFETY: a non-null result carries a +1 reference, ownership of which
+    // transfers to `CFRetained`.
+    Ok(unsafe { CFRetained::from_raw(image) })
+}
+
+/// A window's true size in screen points, by id.
+///
+/// The window list's own bounds can disagree with this; this is the value
+/// `SketchyBar` actually draws a capture at. On the capture pool for the same
+/// reason [`capture`] is.
+pub fn true_rect(connected: &crate::Connected, window: WindowId) -> Result<CGRect> {
+    let mut rect = CGRect::ZERO;
+    // SAFETY: `rect` is a valid out-pointer.
+    ok(unsafe { ffi::SLSGetScreenRectForWindow(connected.id(), window, &raw mut rect) })
+        .map_err(Error::ScreenRect)?;
+    Ok(rect)
 }
 
 impl Drop for Window {
     fn drop(&mut self) {
-        if !self.owned {
-            return;
-        }
         // SAFETY: we created this window and have not released it.
         if let Err(err) = ok(unsafe { ffi::SLSReleaseWindow(self.connection, self.id) }) {
             tracing::warn!(?err, id = self.id, "failed to release window server window");
@@ -424,17 +460,22 @@ impl Drop for Window {
 /// Suspends compositing for the duration of `f`, so a batch of window mutations
 /// lands as one visual change instead of a sequence of them.
 ///
+/// Takes the marker rather than a window: this is the whole display's
+/// compositing, so there is no one value to carry the proof.
+///
 /// Re-enables on unwind too: a leaked suspension freezes the entire display.
-pub fn batched<R>(f: impl FnOnce() -> R) -> R {
+pub fn batched<R>(proof: impl crate::MainThreadProof, f: impl FnOnce() -> R) -> R {
     struct Guard(ConnectionId);
     impl Drop for Guard {
         fn drop(&mut self) {
             // SAFETY: matches the disable in `batched`.
+            // SAFETY: matches the disable in `batched`; the guard cannot
+            // outlive the proof that made it.
             unsafe { ffi::SLSReenableUpdate(self.0) };
         }
     }
 
-    let cid = connection();
+    let cid = connection(proof);
     // SAFETY: the guard re-enables on every path out, including a panic.
     unsafe { ffi::SLSDisableUpdate(cid) };
     let _guard = Guard(cid);

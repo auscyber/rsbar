@@ -132,6 +132,19 @@ enum Member<'de> {
     Nested(Vec<(&'de str, &'de str)>),
 }
 
+/// The members of one group, in the order argv named them.
+///
+/// A head that arrives both ways — `label=12:34 label.color=0xff00ff00` — is
+/// yielded **twice**, bare form first. That is not a contradiction to be
+/// rejected: it is the flat spelling of one table, and it is what every real
+/// `SketchyBar` config writes. The patch folds the two into one value, and
+/// which field a bare string lands in is the patch type's own business
+/// (`#[changes(scalar = ...)]`) rather than something this reader has to
+/// know — so a type with no bare form, like a background, still fails, and
+/// fails saying so.
+///
+/// What is still a contradiction, and still an error: the same key given two
+/// different values in one command.
 fn group_members<'de>(
     pairs: &[(&'de str, &'de str)],
     path: &str,
@@ -149,7 +162,14 @@ fn group_members<'de>(
         }
         match rest {
             None => {
-                leaves.insert(head, value);
+                if let Some(previous) = leaves.insert(head, value)
+                    && previous != value
+                {
+                    return Err(ArgsError::at(
+                        &join_path(path, head),
+                        format!("set twice in one command, to `{previous}` and to `{value}`"),
+                    ));
+                }
             }
             Some(rest) => {
                 nested.entry(head).or_default().push((rest, value));
@@ -159,17 +179,12 @@ fn group_members<'de>(
 
     let mut result = Vec::with_capacity(order.len());
     for head in order {
-        let has_leaf = leaves.contains_key(head);
-        let has_nested = nested.contains_key(head);
-        if has_leaf && has_nested {
-            return Err(ArgsError::at(
-                &join_path(path, head),
-                "used both as a plain value and as a nested property in the same command",
-            ));
-        }
+        // Bare form first, so an explicit nested key for the same property
+        // is the later of the two and wins.
         if let Some(value) = leaves.get(head) {
             result.push((head, Member::Leaf(value)));
-        } else if let Some(rest) = nested.remove(head) {
+        }
+        if let Some(rest) = nested.remove(head) {
             result.push((head, Member::Nested(rest)));
         }
     }
@@ -322,8 +337,18 @@ impl ScalarDeserializer<'_> {
 impl<'de> Deserializer<'de> for ScalarDeserializer<'de> {
     type Error = ArgsError;
 
-    fn deserialize_any<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Self::Error> {
-        Err(self.err("this shape is not supported in a command-line value"))
+    /// A value out of argv is a string and nothing else, so that is what a
+    /// type asking "what have you got" is told. It matters for the types that
+    /// take more than one spelling — a [`Color`](rsbar_protocol::Color) is a
+    /// string here and a number in a Lua config, and asks `any` rather than
+    /// declaring which — and it is what `#[serde(untagged)]` needs to work
+    /// through this deserializer at all.
+    ///
+    /// A type that cannot be a string still fails, just one step later and
+    /// with its own message: "invalid type: string" from the visitor that
+    /// wanted something else, rather than a blanket refusal from here.
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        visitor.visit_borrowed_str(self.value)
     }
 
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
@@ -546,7 +571,13 @@ mod tests {
             patch.label.unwrap().font,
             Some(FontSpec::parse("Hack:Bold:14"))
         );
-        assert_eq!(patch.background.unwrap().corner_radius, Some(6.0));
+        assert_eq!(
+            patch
+                .geometry
+                .and_then(|geometry| geometry.background)
+                .and_then(|background| background.corner_radius),
+            Some(6.0)
+        );
     }
 
     #[test]
@@ -571,15 +602,32 @@ mod tests {
         ] {
             let p = pairs(&[("drawing", text)]);
             let patch: RunPatch = from_pairs(&p).unwrap();
-            assert_eq!(patch.drawing, Some(expected), "for {text}");
+            assert_eq!(
+                patch.drawing,
+                Some(if expected {
+                    rsbar_protocol::BoolChange::True
+                } else {
+                    rsbar_protocol::BoolChange::False
+                }),
+                "for {text}"
+            );
         }
     }
 
     #[test]
     fn a_bad_bool_names_the_key() {
-        let p = pairs(&[("drawing", "toggle")]);
+        let p = pairs(&[("drawing", "sometimes")]);
         let err = from_pairs::<RunPatch>(&p).unwrap_err();
         assert_eq!(err.path, "drawing");
+    }
+
+    #[test]
+    fn toggle_is_a_boolean_spelling_now_that_the_daemon_resolves_it() {
+        // The field is `BoolChange`: the CLI carries the intent, the daemon
+        // (which knows the current value) resolves `toggle`.
+        let p = pairs(&[("drawing", "toggle")]);
+        let patch: RunPatch = from_pairs(&p).unwrap();
+        assert_eq!(patch.drawing, Some(rsbar_protocol::BoolChange::Toggle));
     }
 
     #[test]
@@ -590,16 +638,25 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_field_is_rejected() {
-        let p = pairs(&[("wat", "1")]);
-        assert!(from_pairs::<RunPatch>(&p).is_err());
+    fn an_unknown_field_is_named_and_skipped_rather_than_rejected() {
+        // The patch's own `Deserialize` warns and carries on -- see
+        // `rsbar_protocol::patch`. What reaches here is a patch with the
+        // properties that were understood and nothing for the one that was
+        // not.
+        let p = pairs(&[("wat", "1"), ("padding_left", "4")]);
+        let patch: RunPatch = from_pairs(&p).unwrap();
+        assert_eq!(patch.padding_left, Some(4.0));
+        assert_eq!(patch.text, None);
     }
 
     #[test]
     fn position_parses_through_the_enum_path() {
         let p = pairs(&[("position", "left")]);
         let patch: ItemPatch = from_pairs(&p).unwrap();
-        assert_eq!(patch.position, Some(Position::Left));
+        assert_eq!(
+            patch.geometry.and_then(|geometry| geometry.position),
+            Some(Position::Left)
+        );
 
         let p = pairs(&[("position", "nope")]);
         assert!(from_pairs::<ItemPatch>(&p).is_err());
@@ -617,6 +674,71 @@ mod tests {
                 Selector::Pattern(r"menu\..*".into()),
             ])
         );
+    }
+
+    #[test]
+    fn a_bare_value_and_its_nested_properties_are_one_table() {
+        // `--set clock label=12:34 label.color=...` is what every real
+        // SketchyBar config writes: the flat spelling of
+        // `label = { string = "12:34", color = ... }`, not a contradiction.
+        let p = pairs(&[
+            ("label", "12:34"),
+            ("icon", "T"),
+            ("label.color", "0xff00ff00"),
+        ]);
+        let patch: ItemPatch = from_pairs(&p).unwrap();
+        let label = patch.label.expect("label was set");
+        assert_eq!(label.text.as_deref(), Some("12:34"));
+        assert_eq!(label.color, Some(Color(0xff00_ff00)));
+        assert_eq!(patch.icon.and_then(|icon| icon.text).as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn the_same_property_set_twice_to_different_values_is_still_an_error() {
+        let p = pairs(&[("label", "a"), ("label", "b")]);
+        let err = from_pairs::<ItemPatch>(&p).unwrap_err();
+        assert_eq!(err.path, "label");
+        assert!(err.message.contains("set twice"), "{err}");
+        // The same value twice says nothing new and is not a contradiction.
+        let p = pairs(&[("label", "a"), ("label", "a")]);
+        assert!(from_pairs::<ItemPatch>(&p).is_ok());
+    }
+
+    #[test]
+    fn a_bare_value_for_a_table_with_no_bare_form_still_fails() {
+        // A background is not a value: there is no `#[changes(scalar = ...)]`
+        // on it, so nothing says what `background=x` would mean.
+        let p = pairs(&[("background", "x"), ("background.height", "20")]);
+        let err = from_pairs::<ItemPatch>(&p).unwrap_err();
+        assert!(err.to_string().contains("background"), "{err}");
+    }
+
+    #[test]
+    fn a_colour_is_spelled_either_way_from_argv_too() {
+        // The alias is the patch type's, so it works through whichever door
+        // reaches the same `Deserialize`.
+        let p = pairs(&[("label.colour", "0xffaa00ff")]);
+        let patch: ItemPatch = from_pairs(&p).unwrap();
+        assert_eq!(
+            patch.label.and_then(|label| label.color),
+            Some(Color(0xffaa_00ff))
+        );
+    }
+
+    #[test]
+    fn a_flattened_property_needs_no_prefix_out_of_argv() {
+        // `padding_left` lives on `Geometry` and `script` on `Scripting`, and
+        // a config writes neither prefix. It also proves nothing buffers: a
+        // buffered `f64` handed the string `4` would fail here.
+        let p = pairs(&[("padding_left", "4"), ("script", "s"), ("update_freq", "5")]);
+        let patch: ItemPatch = from_pairs(&p).unwrap();
+        assert_eq!(
+            patch.geometry.and_then(|geometry| geometry.padding_left),
+            Some(4.0)
+        );
+        let scripting = patch.scripting.expect("scripting keys landed");
+        assert_eq!(scripting.script.as_deref(), Some("s"));
+        assert_eq!(scripting.update_freq, Some(5));
     }
 
     #[test]

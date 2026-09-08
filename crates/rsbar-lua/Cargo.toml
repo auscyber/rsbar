@@ -54,7 +54,14 @@ module = ["mlua/module"]
 # `Serialize` in exactly the shape a config should see, `Color`/`FontSpec`
 # included — `lua.to_value` builds the Lua table from that directly instead
 # of a second, hand-maintained copy of the same field list.
-mlua = { version = "0.12", default-features = false, features = ["async", "serde"] }
+# `send`: `Lua` becomes `Send + Sync` behind a reentrant mutex, which is what
+# lets the daemon host the VM on a thread that is not the one that draws. It
+# does not make Lua itself concurrent -- the VM still runs one thread at a
+# time -- it makes the *handle* movable, and in exchange requires every
+# callback this crate registers to be `Send` and every `UserData` to be
+# `Send + Sync`. That is why `Dispatcher`'s futures are `BoxFuture` rather
+# than local, and why nothing here holds an `Rc`.
+mlua = { version = "0.12", default-features = false, features = ["async", "send", "serde"] }
 rsbar-protocol = { workspace = true }
 async-mach-ports = { workspace = true }
 futures-lite = { workspace = true }
@@ -63,7 +70,7 @@ futures-lite = { workspace = true }
 futures-util = { version = "0.3", default-features = false, features = ["std", "alloc"] }
 # Only the bin needs an actual runtime (`rt`) to drive `exec_async`, plus
 # `process` for `rsbar.exec` spawning a shell command.
-tokio = { workspace = true, features = ["rt", "process"] }
+tokio = { workspace = true, features = ["rt", "process", "time"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
@@ -76,6 +83,12 @@ regex = "1"
 # `ItemState`/`BarState` are already `Serialize` in exactly the shape a query
 # result should hand back to a config — see `convert::serde_table`.
 serde = { workspace = true }
+# Diagnostics only, and deliberately not a second reader: it wraps `mlua`'s
+# own deserializer to remember which key it was on when a value failed, so a
+# config author is told `popup.drawing` and not just what the value was. The
+# CLI names the property from its own `ArgsError` path; this is what makes the
+# Lua side say the same thing.
+serde_path_to_error = "0.1.20"
 
 [lints]
 workspace = true

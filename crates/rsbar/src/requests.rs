@@ -15,13 +15,17 @@ use crate::components::{
 use crate::popup::{PopupConfig, PopupOf};
 use crate::script::Job;
 use crate::shaping::Cache;
-use crate::sources::{Registry, Target};
+use crate::sources::Registry;
 use crate::subscribers::Subscribers;
 use bevy_ecs::prelude::*;
 use bevy_ecs::query::QueryData;
 use bevy_ecs::system::SystemParam;
+// `Changes` is `rsbar_protocol`'s trait; the bitflags of the same name from
+// `crate::bar` is what this module's own `set_bar` reads, so the trait comes
+// in anonymously and neither shadows the other.
+use rsbar_protocol::Changes as _;
 use rsbar_protocol::{
-    BackgroundPatch, ComponentKind, Event, ItemName, ItemPatch, ItemState, Kind, Patch, Position,
+    BackgroundPatch, ComponentKind, Event, ItemName, ItemPatch, ItemState, Kind, Position,
     PressTarget, Query as ProtocolQuery, Relative, Request, Response, RunPatch, Selector,
 };
 use std::collections::BTreeSet;
@@ -117,11 +121,29 @@ pub struct Items<'w, 's> {
 #[derive(SystemParam)]
 pub struct ItemsRead<'w, 's> {
     pub read: Query<'w, 's, ItemRead>,
+    /// The three components [`ItemRead`] does not carry, queried separately
+    /// so both projections of an item report the same thing. Read-only and
+    /// over the same entities, which Bevy allows: two reads never conflict.
+    pub extra: Query<
+        'w,
+        's,
+        (
+            &'static ItemDisplay,
+            Option<&'static Slider>,
+            Option<&'static AssociatedSpace>,
+        ),
+    >,
 }
 
+/// What [`ItemsRead::extra`] yields for one item.
+type Extra<'a> = (
+    Option<&'a ItemDisplay>,
+    Option<&'a Slider>,
+    Option<&'a AssociatedSpace>,
+);
+
 impl Items<'_, '_> {
-    /// The scripts to run for `event`, read through the write query.
-    /// The jobs an event produces for the items that depend on it.
+    /// The scripts to run for `event`, for the items that depend on it.
     ///
     /// `dependents` comes from the claims, so this never scans: an event goes
     /// to what asked for it, and an event nothing asked for costs nothing.
@@ -185,10 +207,10 @@ impl Items<'_, '_> {
 fn popup_state(config: Option<&PopupConfig>) -> rsbar_protocol::PopupState {
     let config = config.copied().unwrap_or_default();
     rsbar_protocol::PopupState {
-        drawing: config.drawing,
-        horizontal: config.horizontal,
+        drawing: config.drawing.into(),
+        horizontal: config.horizontal.into(),
         align: config.align,
-        topmost: config.topmost,
+        topmost: config.topmost.into(),
         height: config.height,
         y_offset: config.y_offset,
         background: (&config.background).into(),
@@ -202,12 +224,13 @@ fn write_state(row: &ItemWriteReadOnlyItem<'_, '_>) -> ItemState {
         name: row.name.0.clone(),
         popup: popup_state(row.popup),
         geometry: rsbar_protocol::Geometry {
-            drawing: row.drawing.0,
+            drawing: row.drawing.0.into(),
             position: row.placement.0.clone(),
             y_offset: row.offset.0,
             padding_left: row.padding.left,
             padding_right: row.padding.right,
             width: row.width.0,
+            display: row.display.0,
             background: row.background.into(),
         },
         icon: (&row.icon.0).into(),
@@ -216,11 +239,18 @@ fn write_state(row: &ItemWriteReadOnlyItem<'_, '_>) -> ItemState {
             script: row.script.map(|s| s.0.to_string()),
             click_script: row.click.map(|s| s.0.to_string()),
             update_freq: row.routine.every,
-            updates: row.updates.0,
+            updates: row.updates.0.into(),
         },
         events: row.subscriptions.0.iter().cloned().collect(),
         alias: row.alias.map(|alias| alias.0.clone()),
         members: row.members.map(|m| m.0.clone()).unwrap_or_default(),
+        associated_space: row.associated_space.and_then(|space| space.0),
+        percentage: row.slider.map_or(0, |slider| slider.percentage),
+        knob: row
+            .slider
+            .map(|slider| (&slider.knob).into())
+            .unwrap_or_default(),
+        highlight_color: row.icon.0.highlight_color,
     }
 }
 
@@ -324,29 +354,39 @@ impl ItemsRead<'_, '_> {
 
     #[must_use]
     pub fn states(&self) -> Vec<ItemState> {
-        self.read.iter().map(|row| state_of(&row)).collect()
+        self.read
+            .iter()
+            .map(|row| {
+                let extra = self.extra.get(row.entity).ok();
+                state_of(&row, extra.map(|(d, s, a)| (Some(d), s, a)))
+            })
+            .collect()
     }
 
     #[must_use]
     pub fn state(&self, name: &ItemName) -> Option<ItemState> {
-        self.read
-            .iter()
-            .find(|row| &row.name.0 == name)
-            .map(|row| state_of(&row))
+        self.read.iter().find(|row| &row.name.0 == name).map(|row| {
+            let extra = self.extra.get(row.entity).ok();
+            state_of(&row, extra.map(|(d, s, a)| (Some(d), s, a)))
+        })
     }
 }
 
-fn state_of(row: &ItemReadItem<'_, '_>) -> ItemState {
+/// The same projection off the read-only query, with the components
+/// [`ItemRead`] does not carry read from [`ItemsRead::extra`].
+fn state_of(row: &ItemReadItem<'_, '_>, extra: Option<Extra<'_>>) -> ItemState {
+    let (display, slider, space) = extra.unwrap_or_default();
     ItemState {
         name: row.name.0.clone(),
         popup: popup_state(row.popup),
         geometry: rsbar_protocol::Geometry {
-            drawing: row.drawing.0,
+            drawing: row.drawing.0.into(),
             position: row.placement.0.clone(),
             y_offset: row.offset.0,
             padding_left: row.padding.left,
             padding_right: row.padding.right,
             width: row.width.0,
+            display: display.map(|d| d.0).unwrap_or_default(),
             background: row.background.into(),
         },
         icon: (&row.icon.0).into(),
@@ -355,11 +395,17 @@ fn state_of(row: &ItemReadItem<'_, '_>) -> ItemState {
             script: row.script.map(|s| s.0.to_string()),
             click_script: row.click.map(|s| s.0.to_string()),
             update_freq: row.routine.every,
-            updates: row.updates.0,
+            updates: row.updates.0.into(),
         },
         events: row.subscriptions.0.iter().cloned().collect(),
         alias: row.alias.map(|alias| alias.0.clone()),
         members: row.members.map(|m| m.0.clone()).unwrap_or_default(),
+        associated_space: space.and_then(|space| space.0),
+        percentage: slider.map_or(0, |slider| slider.percentage),
+        knob: slider
+            .map(|slider| (&slider.knob).into())
+            .unwrap_or_default(),
+        highlight_color: row.icon.0.highlight_color,
     }
 }
 
@@ -444,6 +490,11 @@ fn no_such(name: &ItemName) -> Outcome {
 
 /// Everything outside the item world that a request can reach.
 pub struct Context<'a> {
+    /// Proof of the thread the window server talks to.
+    ///
+    /// Carried rather than asked for: applying a request reshapes windows, and
+    /// the caller — a system on the run loop's own thread — already has it.
+    pub main: objc2::MainThreadMarker,
     pub settings: &'a mut Settings,
     pub panels: &'a mut Panels,
     pub cache: &'a mut Cache,
@@ -453,7 +504,7 @@ pub struct Context<'a> {
     pub subscribers: &'a mut Subscribers,
     /// A port this request arrived with, if the client wants its events
     /// pushed back rather than run as a script.
-    pub subscriber: Option<async_mach_ports::Subscriber>,
+    pub subscriber: Option<rsbar_protocol::wire::Subscriber>,
     /// What `--default` last set, applied to every item added from here on.
     pub defaults: &'a mut Defaults,
 }
@@ -505,10 +556,18 @@ fn apply_popup(
 ) {
     let existing = current.copied().unwrap_or_default();
     let patch = crate::popup::PopupPatch {
-        drawing: patch.drawing.map(|d| d.resolve(existing.drawing)),
-        horizontal: patch.horizontal,
+        // Every popup boolean resolves `toggle` against what the popup
+        // already is.
+        drawing: patch
+            .drawing
+            .map(|d| d.resolve(existing.drawing.into()).get()),
+        horizontal: patch
+            .horizontal
+            .map(|h| h.resolve(existing.horizontal.into()).get()),
         align: patch.align,
-        topmost: patch.topmost,
+        topmost: patch
+            .topmost
+            .map(|t| t.resolve(existing.topmost.into()).get()),
         height: patch.height,
         y_offset: patch.y_offset,
         background: patch.background,
@@ -591,9 +650,13 @@ fn matching(pattern: &str, items: &Items<'_, '_>) -> Result<Vec<Entity>, regex::
 }
 
 /// Opens the menu behind an `Owner,Name` alias spec.
+///
+/// Against the cached scan: a click must not wait on a walk of every running
+/// application, and does not need to — the item it is opening was resolved
+/// well before it could be clicked.
 fn press_alias(spec: &str) -> Result<(), crate::alias::Error> {
     let (owner, name) = spec.split_once(',').unwrap_or((spec, spec));
-    crate::alias::press_item(owner, name)
+    crate::alias::press_item(&crate::alias::Snapshot::cached()?, owner, name)
 }
 
 /// Applies one request.
@@ -603,6 +666,7 @@ fn press_alias(spec: &str) -> Result<(), crate::alias::Error> {
 )]
 pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outcome {
     let Context {
+        main,
         settings,
         panels,
         cache,
@@ -620,7 +684,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
                 if changes.contains(Changes::DISPLAYS) {
                     // A superset of `reframe`: it also creates and destroys
                     // panels, so a plain reframe afterwards would be redundant.
-                    panels.rebuild(settings)?;
+                    panels.rebuild(*main, settings)?;
                 } else if changes.contains(Changes::GEOMETRY) {
                     panels.reframe(settings)?;
                 }
@@ -673,13 +737,16 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
                 .id();
             items.index.insert(name, entity);
             host_of(&position, &items.index, entity, &mut items.commands);
-            // Applied through the ordinary patch path rather than baked into
-            // the bundle, so a default and an explicit `--set` of the same
-            // property behave identically -- including doing nothing when the
-            // value is already what the bundle starts with.
+            // See `NeedsDefaults`: applied through the ordinary patch path,
+            // not baked into the bundle.
             if defaults.0 != ItemPatch::default() {
                 items.commands.entity(entity).insert(NeedsDefaults);
             }
+            Outcome::ok()
+        }
+
+        Request::AddEvent { name, notification } => {
+            sources.declare_event(name, notification);
             Outcome::ok()
         }
 
@@ -697,14 +764,32 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
                 return Outcome::ok();
             }
             let order = items.index.next_order();
-            let mut spawned = items.commands.spawn(bundle(name.clone(), position, order));
+            let mut spawned = items
+                .commands
+                .spawn(bundle(name.clone(), position.clone(), order));
             // A space auto-subscribes to space changes the way `SketchyBar`'s
             // own `bar_item_set_type` sets `UPDATE_SPACE_CHANGE` — a config
-            // never has to ask for it. Graph and slider have nothing to
-            // subscribe to: they are driven by `--push`/a percentage set, not
-            // an event.
+            // never has to ask for it. An alias does the same with
+            // application launches, and for the same kind of reason: an alias
+            // naming an application that is not running cannot resolve, and a
+            // launch is the moment it can. It is the *only* thing that brings
+            // such an alias back, since nothing else observes an owner that
+            // was never found. Graph and slider have nothing to subscribe to:
+            // they are driven by `--push`/a percentage set, not an event.
             let watch: Vec<Kind> = match kind {
-                ComponentKind::Item { .. } | ComponentKind::Alias { .. } => Vec::new(),
+                ComponentKind::Item { .. } => Vec::new(),
+                ComponentKind::Alias { name, .. } => {
+                    // The name *is* the spec for `--add alias Owner,Name`, the
+                    // way a space's name is the space it follows. Without this
+                    // insert the item exists but draws nothing forever:
+                    // `ecs::refresh_aliases` queries for `AliasSpec` and
+                    // silently skips anything without it.
+                    spawned.insert((
+                        AliasSpec(name.to_string()),
+                        crate::components::AliasContent::default(),
+                    ));
+                    vec![Kind::AppLaunched]
+                }
                 ComponentKind::Bracket { members, .. } => {
                     spawned.insert(Members(
                         members
@@ -732,6 +817,11 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             };
             let entity = spawned.id();
             items.index.insert(name, entity);
+            // Same attachment `Request::Add(Item)` does: an alias, a bracket
+            // or a space placed in a popup needs [`PopupOf`] too, or nothing
+            // downstream -- including the popup's own drawing state -- can
+            // tell it is inside one.
+            host_of(&position, &items.index, entity, &mut items.commands);
             if defaults.0 != ItemPatch::default() {
                 items.commands.entity(entity).insert(NeedsDefaults);
             }
@@ -758,7 +848,11 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             let Ok(mut row) = items.write.get_mut(entity) else {
                 return no_such(&name);
             };
-            let wants_clicks = patch.click_script.as_ref().is_some_and(|s| !s.is_empty());
+            let wants_clicks = patch
+                .scripting
+                .as_ref()
+                .and_then(|scripting| scripting.click_script.as_ref())
+                .is_some_and(|script| !script.is_empty());
             let subscribed = wants_clicks.then(|| row.subscriptions.0.clone());
             set_item(entity, &mut row, &patch, &known, &mut items.commands);
             // Touching an item during a reload is what keeps it: a config that
@@ -907,17 +1001,18 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
 
         Request::Trigger(event) => {
             tracing::debug!(kind = %event.kind(), "trigger");
-            // A triggered event is not aimed anywhere, so it reaches whoever
-            // claimed it — the same path a source's event takes.
-            let event = Arc::new(event);
-            let mut dependents = sources.dependents(&event, &Target::All);
-            // Whoever holds a port takes it; only the rest fall back to a
-            // script, exactly as a source's event does.
-            dependents.retain(|item| !subscribers.push(*item, &event));
-            Outcome {
-                jobs: items.jobs_for(&event, &dependents),
-                ..Outcome::ok()
-            }
+            // A triggered event needs no source and no claim: this request
+            // arriving *is* the event arriving, so it is emitted rather than
+            // dispatched directly here -- the emitter sets the ready bit and
+            // wakes the run loop, and the ordinary drain delivers it the same
+            // way a source's event would. One delivery path, not a
+            // hand-copied second one.
+            //
+            // It is also the whole difference between the two kinds of custom
+            // event: a bridged one needs an observer on a notification centre,
+            // a triggered one needs nothing at all.
+            sources.emitter().send(event);
+            Outcome::ok()
         }
 
         Request::UpdateAll => Outcome {
@@ -933,32 +1028,42 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             Some(state) => Outcome::answer(Response::Item(Box::new(state))),
             None => no_such(&name),
         },
-        Request::Query(ProtocolQuery::MenuItems) => match crate::alias::list_menu_bar_items() {
-            Ok(found) => Outcome::answer(Response::MenuItems(
-                found
-                    .into_iter()
-                    .map(|item| format!("{},{}", item.owner, item.name))
-                    .collect(),
-            )),
-            Err(err) => Outcome::error(err.to_string()),
-        },
+        // `cached_or_scan`, not `cached`: this query's entire output is
+        // owner names, and a config reads it to decide which aliases to
+        // create. Answering before any scan has landed hands back
+        // `Control Centre,Fantastical` for an item really owned by
+        // `Fantastical Helper`, and the config writes that down for good.
+        Request::Query(ProtocolQuery::MenuItems) => {
+            match crate::alias::Snapshot::cached_or_scan(*main)
+                .and_then(|snapshot| crate::alias::list_menu_bar_items(&snapshot))
+            {
+                Ok(found) => Outcome::answer(Response::MenuItems(
+                    found
+                        .into_iter()
+                        .map(|item| format!("{},{}", item.owner, item.name))
+                        .collect(),
+                )),
+                Err(err) => Outcome::error(err.to_string()),
+            }
+        }
         Request::Push { name, value } => push(&name, value, items),
 
-        Request::Query(ProtocolQuery::AppMenus) => match crate::menus::list() {
-            Ok(found) => Outcome::answer(Response::AppMenus(
-                found.into_iter().map(|menu| menu.title).collect(),
-            )),
-            Err(err) => Outcome::error(err.to_string()),
-        },
+        // `Query(AppMenus)` and `Press(AppMenu)` are answered before `apply`
+        // is called: [`crate::menus::list`] and [`crate::menus::press`] are
+        // `async`, so `ecs::defer` takes their reply and finishes them off the
+        // main thread.
+        //
+        // Reported rather than `unreachable!`: getting here means a caller
+        // routed around `defer` -- which `harness` could, since it calls
+        // `apply` directly -- and a daemon that answers "not here" is better
+        // than one that takes the process down over a routing mistake.
+        Request::Query(ProtocolQuery::AppMenus) | Request::Press(PressTarget::AppMenu(_)) => {
+            Outcome::error("this request is answered asynchronously; see `ecs::defer`".to_owned())
+        }
 
         Request::Query(ProtocolQuery::Defaults) => {
             Outcome::answer(Response::Defaults(Box::new(defaults.0.clone())))
         }
-
-        Request::Press(PressTarget::AppMenu(index)) => match crate::menus::press(index) {
-            Ok(()) => Outcome::ok(),
-            Err(err) => Outcome::error(err.to_string()),
-        },
 
         Request::Press(PressTarget::Alias(name)) => {
             // The item's own `alias` is what names the thing to press, not the
@@ -986,6 +1091,10 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
             for row in &items.write {
                 items.commands.entity(row.entity).insert(Stale);
             }
+            // Declared events are marked by the same bracket and swept by the
+            // same `--end`: there is no `--remove event`, so this is the only
+            // thing that ever retires one.
+            sources.begin_config();
             Outcome::ok()
         }
 
@@ -1006,6 +1115,7 @@ pub fn apply(request: Request, items: &mut Items, ctx: &mut Context<'_>) -> Outc
                 items.index.remove(&name);
                 items.commands.entity(entity).despawn();
             }
+            sources.end_config();
             Outcome::ok()
         }
 
@@ -1086,43 +1196,73 @@ fn set_item(
     if let Some(next) = patched_run(&label.0, patch.label.as_ref()) {
         label.0 = next;
     }
-    if let Some(next) = patched_background(background, patch.background.as_ref()) {
+
+    // The two flattened halves. A config spells their properties as the
+    // item's own -- `padding_left=4`, `script=...` -- and the patch keeps
+    // them where the state keeps them, so `--query` still answers with the
+    // nesting a config reads back.
+    let geometry = patch.geometry.as_ref();
+    let scripting = patch.scripting.as_ref();
+
+    if let Some(next) = patched_background(
+        background,
+        geometry.and_then(|geometry| geometry.background.as_ref()),
+    ) {
         **background = next;
     }
 
-    if let Some(p) = patch.padding_left {
-        padding.left = p;
+    // `Padding`, `Offset` and `Placement` are all in the dirty-item query, so
+    // they are asked what would *change* before the `Mut` is touched at all —
+    // the same discipline `Width` and `ItemDisplay` already had, and which
+    // these three were missing: a script re-stating the padding it set last
+    // time marked the component changed and repainted for nothing.
+    if let Some(left) = geometry
+        .and_then(|geometry| geometry.padding_left)
+        .and_then(|p| p.changes(&padding.left))
+    {
+        padding.left = left;
     }
-    if let Some(p) = patch.padding_right {
-        padding.right = p;
+    if let Some(right) = geometry
+        .and_then(|geometry| geometry.padding_right)
+        .and_then(|p| p.changes(&padding.right))
+    {
+        padding.right = right;
     }
-    if let Some(y) = patch.y_offset {
+    if let Some(y) = geometry
+        .and_then(|geometry| geometry.y_offset)
+        .and_then(|y| y.changes(&offset.0))
+    {
         offset.0 = y;
     }
-    if let Some(p) = patch.position.clone() {
+    if let Some(p) = geometry
+        .and_then(|geometry| geometry.position.as_ref())
+        .and_then(|p| p.changes(&placement.0))
+    {
         placement.0 = p;
     }
-    if let Some(d) = patch.drawing {
+    if let Some(d) = geometry.and_then(|geometry| geometry.drawing) {
         // Resolved here, not by the caller: `toggle` means "the opposite of
         // whatever it is now", and only the daemon knows what that is.
-        drawing.set_if_neq(Drawing(d.resolve(drawing.0)));
+        drawing.set_if_neq(Drawing(d.resolve(drawing.0.into()).get()));
     }
-    // `Width` and `ItemDisplay` affect layout, so — unlike the plain
-    // assignments above — they go through `set_if_neq`: a script re-setting
-    // the display or width it already has must not repaint the bar.
-    if let Some(u) = patch.updates {
-        row.updates.set_if_neq(Updates(u));
+    if let Some(u) = scripting.and_then(|scripting| scripting.updates) {
+        row.updates
+            .set_if_neq(Updates(u.resolve(row.updates.0.into()).get()));
     }
-    if let Some(w) = patch.width {
+    if let Some(w) = geometry.and_then(|geometry| geometry.width) {
         row.width.set_if_neq(Width(Some(w)));
     }
-    if let Some(spec) = &patch.display {
-        row.display.set_if_neq(ItemDisplay(*spec));
+    if let Some(spec) = geometry.and_then(|geometry| geometry.display) {
+        row.display.set_if_neq(ItemDisplay(spec));
     }
-    if let Some(freq) = patch.update_freq {
+    if let Some(freq) = scripting
+        .and_then(|scripting| scripting.update_freq)
+        .and_then(|f| f.changes(&routine.every))
+    {
         routine.every = freq;
         // A changed frequency restarts the clock, so setting it twice does not
-        // fire early on the second set.
+        // fire early on the second set. Only a *changed* one: re-stating the
+        // frequency it already has used to postpone the tick for ever.
         routine.elapsed = 0;
     }
     // Kind-specific properties, written only where they differ so a script
@@ -1156,7 +1296,8 @@ fn set_item_components(
     known: &[ItemName],
     commands: &mut Commands,
 ) {
-    if let Some(script) = &patch.script {
+    let scripting = patch.scripting.as_ref();
+    if let Some(script) = scripting.and_then(|scripting| scripting.script.as_ref()) {
         if script.is_empty() {
             commands.entity(entity).remove::<Script>();
         } else {
@@ -1165,7 +1306,7 @@ fn set_item_components(
                 .insert(Script(script.as_str().into()));
         }
     }
-    if let Some(script) = &patch.click_script {
+    if let Some(script) = scripting.and_then(|scripting| scripting.click_script.as_ref()) {
         if script.is_empty() {
             commands.entity(entity).remove::<ClickScript>();
         } else {
@@ -1224,7 +1365,6 @@ fn set_item_components(
 /// reaches for the `Mut`. `Mut::as_mut` is a `deref_mut`: touching a component
 /// at all marks it changed, and a component marked changed reshapes its text
 /// and repaints its rect whether or not a pixel moved.
-/// The same for the surface behind an item.
 fn patched_run(current: &Run, patch: Option<&RunPatch>) -> Option<Run> {
     patched(current, patch)
 }
@@ -1236,31 +1376,26 @@ fn patched_background(current: &Background, patch: Option<&BackgroundPatch>) -> 
 
 /// Applies a patch to a copy, and reports it only if the copy differs.
 ///
-/// The merge itself is `struct_patch`'s own [`Patch::apply_with_log`],
-/// generated from the same declaration as the patch struct, so a property
-/// added to one is a property the other already knows about. What is applied
-/// to is the wire form, because that is what the patch is defined against;
-/// the daemon's own form parses a font and a colour out of it, and the two
-/// conversions are exhaustive struct literals, so a new field fails to
-/// compile here rather than silently going unread.
+/// The merge is the patch type's own derived [`Changes`] impl, generated from
+/// the same declaration as the patch struct, so a property added to one is a
+/// property the other already knows about. What is applied to is the wire
+/// form, because that is what the patch is defined against; the daemon's own
+/// form parses a font and a colour out of it, and the two conversions are
+/// exhaustive struct literals, so a new field fails to compile here rather
+/// than silently going unread.
 ///
-/// The log names the fields the patch *wrote*, which is not the same as the
-/// fields that *changed* — a config setting a colour to the colour it already
-/// had writes it and changes nothing. That difference is the whole question
-/// when an item is repainting more than it should, so both halves are traced:
-/// the field names here, and whether anything came of them below.
+/// `Changes` answers what actually *changed*, not what the patch *wrote* — a
+/// config setting a colour to the colour it already had writes it and changes
+/// nothing. That difference is the whole question when an item repaints more
+/// than it should, and it is now the only thing this reports: a `None` here
+/// is a repaint that does not happen.
 fn patched<T, W, P>(current: &T, patch: Option<&P>) -> Option<T>
 where
-    T: Clone + PartialEq + for<'a> From<&'a W>,
-    W: for<'a> From<&'a T> + Patch<P>,
-    P: Clone,
+    T: PartialEq + for<'a> From<&'a W>,
+    W: Clone + for<'a> From<&'a T>,
+    P: rsbar_protocol::Changes<W>,
 {
-    let patch = patch?;
-    let mut wire = W::from(current);
-    wire.apply_with_log(patch.clone(), |field| {
-        tracing::trace!(field, "patch wrote");
-    });
-    let next = T::from(&wire);
+    let next = T::from(&patch?.changes(&W::from(current))?);
     (next != *current).then_some(next)
 }
 
@@ -1295,7 +1430,11 @@ mod patch_tests {
     fn a_background_patch_matching_every_current_field_changes_nothing() {
         let current = background();
         let patch = BackgroundPatch {
-            drawing: Some(current.drawing),
+            drawing: Some(if current.drawing {
+                rsbar_protocol::BoolChange::True
+            } else {
+                rsbar_protocol::BoolChange::False
+            }),
             color: Some(current.color),
             corner_radius: Some(current.corner_radius),
             height: Some(current.height),

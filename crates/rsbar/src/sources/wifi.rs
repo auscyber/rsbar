@@ -19,20 +19,25 @@
 //! through this identical path.
 //!
 //! `SCDynamicStore` notifies on more than a join or leave — signal-quality and
-//! other `AirPort` sub-keys live under the same wildcard — so [`State`] keeps
-//! the last SSID seen per interface key and only emits when it actually moved.
-//! Per registration, not process-wide: unlike `brightness`'s passthrough, this
-//! callback's context is a real pointer, so the dedup state can live where
-//! every other multi-registration source keeps it, alongside the sink.
+//! other `AirPort` sub-keys live under the same wildcard — so this keeps the
+//! last SSID seen per interface key and only emits when it actually moved.
+//!
+//! # The callback reads; the task decides
+//!
+//! The per-interface last-seen map lives in [`decide`]'s task, as an ordinary
+//! local held across the `.await` — not behind the callback's context. A
+//! `SCDynamicStore` callback cannot hold anything between calls and has
+//! nowhere to `.await`, so putting the map there would mean a lock taken
+//! blockingly from a C callback. The callback instead does only what is true
+//! *inside* the call — the store handle and the `CFArray` of changed keys are
+//! borrowed for its duration and dangling after it, so the SSID is read there
+//! — and posts a plain [`Joined`] through a [`relay`](skylight::callback::relay).
 
-use crate::sources::{
-    CallbackState, Cause, Emitter, Registering, Registration, Source, SourceId, StartError,
-};
-use objc2_core_foundation::{
-    CFArray, CFDictionary, CFRetained, CFRunLoop, CFRunLoopSource, CFString, CFType,
-};
+use crate::sources::{Cause, Registering, Source, SourceId, StartError};
+use objc2_core_foundation::{CFArray, CFDictionary, CFRetained, CFRunLoopSource, CFString, CFType};
 use rsbar_protocol::event::WifiChange;
 use rsbar_protocol::{Event, Kind};
+use skylight::callback::{Callback, Relay};
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -46,8 +51,8 @@ const SSID_KEY: &str = "SSID_STR";
 
 /// `SCDynamicStoreContext`. Only `version` and `info` are used — the retain,
 /// release and copy-description callbacks are for a context `SCDynamicStore`
-/// itself owns, and this one is owned by the [`CallbackState`] instead, kept
-/// alive by [`Watch`].
+/// itself owns, and this one is owned by the [`Callback`] instead, kept alive
+/// inside the future [`Source::run`](crate::sources::Source::run) returns.
 #[repr(C)]
 struct StoreContext {
     version: isize,
@@ -113,21 +118,19 @@ fn read_ssid(store: *mut CFType, key: &CFString) -> Option<String> {
     Some(ssid.to_string())
 }
 
-/// The sink and the dedup state a registration is handed a pointer to.
-pub struct State {
-    emit: Emitter,
-    /// The last SSID seen per interface key, so a notification that did not
-    /// actually change the joined network — `SCDynamicStore` fires this for
-    /// more than a join or leave — does not turn into a script run and a
-    /// repaint for a value nobody would see move.
-    last: tokio::sync::Mutex<HashMap<String, Option<String>>>,
+/// One interface's `AirPort` key, and what it resolved to when it changed.
+///
+/// Owned, because everything the callback was handed to produce it is gone by
+/// the time the task reads it.
+struct Joined {
+    key: String,
+    ssid: Option<String>,
 }
 
-extern "C-unwind" fn changed(store: *mut CFType, changed_keys: *mut CFArray, context: *mut c_void) {
-    // SAFETY: the registration passed a `CallbackState<State>` pointer.
-    let Some(state) = (unsafe { CallbackState::<State>::recover(context) }) else {
-        return;
-    };
+/// What `SCDynamicStore` calls when a watched key changes.
+///
+/// Reads, posts, returns. The dedup is [`decide`]'s.
+fn changed(store: *mut CFType, changed_keys: *mut CFArray, relay: &Relay<Joined>) {
     let Some(keys) = NonNull::new(changed_keys) else {
         return;
     };
@@ -143,42 +146,34 @@ extern "C-unwind" fn changed(store: *mut CFType, changed_keys: *mut CFArray, con
         };
         // SAFETY: as above.
         let key = unsafe { key.cast::<CFString>().as_ref() };
-        let ssid = read_ssid(store, key);
-        let key_name = key.to_string();
-
-        // `blocking_lock`, not an await: this runs inside `SCDynamicStore`'s
-        // own callback, never inside a polled task.
-        let mut last = state.last.blocking_lock();
-        let worth_reporting = last.get(&key_name) != Some(&ssid);
-        last.insert(key_name, ssid.clone());
-        drop(last);
-
-        if worth_reporting {
-            state.emit.send(Event::WifiChanged(WifiChange {
-                ssid: ssid.unwrap_or_default(),
-            }));
-        }
+        relay.post(Joined {
+            ssid: read_ssid(store, key),
+            key: key.to_string(),
+        });
     }
 }
 
-/// Deregisters on drop: the run loop source is removed, and the store —
-/// released when `store` drops — takes the notification registration with it.
-struct Watch {
-    /// Never read: held only so the store outlives the registration and its
-    /// release deregisters. See the type-level doc comment.
-    _store: CFRetained<CFType>,
-    source: CFRetained<CFRunLoopSource>,
-    run_loop: CFRetained<CFRunLoop>,
-    /// Outlives the store: `SCDynamicStore` may still be draining a callback
-    /// when this drops, and the state must still be there to recover.
-    _state: CallbackState<State>,
-}
+skylight::trampoline!(CHANGED = changed(
+    store: *mut CFType,
+    changed_keys: *mut CFArray,
+    @ relay: &Relay<Joined>,
+));
 
-impl Drop for Watch {
-    fn drop(&mut self) {
-        self.run_loop.remove_source(Some(&self.source), unsafe {
-            objc2_core_foundation::kCFRunLoopCommonModes
-        });
+/// Reports the joins that actually moved, until the registration goes away.
+///
+/// The loop ends on its own: dropping the [`Callback`] drops the last
+/// [`Relay`], `next` answers `None`, and this returns. There is no separate
+/// stop signal, and nothing to remember to send one through.
+async fn decide(mut joins: skylight::callback::Events<Joined>, emit: crate::sources::Emitter) {
+    let mut last: HashMap<String, Option<String>> = HashMap::new();
+    while let Some(Joined { key, ssid }) = joins.next().await {
+        if last.get(&key) == Some(&ssid) {
+            continue;
+        }
+        last.insert(key, ssid.clone());
+        emit.send(Event::WifiChanged(WifiChange {
+            ssid: ssid.unwrap_or_default(),
+        }));
     }
 }
 
@@ -193,78 +188,98 @@ impl Source for Wifi {
         vec![Kind::WifiChanged]
     }
 
-    fn register(
+    fn run(
         &mut self,
         _wanted: &BTreeSet<Kind>,
-        cx: &mut Registering<'_>,
-    ) -> Result<Registration, StartError> {
+        cx: Registering,
+    ) -> Result<crate::pool::Task, StartError> {
         let emit = cx.emitter();
-        let state = CallbackState::new(State {
-            emit,
-            last: tokio::sync::Mutex::new(HashMap::new()),
-        });
+        let id = self.id();
 
-        let name = CFString::from_str("rsbar-wifi");
-        let mut context = StoreContext {
-            version: 0,
-            info: state.with_ptr(|ptr| ptr),
-            retain: None,
-            release: None,
-            copy_description: None,
-        };
+        // `!Send` means "build it where it will live", not "put it on the
+        // main thread": `wifi` needs nothing from AppKit or the window
+        // server, only `pool::run_loop()`'s thread, which is where the
+        // `CFRunLoopSource` below is scheduled -- so the whole registration
+        // is built there from the start.
+        //
+        // The cost: a refusal can no longer come back through this `run`'s
+        // `Result`, since this closure runs after `run` has already returned
+        // `Ok`. Logged instead -- `SCDynamicStore` refusing is exceedingly
+        // rare, and the registry has nothing sane to retry.
+        Ok(crate::pool::sources().spawn(move |_here| async move {
+            let (relay, joins) = skylight::callback::relay::<Joined>();
+            let run_loop = crate::pool::run_loop();
 
-        // SAFETY: `name` outlives the call; `context` outlives the store
-        // (dropped only when `Watch` is, which deregisters first).
-        let store = unsafe {
-            SCDynamicStoreCreate(
-                std::ptr::null(),
-                CFRetained::as_ptr(&name).as_ptr(),
-                changed,
-                &raw mut context,
-            )
-        };
-        let store =
-            NonNull::new(store).ok_or_else(|| StartError::new(self.id(), Cause::DynamicStore))?;
-        // SAFETY: the Create convention hands back a +1 reference.
-        let store = unsafe { CFRetained::<CFType>::from_raw(store) };
+            // `SCDynamicStore` has no unregister call because the store *is*
+            // the registration: taking the source off the loop and releasing
+            // the store is the whole teardown.
+            let watch = match Callback::new(relay, |context| {
+                let name = CFString::from_str("rsbar-wifi");
+                let mut store_context = StoreContext {
+                    version: 0,
+                    info: context,
+                    retain: None,
+                    release: None,
+                    copy_description: None,
+                };
 
-        let pattern = CFString::from_str(AIRPORT_KEY_PATTERN);
-        let patterns = CFArray::from_objects(&[&*pattern]);
-        // SAFETY: `store` and `patterns` are both live for the call.
-        let ok = unsafe {
-            SCDynamicStoreSetNotificationKeys(
-                CFRetained::as_ptr(&store).as_ptr(),
-                std::ptr::null(),
-                CFRetained::as_ptr(&patterns).as_ptr().cast(),
-            )
-        };
-        if ok == 0 {
-            return Err(StartError::new(self.id(), Cause::DynamicStore));
-        }
+                // SAFETY: `name` and `store_context` outlive the call, and
+                // `context` stays valid to reconstruct for as long as the
+                // registration lives.
+                let store = unsafe {
+                    SCDynamicStoreCreate(
+                        std::ptr::null(),
+                        CFRetained::as_ptr(&name).as_ptr(),
+                        CHANGED,
+                        &raw mut store_context,
+                    )
+                };
+                let store = NonNull::new(store).ok_or(Cause::DynamicStore)?;
+                // SAFETY: the Create convention hands back a +1 reference.
+                let store = unsafe { CFRetained::<CFType>::from_raw(store) };
 
-        // SAFETY: `store` is live; the call hands back a +1 run loop source.
-        let source = unsafe {
-            SCDynamicStoreCreateRunLoopSource(
-                std::ptr::null(),
-                CFRetained::as_ptr(&store).as_ptr(),
-                0,
-            )
-        };
-        let source =
-            NonNull::new(source).ok_or_else(|| StartError::new(self.id(), Cause::DynamicStore))?;
-        // SAFETY: as above.
-        let source = unsafe { CFRetained::from_raw(source) };
+                let pattern = CFString::from_str(AIRPORT_KEY_PATTERN);
+                let patterns = CFArray::from_objects(&[&*pattern]);
+                // SAFETY: `store` and `patterns` are both live for the call.
+                let ok = unsafe {
+                    SCDynamicStoreSetNotificationKeys(
+                        CFRetained::as_ptr(&store).as_ptr(),
+                        std::ptr::null(),
+                        CFRetained::as_ptr(&patterns).as_ptr().cast(),
+                    )
+                };
+                if ok == 0 {
+                    return Err(Cause::DynamicStore);
+                }
 
-        let run_loop = CFRunLoop::current().expect("no run loop on this thread");
-        run_loop.add_source(Some(&source), unsafe {
-            objc2_core_foundation::kCFRunLoopCommonModes
-        });
+                // SAFETY: `store` is live; the call hands back a +1 run loop
+                // source.
+                let source = unsafe {
+                    SCDynamicStoreCreateRunLoopSource(
+                        std::ptr::null(),
+                        CFRetained::as_ptr(&store).as_ptr(),
+                        0,
+                    )
+                };
+                let source = NonNull::new(source).ok_or(Cause::DynamicStore)?;
+                // SAFETY: as above.
+                let source = unsafe { CFRetained::from_raw(source) };
+                let unschedule = crate::runloop::scheduled(run_loop, source);
 
-        Ok(Box::new(Watch {
-            _store: store,
-            source,
-            run_loop,
-            _state: state,
+                Ok(move || {
+                    unschedule.now();
+                    drop(store);
+                })
+            }) {
+                Ok(watch) => watch,
+                Err(cause) => {
+                    let err = StartError::new(id, cause);
+                    tracing::error!(%err, "wifi source could not register on its own thread");
+                    return;
+                }
+            };
+            let _watch = watch;
+            decide(joins, emit).await;
         }))
     }
 }

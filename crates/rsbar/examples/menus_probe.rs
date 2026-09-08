@@ -6,14 +6,40 @@
 //! after. A real dropdown is a brand new on-screen window (a popup menu at a
 //! very high level); if the count and layers are identical before and after,
 //! the press did not do anything, whatever it returned.
-use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFString, CFType};
-use objc2_core_graphics::{
-    CGWindowListCopyWindowInfo, CGWindowListOption, kCGWindowLayer, kCGWindowName, kCGWindowNumber,
-    kCGWindowOwnerName,
-};
+use objc2_core_foundation::{CFRunLoop, kCFRunLoopDefaultMode};
+use objc2_core_graphics::{CGWindowListCopyWindowInfo, CGWindowListOption};
 use rsbar::{alias, menus};
-use std::ptr::NonNull;
+use skylight::cf::{Array, WindowKey};
+use std::future::Future;
 use std::time::Duration;
+
+/// Runs `future` to completion on a thread of its own, pumping *this*
+/// thread's `CFRunLoop` in short bursts while it waits.
+///
+/// `menus::list` and `menus::press` are `async` now: the `AppKit` half runs
+/// through `runloop::on_main`, which answers by queueing an errand on the
+/// main thread's `CFRunLoopSource` and waking it -- and that source only
+/// fires while something is actually pumping the loop. `rsbar::pool::handle()
+/// .block_on(future)` alone would park *this* thread without ever pumping it,
+/// which is exactly the deadlock `clippy.toml` bans `block_on` in the daemon
+/// over. A one-shot probe has no reactor of its own, so it drives the
+/// blocking half on a second thread and spends this one pumping instead --
+/// acceptable here in a way it would not be in the daemon proper, which is
+/// never blocked on anything.
+fn block_on_main<T: Send + 'static>(future: impl Future<Output = T> + Send + 'static) -> T {
+    let (done, wait) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(rsbar::pool::handle().block_on(future));
+    });
+    loop {
+        if let Ok(value) = wait.try_recv() {
+            return value;
+        }
+        // SAFETY: `kCFRunLoopDefaultMode` is a `'static` constant, and this
+        // runs only on the main thread, which owns the loop being pumped.
+        unsafe { CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, 0.05, false) };
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Row {
@@ -23,47 +49,18 @@ struct Row {
     name: String,
 }
 
-fn dict_at(array: &CFArray, i: isize) -> Option<&CFDictionary> {
-    let ptr = unsafe { array.value_at_index(i) };
-    let ptr = NonNull::new(ptr.cast_mut())?.cast::<CFType>();
-    unsafe { ptr.as_ref() }.downcast_ref::<CFDictionary>()
-}
-
-fn dict_string(dict: &CFDictionary, key: &CFString) -> Option<String> {
-    let ptr = unsafe { dict.value((std::ptr::from_ref(key)).cast()) };
-    let ptr = NonNull::new(ptr.cast_mut())?.cast::<CFType>();
-    Some(
-        unsafe { ptr.as_ref() }
-            .downcast_ref::<CFString>()?
-            .to_string(),
-    )
-}
-
-fn dict_i64(dict: &CFDictionary, key: &CFString) -> Option<i64> {
-    let ptr = unsafe { dict.value((std::ptr::from_ref(key)).cast()) };
-    let ptr = NonNull::new(ptr.cast_mut())?.cast::<CFType>();
-    unsafe { ptr.as_ref() }.downcast_ref::<CFNumber>()?.as_i64()
-}
-
 fn snapshot() -> Vec<Row> {
     let list = CGWindowListCopyWindowInfo(CGWindowListOption::OptionAll, 0).expect("window list");
-    let mut rows = Vec::new();
-    for i in 0..list.count() {
-        let Some(dict) = dict_at(&list, i) else {
-            continue;
-        };
-        let id = dict_i64(dict, unsafe { kCGWindowNumber }).unwrap_or(-1);
-        let layer = dict_i64(dict, unsafe { kCGWindowLayer }).unwrap_or(i64::MIN);
-        let owner = dict_string(dict, unsafe { kCGWindowOwnerName }).unwrap_or_default();
-        let name = dict_string(dict, unsafe { kCGWindowName }).unwrap_or_default();
-        rows.push(Row {
-            id,
-            layer,
-            owner,
-            name,
-        });
-    }
-    rows
+    let list = Array::new(&list);
+    (0..list.len())
+        .filter_map(|i| list.dict(i))
+        .map(|dict| Row {
+            id: dict.get::<i64>(WindowKey::Number).unwrap_or(-1),
+            layer: dict.get::<i64>(WindowKey::Layer).unwrap_or(i64::MIN),
+            owner: dict.get::<String>(WindowKey::OwnerName).unwrap_or_default(),
+            name: dict.get::<String>(WindowKey::Name).unwrap_or_default(),
+        })
+        .collect()
 }
 
 fn diff(before: &[Row], after: &[Row]) -> Vec<Row> {
@@ -88,10 +85,16 @@ fn screenshot(name: &str) {
     }
 }
 
+#[skylight::main(also(now), pass)]
 fn main() {
+    // `on_main` -- which `menus::list`/`menus::press` now go through --
+    // answers nothing until the main loop is published; the daemon does this
+    // in `main.rs`, and a probe has to as well.
+    rsbar::runloop::publish_main(mtm);
+
     println!(
         "Accessibility permission: {}",
-        alias::accessibility_trusted()
+        alias::accessibility_trusted().is_ok()
     );
     println!(
         "Screen Recording permission: {}",
@@ -100,7 +103,7 @@ fn main() {
     println!();
 
     println!("=== menus::list() (front app's own AXMenuBar) ===");
-    match menus::list() {
+    match block_on_main(menus::list()) {
         Ok(items) => {
             for item in &items {
                 println!("  [{}] {:?}", item.index, item.title);
@@ -111,7 +114,7 @@ fn main() {
                     target.index, target.title
                 );
                 let before = snapshot();
-                let result = menus::press(target.index);
+                let result = block_on_main(menus::press(target.index));
                 std::thread::sleep(Duration::from_millis(300));
                 let after = snapshot();
                 println!("  menus::press result: {result:?}");
@@ -140,14 +143,21 @@ fn main() {
                 // anything either. A leftover open menu here is a harmless
                 // side effect of this probe, not a functional problem with
                 // pressing.
-                let _ = menus::press(target.index);
+                let _ = block_on_main(menus::press(target.index));
             }
         }
         Err(err) => println!("menus::list() failed: {err}"),
     }
 
     println!("\n=== alias::press_item on a real extras item ===");
-    match alias::list_menu_bar_items() {
+    let menu_bar = match alias::Snapshot::now() {
+        Ok(menu_bar) => menu_bar,
+        Err(err) => {
+            println!("could not list the menu bar layer: {err}");
+            return;
+        }
+    };
+    match alias::list_menu_bar_items(&menu_bar) {
         Ok(items) if !items.is_empty() => {
             let target = &items[0];
             println!(
@@ -155,7 +165,7 @@ fn main() {
                 target.owner, target.name
             );
             let before = snapshot();
-            let result = alias::press_item(&target.owner, &target.name);
+            let result = alias::press_item(&menu_bar, &target.owner, &target.name);
             std::thread::sleep(Duration::from_millis(300));
             let after = snapshot();
             println!("  alias::press_item result: {result:?}");
@@ -176,7 +186,7 @@ fn main() {
             }
             // Best-effort only — see the comment on the equivalent line
             // above; this often leaves the menu open.
-            let _ = alias::press_item(&target.owner, &target.name);
+            let _ = alias::press_item(&menu_bar, &target.owner, &target.name);
         }
         Ok(_) => println!("no aliasable items found to press"),
         Err(err) => println!("alias::list_menu_bar_items failed: {err}"),

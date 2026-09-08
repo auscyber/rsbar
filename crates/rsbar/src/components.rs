@@ -76,11 +76,11 @@ impl From<&Run> for rsbar_protocol::Run {
             text: run.string.clone(),
             color: run.color,
             font: run.font.clone(),
-            drawing: run.drawing,
+            drawing: run.drawing.into(),
             padding_left: run.padding_left,
             padding_right: run.padding_right,
             y_offset: run.y_offset,
-            highlight: run.highlight,
+            highlight: run.highlight.into(),
             highlight_color: run.highlight_color,
         }
     }
@@ -92,11 +92,11 @@ impl From<&rsbar_protocol::Run> for Run {
             string: run.text.clone(),
             color: run.color,
             font: run.font.clone(),
-            drawing: run.drawing,
+            drawing: run.drawing.into(),
             padding_left: run.padding_left,
             padding_right: run.padding_right,
             y_offset: run.y_offset,
-            highlight: run.highlight,
+            highlight: run.highlight.into(),
             highlight_color: run.highlight_color,
         }
     }
@@ -105,7 +105,7 @@ impl From<&rsbar_protocol::Run> for Run {
 impl From<&Background> for rsbar_protocol::Background {
     fn from(background: &Background) -> Self {
         Self {
-            drawing: background.drawing,
+            drawing: background.drawing.into(),
             color: background.color,
             corner_radius: background.corner_radius,
             height: background.height,
@@ -120,7 +120,7 @@ impl From<&Background> for rsbar_protocol::Background {
 impl From<&rsbar_protocol::Background> for Background {
     fn from(background: &rsbar_protocol::Background) -> Self {
         Self {
-            drawing: background.drawing,
+            drawing: background.drawing.into(),
             color: background.color,
             corner_radius: background.corner_radius,
             height: background.height,

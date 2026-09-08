@@ -56,7 +56,9 @@
 
 use crate::alias::Captures;
 use crate::bar::{Panels, Settings, fill_rounded_rect, stroke_rounded_rect};
-use crate::layout::{ItemQuery, PanelPlacements, Placements, damage, draw_item, intersects, width};
+use crate::layout::{
+    ItemQuery, PanelPlacements, Placements, alias_width, damage, draw_item, intersects, width,
+};
 use crate::shaping::Cache;
 use bevy_ecs::prelude::*;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -196,7 +198,7 @@ fn apply_background_patch(
     patch: &rsbar_protocol::BackgroundPatch,
 ) -> crate::components::Background {
     if let Some(v) = patch.drawing {
-        bg.drawing = v;
+        bg.drawing = v.resolve(bg.drawing.into()).get();
     }
     if let Some(v) = patch.color {
         bg.color = v;
@@ -251,11 +253,19 @@ pub fn arrange_popup<T: Copy>(
         let mut x = 0.0;
         let mut placed = Vec::with_capacity(items.len());
         for item in items {
+            // Clamped, so the run only ever moves forward. A config can set
+            // padding negative enough that an item measures below zero -- the
+            // real config does, to claw back the margins a menu bar extra's
+            // own window carries -- and advancing by that walks the cursor
+            // backwards and lays every later item on top of an earlier one.
+            // Two items touching is a layout a person can read; two items in
+            // the same place is not.
+            let advance = item.width.max(0.0);
             placed.push((
                 item.id,
-                CGRect::new(CGPoint::new(x, 0.0), CGSize::new(item.width, row_height)),
+                CGRect::new(CGPoint::new(x, 0.0), CGSize::new(advance, row_height)),
             ));
-            x += item.width;
+            x += advance;
         }
         (placed, CGSize::new(x, row_height))
     } else {
@@ -328,6 +338,7 @@ impl Popups {
     ///
     /// Returns the window server's error if a window cannot be created or
     /// configured.
+    #[skylight::main_thread]
     fn ensure(
         &mut self,
         host: Entity,
@@ -417,6 +428,7 @@ fn contains(rect: CGRect, point: CGPoint) -> bool {
     reason = "one system doing one whole surface's layout-and-draw pass, matching crate::layout::repaint's own shape"
 )]
 pub fn repaint_popups(
+    main: NonSend<crate::ecs::Main>,
     items: ItemQuery,
     dirty: crate::layout::DirtyItems,
     hosts: Query<(Entity, &PopupConfig)>,
@@ -464,16 +476,22 @@ pub fn repaint_popups(
             .iter()
             .map(|row| PopupPlaced {
                 id: row.entity,
+                // The same two-step the bar measures with: a fixed width
+                // wins, then an alias's mirrored ink, then the item's own
+                // text. Skipping the middle step is what used to give every
+                // alias in a popup a width of nothing but its padding.
                 width: row.width.0.unwrap_or_else(|| {
-                    width(
-                        &cache,
-                        row.entity,
-                        row.icon,
-                        row.label,
-                        row.padding,
-                        None,
-                        None,
-                    )
+                    alias_width(&captures, row.entity, row.padding).unwrap_or_else(|| {
+                        width(
+                            &cache,
+                            row.entity,
+                            row.icon,
+                            row.label,
+                            row.padding,
+                            None,
+                            None,
+                        )
+                    })
                 }),
             })
             .collect();
@@ -502,7 +520,7 @@ pub fn repaint_popups(
         let unchanged = torn.as_ref().is_some_and(Vec::is_empty);
 
         let scale = panels.scale_for(display);
-        let window = match popups.ensure(host, frame, scale, config) {
+        let window = match popups.ensure(main.0, host, frame, scale, config) {
             Ok(window) => window,
             Err(err) => {
                 tracing::error!(?err, "could not open a popup window");
@@ -517,7 +535,7 @@ pub fn repaint_popups(
         }
 
         if !unchanged {
-            skylight::draw_damaged(window.id(), size, torn.as_deref(), |ctx| {
+            skylight::draw_damaged(window, size, torn.as_deref(), |ctx| {
                 fill_rounded_rect(
                     ctx,
                     CGRect::new(CGPoint::new(0.0, 0.0), size),
@@ -614,6 +632,10 @@ mod align_tests {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::float_cmp,
+    reason = "exact equality is the claim: a laid-out edge is a sum of the widths given, not an approximation of one"
+)]
 mod arrange_tests {
     use super::{PopupPlaced, arrange_popup};
     use objc2_core_foundation::CGSize;
@@ -666,6 +688,24 @@ mod arrange_tests {
             "as wide as the widest row"
         );
         assert!((size.height - 60.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_horizontal_run_never_walks_backwards() {
+        // What an alias in a popup used to measure: no icon, no label, and
+        // `padding_left = -2, padding_right = -2`. Advancing by that put every
+        // item on top of the one before it -- the whole popup clumped into one
+        // spot. Widths are still reported as laid out; it is the cursor that
+        // may not retreat.
+        let (placed, size) =
+            arrange_popup(&[item(1, -4.0), item(2, -4.0), item(3, 20.0)], true, 30.0);
+        let xs: Vec<f64> = placed.iter().map(|(_, r)| r.origin.x).collect();
+        assert!(
+            xs.windows(2).all(|w| w[1] >= w[0]),
+            "a run must not move backwards, got {xs:?}"
+        );
+        assert_eq!(xs, vec![0.0, 0.0, 0.0], "nothing wide takes no space");
+        assert_eq!(size.width, 20.0, "only the item with ink is wide");
     }
 
     #[test]
@@ -1048,8 +1088,11 @@ mod visual_probe {
             .collect();
         let (local, size) = super::arrange_popup(&measured, false, row_height);
 
-        let window = skylight::Window::new(CGRect::new(CGPoint::new(80.0, 40.0), size))
-            .expect("a window server connection is available when run manually");
+        let window = skylight::Window::new(
+            CGRect::new(CGPoint::new(80.0, 40.0), size),
+            crate::runloop::main_thread(),
+        )
+        .expect("a window server connection is available when run manually");
         window.set_opaque(false).unwrap();
         window.set_alpha(1.0).unwrap();
         window.set_level(skylight::level::POPUP_MENU).unwrap();
@@ -1061,7 +1104,7 @@ mod visual_probe {
         let query = state.get(&world).expect("query param is valid");
         let captures = Captures::default();
 
-        skylight::draw::<()>(window.id(), size, |ctx| {
+        skylight::draw::<()>(&window, size, |ctx| {
             crate::bar::fill_rounded_rect(
                 ctx,
                 CGRect::new(CGPoint::new(0.0, 0.0), size),

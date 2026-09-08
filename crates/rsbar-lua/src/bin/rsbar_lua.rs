@@ -1,26 +1,22 @@
 //! Runs a `.lua` config against a running `rsbard`.
 //!
-//! Hosts a vendored `LuaJIT` itself and seeds `package.loaded.rsbar` before
-//! loading the script, so `require("rsbar")` finds the module already there
-//! — no dynamic loading, so there is only ever one Lua runtime involved. See
-//! `Cargo.toml` for why that matters and when the `cdylib`/`module` build is
-//! used instead.
+//! Almost nothing happens here. [`rsbar_lua::host`] is what turns a file into
+//! a running config — the `Lua` state, the API under all three names a config
+//! reaches for, the `require` trampoline, the search paths, the runtime — and
+//! this binary's whole contribution is choosing the [`IpcDispatcher`] and
+//! seeding `CONFIG_DIR`.
 //!
-//! `Lua::unsafe_new`, not the safe default: a real config's own `require` may
-//! reach a native module (`package.cpath`/`loadlib`), which mlua's safe mode
-//! disables outright — see `rsbar_lua::require`.
-//!
-//! The whole script runs as one Lua coroutine (`exec_async`) on a
-//! current-thread Tokio runtime, so `rsbar.bar(...)`, `item:set(...)` and
-//! `rsbar.run()` all read as ordinary calls in the config while actually
-//! awaiting their dispatcher underneath.
+//! That is deliberate, and it is what the promise rests on: a config the
+//! daemon hosts in-process and a config run through here go through the *same*
+//! host code on the *same* runtime, differing only in whether a request
+//! becomes a Mach message or a value in a queue. There is no second
+//! implementation to drift.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::rc::Rc;
+use std::sync::Arc;
 
-use mlua::Lua;
-use rsbar_lua::{IpcDispatcher, api};
+use rsbar_lua::{IpcDispatcher, host, require::Modules};
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -34,38 +30,17 @@ fn main() -> ExitCode {
         eprintln!("usage: rsbar-lua <config.lua>");
         return ExitCode::FAILURE;
     };
+    let path = PathBuf::from(path);
 
-    let source = match std::fs::read_to_string(&path) {
-        Ok(source) => source,
-        Err(err) => {
-            eprintln!("{path}: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
+    seed_config_dir(&path);
 
-    let lua = unsafe { Lua::unsafe_new() };
-    if let Err(err) = seed_module(&lua) {
-        eprintln!("rsbar: {err}");
-        return ExitCode::FAILURE;
-    }
-    // This bin owns the whole Lua state (no foreign host sharing it), so it
-    // can safely replace `require` with one that lets a config's own
-    // `require("bar")`-style module calls yield through an async `rsbar`
-    // call at their top level — see `rsbar_lua::require` for why the builtin
-    // cannot.
-    if let Err(err) = rsbar_lua::require::install(&lua) {
-        eprintln!("rsbar: {err}");
-        return ExitCode::FAILURE;
-    }
-    if let Err(err) = configure_package_paths(&lua, Path::new(&path)) {
-        eprintln!("rsbar: {err}");
-        return ExitCode::FAILURE;
-    }
+    let dispatcher: Arc<dyn rsbar_lua::Dispatcher> = Arc::new(IpcDispatcher::new());
+    // On a thread of its own even here, where nothing else needs this one:
+    // it is the same call the daemon makes, so this binary exercises the path
+    // that matters rather than a shortcut past it.
+    let waiting = host::spawn(dispatcher, path, Modules::new());
 
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
+    let runtime = match tokio::runtime::Builder::new_current_thread().build() {
         Ok(runtime) => runtime,
         Err(err) => {
             eprintln!("could not start the runtime: {err}");
@@ -73,44 +48,34 @@ fn main() -> ExitCode {
         }
     };
 
-    match runtime.block_on(lua.load(&source).set_name(&path).exec_async()) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
+    match runtime.block_on(waiting) {
+        Ok(Ok(())) => ExitCode::SUCCESS,
+        Ok(Err(err)) => {
             eprintln!("{err}");
+            ExitCode::FAILURE
+        }
+        Err(_) => {
+            eprintln!("the config thread went away without answering");
             ExitCode::FAILURE
         }
     }
 }
 
-fn seed_module(lua: &Lua) -> mlua::Result<()> {
-    let dispatcher: Rc<dyn rsbar_lua::Dispatcher> = Rc::new(IpcDispatcher::new());
-    let table = api::install(lua, dispatcher)?;
-
-    let package: mlua::Table = lua.globals().get("package")?;
-    let loaded: mlua::Table = package.get("loaded")?;
-    loaded.set("rsbar", table)
-}
-
-/// Seeds `CONFIG_DIR`, if the environment does not already carry one, to the
-/// config's own directory — the same thing real `SketchyBar`'s `hotload.c`
-/// sets before running a config script — and appends its Lua/native module
-/// locations to `package.path`/`package.cpath`. A config is free to overwrite
-/// either afterwards; this only fills in the default a bare-bones one never
-/// bothered to set for itself.
-fn configure_package_paths(lua: &Lua, script: &Path) -> mlua::Result<()> {
-    let dir = script.parent().unwrap_or(Path::new("."));
-    if std::env::var_os("CONFIG_DIR").is_none() {
-        // Safety: single-threaded, and still before the runtime (let alone
-        // the config) starts — nothing else can be reading the environment
-        // concurrently yet.
-        unsafe { std::env::set_var("CONFIG_DIR", dir) };
+/// Seeds `CONFIG_DIR` to the config's own directory — the same thing real
+/// `SketchyBar`'s `hotload.c` sets before running a config script. A config is
+/// free to overwrite it afterwards; this only fills in the default a
+/// bare-bones one never bothered to set for itself.
+///
+/// Here rather than in [`host::build`] because only this process can honestly
+/// do it: a daemon has threads by the time it runs a config, and
+/// `std::env::set_var` is unsound with any of them reading the environment.
+fn seed_config_dir(script: &Path) {
+    if std::env::var_os("CONFIG_DIR").is_some() {
+        return;
     }
-    let dir = dir.display();
-
-    let package: mlua::Table = lua.globals().get("package")?;
-    let path: String = package.get("path")?;
-    package.set("path", format!("{path};{dir}/?.lua;{dir}/?/init.lua"))?;
-    let cpath: String = package.get("cpath")?;
-    package.set("cpath", format!("{cpath};{dir}/?.so;{dir}/?.dylib"))?;
-    Ok(())
+    let dir = script.parent().unwrap_or(Path::new("."));
+    // SAFETY: still single-threaded -- before the runtime, before the config
+    // thread, and before the config itself -- so nothing else can be reading
+    // the environment concurrently yet.
+    unsafe { std::env::set_var("CONFIG_DIR", dir) };
 }

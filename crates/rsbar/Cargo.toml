@@ -17,16 +17,18 @@ path = "src/main.rs"
 
 [dependencies]
 bitflags = { workspace = true }
+async-executor = { workspace = true }
 async-mach-ports = { workspace = true }
 rsbar-protocol = { workspace = true }
 serde = { workspace = true }
 skylight = { workspace = true }
-objc2-core-foundation = { workspace = true, features = ["CFArray", "CFAttributedString", "CFDictionary", "CFNumber", "CFString", "CFCGTypes", "CFRunLoop", "CFUUID", "CFData", "CFURL"] }
+objc2-core-foundation = { workspace = true, features = ["CFArray", "CFAttributedString", "CFDictionary", "CFNumber", "CFString", "CFCGTypes", "CFMachPort", "CFRunLoop", "CFUUID", "CFData", "CFURL", "libc"] }
 objc2-core-graphics = { workspace = true, features = ["CGContext", "CGColor", "CGColorSpace", "CGDirectDisplay", "CGDisplayConfiguration", "CGError", "CGEvent", "CGEventTypes", "CGPath", "CGGeometry", "CGImage", "CGDataProvider", "CGWindow"] }
 objc2-core-text = { workspace = true, features = ["CTFont", "CTFontDescriptor", "CTLine", "CTStringAttributes", "objc2-core-graphics"] }
-objc2-application-services = { version = "0.3", default-features = false, features = ["std", "HIServices", "AXError", "AXUIElement", "AXValue", "libc"] }
+objc2-application-services = { workspace = true, features = ["std", "HIServices", "AXError", "AXUIElement", "AXValue", "libc"] }
 bevy_app = { workspace = true }
 bevy_ecs = { workspace = true }
+bevy_tasks = { workspace = true }
 bevy_time = { workspace = true }
 block2 = "0.6"
 futures-lite = { workspace = true }
@@ -34,7 +36,7 @@ libc = { workspace = true }
 notify = { workspace = true }
 objc2 = { workspace = true }
 objc2-app-kit = { workspace = true, features = ["NSWorkspace", "NSRunningApplication", "NSApplication", "NSResponder", "NSScreen", "NSEvent", "NSGraphics", "objc2-core-foundation", "libc"] }
-objc2-foundation = { workspace = true, features = ["NSNotification", "NSString", "NSDictionary", "NSOperation", "NSValue", "NSObject", "NSArray", "NSDate", "NSRunLoop", "block2"] }
+objc2-foundation = { workspace = true, features = ["NSNotification", "NSDistributedNotificationCenter", "NSString", "NSDictionary", "NSOperation", "NSValue", "NSObject", "NSArray", "NSDate", "NSRunLoop", "block2"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -44,6 +46,11 @@ lexopt = "0.3.2"
 # Resolving SketchyBar's `/pattern/` item selectors, which only the daemon
 # can do: it is the one with a live item list.
 regex = "1"
+
+# Only the probes need it: `examples/alias_probe.rs` times the real
+# `Captures::refresh`, which is keyed by `Entity`.
+[dev-dependencies]
+bevy_ecs = { workspace = true }
 
 [lints]
 workspace = true

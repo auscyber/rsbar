@@ -1,0 +1,25 @@
+# Two kinds of entry live here, and both are about which thread a call lands
+# on.
+#
+# 1. `block_on` parks the calling thread on a `parking::Parker`. On the main
+#    thread that thread is the run loop -- the very thing that would have to
+#    keep turning for the future to make progress -- so it does not block, it
+#    deadlocks. The daemon has a `LocalExecutor` driven by the run loop
+#    instead: spawn onto it, or await.
+#
+# 2. The rest are the inverse of what `skylight::Window` enforces in the type
+#    system. A `Window` cannot leave the main thread, so the compiler proves
+#    that main-thread work stays there. Nothing in a type can say the opposite
+#    -- that a call is *too expensive* to make from the thread that
+#    composites, even though it is perfectly legal there -- so it is said
+#    here. Each is thread-safe, measured in the tens or hundreds of
+#    milliseconds, and already has a worker whose whole job is to make it.
+#
+#    A site that really is the worker answers with
+#    `#[expect(clippy::disallowed_methods, reason = "...")]`, which is the
+#    audit trail: every legitimate caller is one grep away.
+disallowed-methods = [
+    { path = "futures_lite::future::block_on", reason = "parks the run loop that would have to run the future; spawn onto runloop::spawn instead" },
+    { path = "skylight::capture", reason = "a window server round trip plus a hash of every pixel -- 115ms/s inline; submit the window id to alias::Captor and take the result on the next pass" },
+    { path = "skylight::true_rect", reason = "part of the same round trip as `capture`; it belongs on the same worker" },
+]

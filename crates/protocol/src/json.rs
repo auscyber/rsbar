@@ -1,19 +1,21 @@
 //! A JSON value that survives the wire.
 //!
-//! `serde_json::Value` cannot be used here. The transport is postcard, which is
-//! not self-describing: it decodes by asking the *type* what comes next, and
-//! `Value` decodes by asking the *format* what it is looking at. So the wire
-//! needs its own shape, and `serde_json` is used only at the edges — parsing
-//! what a client typed, and rendering what a script reads.
+//! `serde_json::Value` was impossible here under the old postcard transport,
+//! which is not self-describing: it decodes by asking the *type* what comes
+//! next, while `Value` decodes by asking the *format* what it is looking at.
+//! The wire is `MessagePack` now and would answer, but this type stays: it is
+//! also what the CLI and the Lua host pass around, and `serde_json` is still
+//! used only at the edges — parsing what a client typed, and rendering what a
+//! script reads.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// A JSON value.
 ///
-/// Objects are a `Vec` of pairs rather than a map: it round-trips through
-/// postcard without ordering surprises, and an event payload is small enough
-/// that lookup cost is irrelevant.
+/// Objects are a `Vec` of pairs rather than a map: it round-trips without
+/// ordering surprises, and an event payload is small enough that lookup cost is
+/// irrelevant.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum Json {
     #[default]
@@ -105,6 +107,7 @@ impl fmt::Display for Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_mach_ports::Codec as _;
 
     #[test]
     fn a_bare_word_is_a_string_not_an_error() {
@@ -138,7 +141,10 @@ mod tests {
     fn it_round_trips_through_the_wire_format() {
         // The whole reason this type exists rather than serde_json::Value.
         let value = Json::parse_or_string(r#"{"a":[1,true,"x"],"b":null}"#);
-        let bytes = postcard::to_allocvec(&value).unwrap();
-        assert_eq!(postcard::from_bytes::<Json>(&bytes).unwrap(), value);
+        let bytes = crate::wire::MessagePack.encode(&value).unwrap();
+        assert_eq!(
+            crate::wire::MessagePack.decode::<Json>(&bytes).unwrap(),
+            value
+        );
     }
 }

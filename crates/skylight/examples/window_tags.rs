@@ -63,7 +63,8 @@ fn report(step: &str, changed: bool, window: &Window) {
 
 fn main() {
     let frame = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(4.0, 4.0));
-    let window = Window::new(frame).expect("create window");
+    let mtm = objc2::MainThreadMarker::new().expect("an example runs on the main thread");
+    let window = Window::new(frame, mtm).expect("create window");
     println!("created window {}", window.id());
     // Printed so a real space switch can be told apart from the switch
     // animation settling back where it started — run this twice around a

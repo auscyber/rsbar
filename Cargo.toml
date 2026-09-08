@@ -11,38 +11,89 @@ repository = "https://github.com/auscyber/rsbar"
 
 [workspace.dependencies]
 rsbar-protocol = { path = "crates/protocol" }
+rsbar-protocol-macros = { path = "crates/protocol-macros" }
 skylight = { path = "crates/skylight" }
+skylight-macros = { path = "crates/skylight-macros" }
 
-async-mach-ports = "0.1"
+async-mach-ports = "0.3.0"
+# The daemon's executor. Taken directly rather than through `bevy_tasks`,
+# whose `mod executor` is private and re-exports neither `Executor` nor
+# `LocalExecutor` -- this is the same crate at the same version bevy_tasks
+# already wraps, so it costs nothing in the tree.
+async-executor = "1.14"
 bevy_app = { version = "0.19", default-features = false, features = ["std"] }
 # `debug` names the system and the components in a B0001 access-conflict
 # panic. Without it the message is six copies of "Enable the debug feature to
 # see the name", which is a bad afternoon.
 bevy_ecs = { version = "0.19", default-features = false, features = ["std", "debug"] }
 bevy_time = { version = "0.19", default-features = false, features = ["std"] }
+# `multi_threaded` is bevy_tasks' own feature and does not reach `bevy_ecs`:
+# `bevy_ecs/multi_threaded` implies this one, never the reverse, so the ECS
+# schedule stays single-threaded on the run loop thread while the
+# Accessibility walk gets a real pool of workers.
+bevy_tasks = { version = "0.19", default-features = false, features = ["multi_threaded"] }
 bitflags = "2.13"
+futures-core = "0.3"
 futures-lite = "2.6"
 notify = "8"
 libc = "0.2"
 objc2 = { version = "0.6", features = ["catch-all", "exception"] }
 objc2-app-kit = { version = "0.3", default-features = false }
+objc2-application-services = { version = "0.3", default-features = false }
 objc2-core-foundation = { version = "0.3", default-features = false }
 objc2-core-graphics = { version = "0.3", default-features = false }
 objc2-core-text = { version = "0.3", default-features = false }
 objc2-foundation = { version = "0.3", default-features = false }
 objc2-quartz-core = { version = "0.3", default-features = false }
+proc-macro2 = "1.0"
+quote = "1.0"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
-# The `sync` feature alone: channels and locks work with no runtime, which
-# matters because this daemon deliberately has none — its executor is the
-# CFRunLoop-driven Bevy runner.
-tokio = { version = "1", default-features = false, features = ["sync"] }
+syn = { version = "2.0", features = ["full", "visit-mut"] }
+# The daemon's one runtime. Bevy's schedule stays single-threaded on the run
+# loop thread -- `NonSend`, `CFRetained` and `MainThreadMarker` are what the
+# world holds, and none of them may leave it -- so everything off that thread
+# shares this instead of arriving with a pool of its own. `rt-multi-thread` for
+# the workers, `time` for deadlines, `process` for scripts that do not need a
+# thread each, `fs` for watching a config without one either, `signal` so
+# `SIGINT`/`SIGTERM` are handled on this runtime instead of a `sigwait` thread.
+tokio = { version = "1", default-features = false, features = [
+    "sync",
+    "rt",
+    "rt-multi-thread",
+    "time",
+    "process",
+    "fs",
+    "io-util",
+    "signal",
+] }
 thiserror = "2.0"
 tracing = "0.1"
 
 [workspace.lints.clippy]
-pedantic = "warn"
+pedantic = "deny"
 
 [profile.release]
+# No LTO, and codegen units well above the default. This is a bar: its work is
+# a repaint every so often and a handful of cross-process calls, none of it the
+# kind of hot inner loop whole-program optimisation pays for -- and the link
+# was costing about ninety seconds on every change, which is the whole edit
+# cycle for a daemon you have to actually look at to test.
 codegen-units = 1
 lto = true
+
+# What a profiler should build. `flamegraph.sh` looks for a profile inheriting
+# release that carries debug info and uses it in preference to patching
+# `release` on the command line, so a recording and an ordinary run are the
+# same binary shape.
+[profile.profiling]
+lto = false
+codegen-units = 256
+inherits = "release"
+debug = true
+strip = false
+# A real `.dSYM`, not the default split DWARF. On macOS `unpacked` leaves the
+# debug info in the `.o` files and records absolute paths to them in the
+# binary; when that mapping does not line up, Instruments symbolicates nothing
+# and every rsbar frame in the flamegraph is a bare hex address, silently.
+split-debuginfo = "packed"

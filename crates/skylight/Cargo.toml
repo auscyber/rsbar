@@ -10,9 +10,21 @@ publish = false
 
 [dependencies]
 bitflags = { workspace = true }
-objc2-core-foundation = { workspace = true, features = ["CFArray", "CFNumber", "CFString", "CFCGTypes"] }
-objc2-core-graphics = { workspace = true, features = ["CGError", "CGDirectDisplay", "CGDisplayConfiguration", "CGContext", "CGImage", "CGWindow", "libc"] }
+objc2 = { workspace = true }
+skylight-macros = { workspace = true }
+objc2-app-kit = { workspace = true, features = ["NSWorkspace", "NSRunningApplication", "NSApplication", "NSResponder", "objc2-core-foundation", "libc"] }
+objc2-application-services = { workspace = true, features = ["std", "HIServices", "AXError", "AXUIElement", "AXValue", "libc"] }
+objc2-core-foundation = { workspace = true, features = ["CFArray", "CFDictionary", "CFNumber", "CFRunLoop", "CFString", "CFCGTypes", "CFUUID"] }
+objc2-core-graphics = { workspace = true, features = ["CGError", "CGDirectDisplay", "CGDisplayConfiguration", "CGContext", "CGGeometry", "CGImage", "CGWindow", "libc"] }
 objc2-quartz-core = { workspace = true, features = ["CALayer", "CATransaction", "objc2-core-foundation", "objc2-core-graphics"] }
+# The `Stream` trait and nothing else -- no executor, no combinators, no
+# runtime. `callback::Events` implements it so a source's future composes with
+# whatever drives it.
+futures-core = { workspace = true }
+# `callback::relay`'s queue. A sender that is synchronous, infallible for want
+# of room and callable from any thread is exactly what a C callback needs, and
+# writing one again is how the 316-line version of this module happened.
+tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

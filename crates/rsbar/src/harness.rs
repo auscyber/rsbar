@@ -57,14 +57,18 @@ impl Harness {
 
         // A waker needs a run loop, and a test thread has one; nothing is ever
         // signalled because no source starts.
-        let waker = crate::runloop::Waker::install(|| {});
+        let waker = crate::runloop::Waker::install(crate::runloop::main_thread(), || {});
         Self {
             world,
             settings: Settings::default(),
             panels: Panels::default(),
             cache: Cache::default(),
             captures: crate::alias::Captures::default(),
-            sources: Registry::new(crate::config::shared(), waker),
+            sources: Registry::new(
+                crate::runloop::main_thread(),
+                crate::config::shared(),
+                waker,
+            ),
             subscribers: crate::subscribers::Subscribers::default(),
         }
     }
@@ -84,6 +88,7 @@ impl Harness {
                 .get_mut(&mut self.world)
                 .expect("item params are always valid");
             let mut ctx = Context {
+                main: crate::runloop::main_thread(),
                 settings: &mut self.settings,
                 panels: &mut self.panels,
                 cache: &mut self.cache,
@@ -150,6 +155,46 @@ impl Harness {
 
     pub fn start_eager(&mut self) {
         self.sources.start_eager();
+    }
+
+    /// Runs the end-of-frame pass again, without a request to hang it off.
+    ///
+    /// A source whose last claim went is marked rather than torn down, and
+    /// comes down on the pass after — see `sources::Liveness` for why. So a
+    /// test that wants "and now it has really stopped" asks for the next
+    /// frame, and one that wants "it is still there to be claimed again"
+    /// does not.
+    pub fn next_frame(&mut self) -> Vec<Job> {
+        self.sources.settle();
+        self.deliver()
+    }
+
+    /// The delivery half of a frame: everything the registry has queued,
+    /// pushed to whatever claimed it.
+    ///
+    /// The same three steps `ecs::dispatch_events` runs, and the reason a
+    /// `--trigger` is not visible in the [`Outcome`] any more: the request
+    /// only emits, and the drain is what delivers.
+    fn deliver(&mut self) -> Vec<Job> {
+        let mut queued: Vec<std::sync::Arc<Event>> = Vec::new();
+        self.sources
+            .drain(|_, event| queued.push(std::sync::Arc::new(event)));
+
+        let mut jobs = Vec::new();
+        for event in queued {
+            let mut dependents = self
+                .sources
+                .dependents(&event, &crate::sources::Target::All);
+            // A client holding a port takes the event itself, and only the
+            // rest fall back to a script.
+            dependents.retain(|item| !self.subscribers.push(*item, &event));
+            let mut state: SystemState<ItemsRead> = SystemState::new(&mut self.world);
+            let read = state
+                .get(&self.world)
+                .expect("item params are always valid");
+            jobs.extend(read.jobs_for(&event, &dependents));
+        }
+        jobs
     }
 
     /// What a source is registered for right now.
@@ -254,14 +299,15 @@ mod tests {
     };
     use std::num::NonZeroU64;
 
-    /// The workspace source, which `front_app_switched` is the lazy way in to.
-    const WORKSPACE: &str = "workspace";
+    /// The notification source, which `front_app_switched` is the lazy way in
+    /// to.
+    const NOTIFICATIONS: &str = "notifications";
 
     #[test]
     fn nothing_is_running_until_an_item_wants_it() {
         let bar = Harness::new();
         assert!(
-            !bar.running(WORKSPACE),
+            !bar.running(NOTIFICATIONS),
             "a bar nobody has configured observes nothing"
         );
     }
@@ -274,12 +320,55 @@ mod tests {
             name: item.clone(),
             events: vec![Kind::FrontAppSwitched],
         });
-        assert!(bar.running(WORKSPACE));
+        assert!(bar.running(NOTIFICATIONS));
 
         bar.apply(Request::Remove(Selector::Name(item)));
         assert!(
-            !bar.running(WORKSPACE),
+            bar.running(NOTIFICATIONS),
+            "the pass its last claim went in only marks it"
+        );
+
+        bar.next_frame();
+        assert!(
+            !bar.running(NOTIFICATIONS),
             "the last item wanting it went, so it should have stopped"
+        );
+    }
+
+    #[test]
+    fn a_claim_retaken_before_the_sweep_keeps_the_registration() {
+        // What the stale pass is for: an item that moves gives up the claim
+        // keyed to where it was and takes one keyed to where it is now, and
+        // the two need not land in the same pass. Tearing the source down in
+        // between and building it again is expensive and, for a Carbon
+        // handler or a `CoreAudio` listener, racy.
+        let mut bar = Harness::new();
+        let item = bar.add("front", Position::Left);
+        bar.apply(Request::Subscribe {
+            name: item.clone(),
+            events: vec![Kind::FrontAppSwitched],
+        });
+
+        // Everything lets go of it, and a pass runs.
+        bar.apply(Request::Subscribe {
+            name: item.clone(),
+            events: vec![],
+        });
+        assert!(bar.running(NOTIFICATIONS), "marked, not stopped");
+
+        // Something wants it again before the sweep.
+        bar.apply(Request::Subscribe {
+            name: item,
+            events: vec![Kind::FrontAppSwitched],
+        });
+        bar.next_frame();
+        assert!(
+            bar.running(NOTIFICATIONS),
+            "the claim came back in time, so the registration was never taken down"
+        );
+        assert_eq!(
+            bar.registered_for(NOTIFICATIONS),
+            vec![Kind::FrontAppSwitched]
         );
     }
 
@@ -302,7 +391,7 @@ mod tests {
             events: vec![],
         });
         assert!(
-            bar.running(WORKSPACE),
+            bar.running(NOTIFICATIONS),
             "the second item still wants front_app_switched"
         );
 
@@ -310,7 +399,8 @@ mod tests {
             name: second,
             events: vec![],
         });
-        assert!(!bar.running(WORKSPACE));
+        bar.next_frame();
+        assert!(!bar.running(NOTIFICATIONS));
     }
 
     #[test]
@@ -323,7 +413,10 @@ mod tests {
             name: item,
             events: vec![Kind::FrontAppSwitched],
         });
-        assert_eq!(bar.registered_for(WORKSPACE), vec![Kind::FrontAppSwitched]);
+        assert_eq!(
+            bar.registered_for(NOTIFICATIONS),
+            vec![Kind::FrontAppSwitched]
+        );
     }
 
     #[test]
@@ -342,12 +435,12 @@ mod tests {
             events: vec![Kind::FrontAppSwitched, Kind::SystemWoke],
         });
 
-        let mut registered = bar.registered_for(WORKSPACE);
+        let mut registered = bar.registered_for(NOTIFICATIONS);
         registered.sort();
         let mut expected = vec![Kind::FrontAppSwitched, Kind::SystemWoke];
         expected.sort();
         assert_eq!(registered, expected, "the added event has an observer now");
-        assert!(bar.running(WORKSPACE));
+        assert!(bar.running(NOTIFICATIONS));
     }
 
     #[test]
@@ -362,8 +455,8 @@ mod tests {
             name: item,
             events: vec![Kind::SystemWoke],
         });
-        assert_eq!(bar.registered_for(WORKSPACE), vec![Kind::SystemWoke]);
-        assert!(bar.running(WORKSPACE), "something still wants it");
+        assert_eq!(bar.registered_for(NOTIFICATIONS), vec![Kind::SystemWoke]);
+        assert!(bar.running(NOTIFICATIONS), "something still wants it");
     }
 
     #[test]
@@ -379,7 +472,7 @@ mod tests {
             name: second,
             events: vec![Kind::SystemWoke],
         });
-        let mut registered = bar.registered_for(WORKSPACE);
+        let mut registered = bar.registered_for(NOTIFICATIONS);
         registered.sort();
         let mut expected = vec![Kind::FrontAppSwitched, Kind::SystemWoke];
         expected.sort();
@@ -390,7 +483,7 @@ mod tests {
             name: first,
             events: vec![],
         });
-        assert_eq!(bar.registered_for(WORKSPACE), vec![Kind::SystemWoke]);
+        assert_eq!(bar.registered_for(NOTIFICATIONS), vec![Kind::SystemWoke]);
     }
 
     #[test]
@@ -407,18 +500,22 @@ mod tests {
                 events: vec![Kind::FrontAppSwitched],
             });
         }
-        assert_eq!(bar.registered_for(WORKSPACE), vec![Kind::FrontAppSwitched]);
+        assert_eq!(
+            bar.registered_for(NOTIFICATIONS),
+            vec![Kind::FrontAppSwitched]
+        );
 
         bar.apply(Request::Remove(Selector::Name(first)));
         assert_eq!(
-            bar.registered_for(WORKSPACE),
+            bar.registered_for(NOTIFICATIONS),
             vec![Kind::FrontAppSwitched],
             "the other item still holds a claim on it"
         );
 
         bar.apply(Request::Remove(Selector::Name(second)));
-        assert!(bar.registered_for(WORKSPACE).is_empty());
-        assert!(!bar.running(WORKSPACE));
+        bar.next_frame();
+        assert!(bar.registered_for(NOTIFICATIONS).is_empty());
+        assert!(!bar.running(NOTIFICATIONS));
     }
 
     #[test]
@@ -434,7 +531,10 @@ mod tests {
             name: front.clone(),
             events: vec![Kind::FrontAppSwitched],
         });
-        assert_eq!(bar.registered_for(WORKSPACE), vec![Kind::FrontAppSwitched]);
+        assert_eq!(
+            bar.registered_for(NOTIFICATIONS),
+            vec![Kind::FrontAppSwitched]
+        );
 
         // Another item asks about waking. The source already exists, so it is
         // widened rather than rebuilt.
@@ -443,7 +543,7 @@ mod tests {
             name: sleep.clone(),
             events: vec![Kind::SystemWoke],
         });
-        let mut both = bar.registered_for(WORKSPACE);
+        let mut both = bar.registered_for(NOTIFICATIONS);
         both.sort();
         let mut expected = vec![Kind::FrontAppSwitched, Kind::SystemWoke];
         expected.sort();
@@ -452,13 +552,15 @@ mod tests {
         // The first item goes. Nothing wants the front application any more,
         // so the source stops observing it — and keeps observing wakes.
         bar.apply(Request::Remove(Selector::Name(front)));
-        assert_eq!(bar.registered_for(WORKSPACE), vec![Kind::SystemWoke]);
-        assert!(bar.running(WORKSPACE));
+        assert_eq!(bar.registered_for(NOTIFICATIONS), vec![Kind::SystemWoke]);
+        assert!(bar.running(NOTIFICATIONS));
 
-        // The second goes too. Nothing wants anything off it, so it stops.
+        // The second goes too. Nothing wants anything off it, so it stops —
+        // on the pass after the one that found it unwanted.
         bar.apply(Request::Remove(Selector::Name(sleep)));
-        assert!(bar.registered_for(WORKSPACE).is_empty());
-        assert!(!bar.running(WORKSPACE));
+        bar.next_frame();
+        assert!(bar.registered_for(NOTIFICATIONS).is_empty());
+        assert!(!bar.running(NOTIFICATIONS));
     }
 
     #[test]
@@ -608,13 +710,16 @@ mod tests {
         bar.apply(Request::Set(
             Selector::Pattern(r"menu\..*".into()),
             Box::new(ItemPatch {
-                drawing: Some(rsbar_protocol::Toggle::Off),
+                geometry: Some(rsbar_protocol::GeometryPatch {
+                    drawing: Some(rsbar_protocol::BoolChange::False),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
         ));
 
         for item in bar.items() {
-            let hidden = !item.geometry.drawing;
+            let hidden = !item.geometry.drawing.get();
             assert_eq!(
                 hidden,
                 item.name.as_str().starts_with("menu."),
@@ -712,7 +817,10 @@ mod tests {
         bar.apply(Request::Set(
             Selector::Name(listener),
             Box::new(ItemPatch {
-                script: Some("true".into()),
+                scripting: Some(rsbar_protocol::ScriptingPatch {
+                    script: Some("true".into()),
+                    ..Default::default()
+                }),
                 ..patch()
             }),
         ));
@@ -733,7 +841,10 @@ mod tests {
         bar.apply(Request::Set(
             Selector::Name(unrelated),
             Box::new(ItemPatch {
-                script: Some("true".into()),
+                scripting: Some(rsbar_protocol::ScriptingPatch {
+                    script: Some("true".into()),
+                    ..Default::default()
+                }),
                 ..patch()
             }),
         ));
@@ -754,7 +865,10 @@ mod tests {
         bar.apply(Request::Set(
             Selector::Name(item),
             Box::new(ItemPatch {
-                click_script: Some("clicked".into()),
+                scripting: Some(rsbar_protocol::ScriptingPatch {
+                    click_script: Some("clicked".into()),
+                    ..Default::default()
+                }),
                 ..patch()
             }),
         ));
@@ -772,7 +886,10 @@ mod tests {
         bar.apply(Request::Set(
             Selector::Name(name("item")),
             Box::new(ItemPatch {
-                script: Some("updated".into()),
+                scripting: Some(rsbar_protocol::ScriptingPatch {
+                    script: Some("updated".into()),
+                    ..Default::default()
+                }),
                 ..patch()
             }),
         ));
@@ -796,7 +913,10 @@ mod tests {
         bar.apply(Request::Set(
             Selector::Name(front),
             Box::new(ItemPatch {
-                script: Some("true".into()),
+                scripting: Some(rsbar_protocol::ScriptingPatch {
+                    script: Some("true".into()),
+                    ..Default::default()
+                }),
                 ..patch()
             }),
         ));
@@ -809,8 +929,8 @@ mod tests {
             app: "Finder".into(),
         }));
         let env = jobs[0].event.env();
-        assert_eq!(env["RSBAR_SENDER"], "front_app_switched");
-        assert_eq!(env["RSBAR_APP"], "Finder");
+        assert_eq!(env["SENDER"], "front_app_switched");
+        assert_eq!(env["APP"], "Finder");
     }
 
     #[test]
@@ -820,7 +940,10 @@ mod tests {
         bar.apply(Request::Set(
             Selector::Name(item),
             Box::new(ItemPatch {
-                script: Some("true".into()),
+                scripting: Some(rsbar_protocol::ScriptingPatch {
+                    script: Some("true".into()),
+                    ..Default::default()
+                }),
                 ..patch()
             }),
         ));
@@ -850,7 +973,10 @@ mod tests {
             bar.apply(Request::Set(
                 Selector::Name(item),
                 Box::new(ItemPatch {
-                    script: Some("true".into()),
+                    scripting: Some(rsbar_protocol::ScriptingPatch {
+                        script: Some("true".into()),
+                        ..Default::default()
+                    }),
                     ..patch()
                 }),
             ));
@@ -874,7 +1000,10 @@ mod tests {
         bar.apply(Request::Set(
             Selector::Name(mine),
             Box::new(ItemPatch {
-                script: Some("true".into()),
+                scripting: Some(rsbar_protocol::ScriptingPatch {
+                    script: Some("true".into()),
+                    ..Default::default()
+                }),
                 ..patch()
             }),
         ));
@@ -883,15 +1012,24 @@ mod tests {
             events: vec![Kind::Custom("my.event".into())],
         });
 
+        // The request only emits; the drain is what delivers. So the jobs
+        // arrive on the next frame rather than in the outcome.
         let fired = bar.apply(Request::Trigger(
             Kind::Custom("my.event".into()).into_event(),
         ));
-        assert_eq!(fired.jobs.len(), 1);
+        assert!(
+            fired.jobs.is_empty(),
+            "triggering queues, it does not deliver"
+        );
+        assert_eq!(bar.next_frame().len(), 1);
 
-        let other = bar.apply(Request::Trigger(
+        bar.apply(Request::Trigger(
             Kind::Custom("other.event".into()).into_event(),
         ));
-        assert!(other.jobs.is_empty(), "a custom event matches by name");
+        assert!(
+            bar.next_frame().is_empty(),
+            "a custom event matches by name"
+        );
     }
 
     #[test]

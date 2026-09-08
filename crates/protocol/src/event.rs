@@ -10,52 +10,75 @@
 //! carry one — and [`Event`] is what a source emits.
 
 use crate::Json;
+use rsbar_protocol_macros::{EnvFields, Spelling, events};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
-/// Where the machine is drawing power from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Where the machine is drawing power from, and what only that side of it
+/// can say.
+///
+/// Determinate rather than a tag beside a pile of optionals. Minutes-to-full
+/// only means anything on mains and minutes-to-empty only means anything on
+/// battery; the old shape let one payload carry both, or neither, with
+/// nothing saying which was a real reading and which was just absent. Here a
+/// value that cannot exist cannot be spelled.
+///
+/// Scripts still see every one of these as its own variable — that is what
+/// `#[derive(EnvFields)]` projects, and what keeps a determinate Rust type and
+/// a flat shell environment from being a choice between two.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, EnvFields, Spelling,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PowerSource {
-    Ac,
-    Battery,
+    /// On mains.
+    ///
+    /// The spelling is what a script matches on, so it is part of the
+    /// interface rather than a debug rendering.
+    #[spell("AC")]
+    Ac {
+        /// What the adapter reports it can supply — a nameplate rating, not
+        /// a measurement, and not every adapter reports one.
+        adapter_watts: Option<u32>,
+        /// Whether the battery is actually taking charge. A full battery on
+        /// mains is not.
+        charging: bool,
+        /// Minutes to full, once charging with an estimate settled.
+        time_to_full_minutes: Option<u32>,
+    },
+    /// On battery, and so discharging by definition -- which is why
+    /// `charging` is spelled out here rather than left empty: a script should
+    /// not have to read the power source back to interpret a hole.
+    #[env(charging = false)]
+    #[spell("BATTERY")]
+    Battery {
+        /// Minutes to empty, once the estimate has settled.
+        time_to_empty_minutes: Option<u32>,
+    },
     /// What a machine reports before anything has asked, and what a failed
     /// query returns.
     #[default]
+    #[spell("UNKNOWN")]
     Unknown,
 }
 
-impl fmt::Display for PowerSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The spelling a script matches on, so it is part of the interface.
-        f.write_str(match self {
-            Self::Ac => "AC",
-            Self::Battery => "BATTERY",
-            Self::Unknown => "UNKNOWN",
-        })
-    }
-}
-
 /// Which mouse button was used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+///
+/// Printed only: nothing parses one back, so the spelling table drives
+/// [`Display`](fmt::Display) alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Spelling)]
 #[serde(rename_all = "snake_case")]
 pub enum MouseButton {
     #[default]
+    #[spell("left")]
     Left,
+    #[spell("right")]
     Right,
+    #[spell("other")]
     Other,
-}
-
-impl fmt::Display for MouseButton {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Left => "left",
-            Self::Right => "right",
-            Self::Other => "other",
-        })
-    }
 }
 
 bitflags::bitflags! {
@@ -70,8 +93,8 @@ bitflags::bitflags! {
     }
 }
 
-/// Serialised as its bits rather than bitflags' own string form: postcard is
-/// the wire format, and a byte beats a list of names.
+/// Serialised as its bits rather than bitflags' own string form: a modifier set
+/// is read by machines on both ends, and an integer beats a list of names.
 impl Serialize for Modifiers {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.bits().serialize(serializer)
@@ -109,288 +132,108 @@ impl fmt::Display for Modifiers {
     }
 }
 
-/// A field a payload may not have a value for, printed as the value or as
-/// nothing at all.
+/// How one leaf value reaches a script, under a name of its own.
 ///
-/// A script tests it with `[ -z "$RSBAR_CHARGE" ]` rather than against a
-/// sentinel, which is the shape a shell already has for "unset". A newtype
-/// because [`events!`] calls `to_string` on every field, and `Display` cannot
-/// be implemented for `Option<T>` from here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct Maybe<T>(pub Option<T>);
-
-impl<T> From<Option<T>> for Maybe<T> {
-    fn from(value: Option<T>) -> Self {
-        Self(value)
-    }
-}
-
-impl<T: fmt::Display> fmt::Display for Maybe<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 {
-            Some(value) => write!(f, "{value}"),
-            None => Ok(()),
-        }
-    }
-}
-
-/// Matches a [`Kind`] variant regardless of what it carries.
-macro_rules! kind_pattern {
-    ($variant:ident) => {
-        Self::$variant
-    };
-    ($variant:ident @$scope:ident) => {
-        Self::$variant(_)
-    };
-}
-
-/// Builds the wire-shaped, item-less [`Kind`] for one variant — `Item = ()`,
-/// the only value an event's own name can produce.
-macro_rules! kind_unscoped {
-    ($variant:ident) => {
-        Kind::$variant
-    };
-    ($variant:ident @$scope:ident) => {
-        Kind::$variant(())
-    };
-}
-
-/// [`Kind::map`]'s pattern for one variant — binding `$item` only where there
-/// is one to bind. Paired with [`kind_map_expr`]; kept separate because a
-/// macro cannot expand to a whole match arm, only to the pattern or the
-/// expression inside one.
+/// `fields()` used to call `to_string` on everything, which forced an absent
+/// value to be a newtype with a `Display` of its own — `Display` cannot be
+/// implemented for `Option<T>` from here, and a wire type is not the place to
+/// invent a Haskell. A trait of this crate's own can be, so the fields are
+/// plain `Option`s and "absent" is the empty string a shell already tests
+/// with `[ -z "$CHARGE" ]`.
 ///
-/// `$item` (and `$f` below) arrive as tokens from [`Kind::map`]'s own body
-/// rather than being named `item`/`f` here directly, because a literal
-/// identifier written inside a macro is hygienic to *that* macro — `item`
-/// bound in this one and `item` used in [`kind_map_expr`] would be two
-/// different bindings that happen to share a spelling. Passing the same
-/// token into both keeps them the one binding.
-macro_rules! kind_map_pattern {
-    ($variant:ident, $item:ident) => {
-        Self::$variant
-    };
-    ($variant:ident @$scope:ident, $item:ident) => {
-        Self::$variant($item)
-    };
+/// No blanket impl over `Display`: it would collide with the one for
+/// `Option<T>`, and the set of types a payload field can be is small, known
+/// and worth naming.
+/// Only the leaf: what a nested value projects up beyond its own name is
+/// [`EnvFields`]'s business, and derived rather than written by hand.
+pub trait Field {
+    /// What a script reads under this field's own name.
+    fn to_field(&self) -> String;
 }
 
-/// [`Kind::map`]'s expression for one variant, recasting `$item` through `$f`
-/// where [`kind_map_pattern`] bound one.
-macro_rules! kind_map_expr {
-    ($variant:ident, $f:ident, $item:ident) => {
-        Kind::$variant
-    };
-    ($variant:ident @$scope:ident, $f:ident, $item:ident) => {
-        Kind::$variant($f($item))
-    };
-}
-
-/// Declares the built-in events.
-///
-/// `Variant = "name" => Payload { field: Type }` gives a payload struct, an
-/// `Event::Variant(Payload)`, and a `Kind::Variant` named `"name"`.
-/// `Variant = "name" @scoped => ...` gives a `Kind::Variant(Item)` instead —
-/// for an event that happens to one item rather than to the bar. See
-/// [`Kind`]'s own doc for what `Item` is and who fills it in.
-///
-/// Every field also becomes an environment variable for scripts, named
-/// `RSBAR_` plus the field in upper case. That is why the fields are named
-/// what a config would call them.
-macro_rules! events {
-    // Builds the `Kind` enum's variant list one event at a time.
-    //
-    // A macro cannot expand to a single enum variant — only a whole item, or
-    // an expression, type or pattern inside one — so the per-event `@scoped`
-    // branch cannot be a helper macro spliced into the variant list the way
-    // [`kind_pattern`] is spliced into a match arm's pattern. This is the
-    // accumulator instead: it munches one `Variant` or `Variant @scoped` at a
-    // time off the front, growing `$done` by exactly the variant that event
-    // needs, until nothing is left to munch.
-    (@kind [$($done:tt)*]) => {
-        /// What an item subscribes to: an event without its payload.
-        ///
-        /// Generic over `Item`, which only a handful of variants carry — the
-        /// ones declared `@scoped` above, because they happen to one item
-        /// rather than to the bar. `Item` is `()` on the wire: a config writes
-        /// a bare `mouse.entered`, meaning "mine", and there is no item to
-        /// name in that string — [`Kind::from_str`] can only ever produce
-        /// `Kind<()>`. Whoever resolves "mine" to an actual item calls
-        /// [`Kind::map`] once, at the one place both are known.
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-        pub enum Kind<Item = ()> {
-            $($done)*
-            Custom(String),
-        }
-    };
-    (@kind [$($done:tt)*] $variant:ident @$scope:ident, $($rest:tt)*) => {
-        events!(@kind [$($done)* $variant(Item),] $($rest)*);
-    };
-    (@kind [$($done:tt)*] $variant:ident, $($rest:tt)*) => {
-        events!(@kind [$($done)* $variant,] $($rest)*);
-    };
-
-    (
+macro_rules! field_via_display {
+    ($($ty:ty),* $(,)?) => {
         $(
-            $variant:ident = $name:literal $(@$scope:ident)? => $data:ident {
-                $( $(#[$field_meta:meta])* $field:ident : $ty:ty ),* $(,)?
-            }
-        ),* $(,)?
-    ) => {
-        events!(@kind [] $( $variant $(@$scope)?, )*);
-
-        $(
-            #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-            pub struct $data {
-                $( $(#[$field_meta])* pub $field: $ty, )*
-            }
-
-            impl $data {
-                /// This payload's fields, as a script sees them.
-                // Built by inserting because the field list is a macro
-                // repetition; a map literal cannot be written for one.
-                #[allow(unused_mut)]
-                #[must_use]
-                pub fn fields(&self) -> BTreeMap<String, String> {
-                    let mut fields = BTreeMap::new();
-                    $( fields.insert(stringify!($field).to_owned(), self.$field.to_string()); )*
-                    fields
+            impl Field for $ty {
+                fn to_field(&self) -> String {
+                    self.to_string()
                 }
             }
         )*
-
-        /// Something that happened, with what it carries.
-        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-        pub enum Event {
-            $( $variant($data), )*
-            /// An event a config invented and triggers itself.
-            Custom(Custom),
-        }
-
-        impl Event {
-            /// What this is, for matching a subscription against.
-            ///
-            /// Always the wire-shaped, item-less `Kind<()>`: a payload never
-            /// carries which item it happened to (that is decided by hit
-            /// geometry, not by the event), so this cannot produce a scoped
-            /// `Kind` and does not try to.
-            #[must_use]
-            pub fn kind(&self) -> Kind {
-                match self {
-                    $( Self::$variant(_) => kind_unscoped!($variant $(@$scope)?), )*
-                    Self::Custom(custom) => Kind::Custom(custom.name.clone()),
-                }
-            }
-
-            /// The payload's fields, as a script sees them.
-            #[must_use]
-            pub fn fields(&self) -> BTreeMap<String, String> {
-                match self {
-                    $( Self::$variant(data) => data.fields(), )*
-                    Self::Custom(custom) => custom.fields(),
-                }
-            }
-        }
-
-        /// As the name a config writes, not as a variant map -- that name is
-        /// the whole vocabulary a client and this daemon share.
-        ///
-        /// Only the unscoped form has a wire representation. A `Kind<Entity>`
-        /// names an entity in one `World`, which means nothing in another
-        /// process, so there is deliberately no way to send one.
-        impl Serialize for Kind<()> {
-            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                serializer.collect_str(self.name())
-            }
-        }
-
-        impl<'de> Deserialize<'de> for Kind<()> {
-            fn deserialize<D: serde::Deserializer<'de>>(
-                deserializer: D,
-            ) -> Result<Self, D::Error> {
-                let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
-                text.parse().map_err(serde::de::Error::custom)
-            }
-        }
-
-        impl<Item> Kind<Item> {
-            /// Recasts the item this depends on, keeping everything else.
-            ///
-            /// An unscoped variant has no item to recast, so `f` never runs
-            /// for one — it only fires for the handful declared `@scoped`.
-            #[must_use]
-            pub fn map<Other>(self, f: impl FnOnce(Item) -> Other) -> Kind<Other> {
-                match self {
-                    $( kind_map_pattern!($variant $(@$scope)?, item) => kind_map_expr!($variant $(@$scope)?, f, item), )*
-                    Self::Custom(name) => Kind::Custom(name),
-                }
-            }
-        }
-
-        impl Kind {
-            /// The name a config writes, and a script reads in `RSBAR_SENDER`.
-            ///
-            /// Defined only for the wire-shaped `Kind<()>` — not because a
-            /// scoped `Kind<Entity>` prints differently, it never does, but
-            /// because nothing ever needs its name: a claim is looked up by
-            /// value, never by string, once it carries a real item.
-            #[must_use]
-            pub fn name(&self) -> &str {
-                match self {
-                    $( kind_pattern!($variant $(@$scope)?) => $name, )*
-                    Self::Custom(name) => name,
-                }
-            }
-
-            /// Whether `event` is one of these.
-            ///
-            /// Generated alongside the variants so a new event cannot be added
-            /// without the match arm that recognises it. Compares directly
-            /// rather than going through [`Event::kind`], which would allocate
-            /// a name for every custom event on every dispatch.
-            #[must_use]
-            pub fn matches(&self, event: &Event) -> bool {
-                match (self, event) {
-                    $( (kind_pattern!($variant $(@$scope)?), Event::$variant(_)) => true, )*
-                    (Self::Custom(name), Event::Custom(custom)) => *name == custom.name,
-                    _ => false,
-                }
-            }
-
-            /// Every built-in, for validating a subscription and for `--help`.
-            ///
-            /// Scoped kinds come back as `Kind::Variant(())` — not a stand-in
-            /// for a real claim, since a real one is `Kind<Entity>` and no
-            /// value of that type is reachable from here. `()` is simply the
-            /// only item a name on its own can mean.
-            #[must_use]
-            pub fn built_in() -> Vec<Kind> {
-                vec![ $( kind_unscoped!($variant $(@$scope)?), )* ]
-            }
-
-            /// An event of this kind carrying nothing.
-            ///
-            /// What `--trigger` produces: a client naming an event knows the
-            /// name, not the payload the source would have filled in. Only
-            /// meaningful for the wire-shaped `Kind<()>` — a trigger names an
-            /// event, not one already bound to an item.
-            #[must_use]
-            pub fn into_event(self) -> Event {
-                match self {
-                    $( kind_pattern!($variant $(@$scope)?) => Event::$variant($data::default()), )*
-                    Self::Custom(name) => {
-                        Event::Custom(Custom { name, data: Json::Null })
-                    }
-                }
-            }
-        }
     };
+}
+
+field_via_display!(
+    String,
+    bool,
+    u8,
+    u32,
+    u64,
+    f64,
+    MouseButton,
+    Modifiers,
+    PowerSource,
+    Json
+);
+
+/// An absent value is the empty string, which is the shape a shell already
+/// has for "unset".
+impl<T: fmt::Display> Field for Option<T> {
+    fn to_field(&self) -> String {
+        match self {
+            Some(value) => value.to_string(),
+            None => String::new(),
+        }
+    }
+}
+
+/// A payload's script environment, worked out from its fields.
+///
+/// Derived rather than written: the upper-casing happens once per field, in
+/// the proc macro, and a struct outside the [`events!`] list gets the same
+/// treatment by asking for it.
+pub trait EnvFields {
+    /// This payload's fields, as a script sees them.
+    #[must_use]
+    fn fields(&self) -> BTreeMap<String, String>;
+
+    /// The same, under the names a script's environment uses.
+    ///
+    /// Only a field that expands into further names -- [`PowerSource`] -- has
+    /// names the derive cannot know, and only those are owned.
+    #[must_use]
+    fn env_fields(&self) -> BTreeMap<Cow<'static, str>, String>;
+}
+
+/// As the name a config writes, not as a variant map -- that name is the
+/// whole vocabulary a client and this daemon share.
+///
+/// Only the unscoped form has a wire representation. A `Kind<Entity>` names an
+/// entity in one `World`, which means nothing in another process, so there is
+/// deliberately no way to send one.
+impl Serialize for Kind<()> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for Kind<()> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <Cow<'de, str>>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 events! {
     Routine = "routine" => Routine {},
     Forced = "forced" => Forced {},
     FrontAppSwitched = "front_app_switched" => FrontApp { app: String },
+    /// An application finishing launch.
+    ///
+    /// The daemon's own reason for it is aliases: an alias naming an
+    /// application that is not running cannot resolve, and this is the
+    /// moment it can. A config can subscribe to it like any other.
+    AppLaunched = "app_launched" => AppLaunch { app: String },
     SpaceChanged = "space_changed" => SpaceChange { display: u32, space: u64 },
     DisplayChanged = "display_changed" => DisplayChange {},
     SystemWoke = "system_woke" => SystemWoke {},
@@ -398,22 +241,30 @@ events! {
     VolumeChanged = "volume_changed" => VolumeChange { volume: u8 },
     BrightnessChanged = "brightness_changed" => BrightnessChange { brightness: u8 },
     PowerSourceChanged = "power_source_changed" => PowerChange {
+        /// Mains or battery — and, inside it, the numbers only that side has.
+        /// It projects `ADAPTER_WATTS`, `CHARGING` and the two estimates up
+        /// alongside `POWER_SOURCE`.
+        #[env(flatten)]
         power_source: PowerSource,
-        /// What the adapter reports it can supply. Empty on battery, and on
-        /// an adapter that does not say.
-        watts: Maybe<u32>,
+        /// Power actually moving through the battery right now, in whole
+        /// watts, whichever way it is going — `charging` says which, so this
+        /// is a magnitude and never carries a sign. Empty on hardware with no
+        /// battery. Legitimately `0` on a full battery on mains.
+        watts: Option<u32>,
         /// 0-100. Empty on hardware with no battery at all.
-        charge: Maybe<u8>,
-        charging: Maybe<bool>,
-        /// Empty unless discharging with an estimate settled.
-        time_to_empty_minutes: Maybe<u32>,
-        /// Empty unless charging with an estimate settled.
-        time_to_full_minutes: Maybe<u32>,
+        charge: Option<u8>,
     },
     WifiChanged = "wifi_changed" => WifiChange { ssid: String },
     MediaChanged = "media_changed" => MediaChange { media: Json },
     SpaceWindowsChanged = "space_windows_changed" => SpaceWindowsChange { space: u64 },
     ConfigReloaded = "config_reloaded" => ConfigReload {},
+    /// The Accessibility grant arriving, or being taken away again.
+    ///
+    /// The system's own prompt says to restart the application, and this
+    /// event is what makes that unnecessary: whatever gave up while untrusted
+    /// -- an alias whose real owner could not be recovered, a menu that could
+    /// not be listed -- gets told the moment the box is ticked.
+    AccessibilityChanged = "accessibility_changed" => AccessibilityChange { trusted: bool },
 
     // The pointer. `.global` fires for the bar as a whole rather than for one
     // item, which is how a config reacts to the empty space between items —
@@ -443,31 +294,177 @@ events! {
         y: f64,
     },
 }
+/// The name of an event a config invented.
+///
+/// Not a bare `String`. Three commands spell an event name -- `--add event`,
+/// `--trigger` and `--subscribe` -- and the failure that matters is a typo in
+/// a built-in name quietly becoming a custom event nobody ever fires. Parsing
+/// through [`Kind`] rules that out: a name that is a built-in comes back as
+/// the built-in, and only what is left can be one of these.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct EventName(String);
 
-/// An event a config invented. Its payload is whatever the trigger passed.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct Custom {
-    pub name: String,
-    pub data: Json,
+impl EventName {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The subscription this name means.
+    #[must_use]
+    pub fn kind(&self) -> Kind {
+        Kind::Custom(self.0.clone())
+    }
 }
 
-impl Custom {
-    fn fields(&self) -> BTreeMap<String, String> {
-        match &self.data {
-            Json::Null => BTreeMap::new(),
-            data => BTreeMap::from([("data".to_owned(), data.to_string())]),
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidEventName {
+    #[error(transparent)]
+    NotAName(#[from] InvalidEvent),
+    #[error("`{0}` is a built-in event; only a name rsbar does not already define can be added")]
+    BuiltIn(String),
+}
+
+impl FromStr for EventName {
+    type Err = InvalidEventName;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.parse::<Kind>()? {
+            Kind::Custom(name) => Ok(Self(name)),
+            built_in => Err(InvalidEventName::BuiltIn(built_in.name().to_owned())),
         }
     }
 }
 
+impl TryFrom<String> for EventName {
+    type Error = InvalidEventName;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<EventName> for String {
+    fn from(name: EventName) -> Self {
+        name.0
+    }
+}
+
+impl fmt::Display for EventName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A `NSDistributedNotificationCenter` notification to bridge an event from.
+///
+/// Distributed notification names are another process's business entirely --
+/// `com.apple.dock.prefchanged`, a bundle identifier, anything a poster chose
+/// -- so this validates only what would make the name unusable rather than
+/// pretending to know the space: it must be non-empty and free of control
+/// characters, which is exactly what [`crate::ItemName`] rules out for the
+/// same reason.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct NotificationName(String);
+
+impl NotificationName {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("`{0}` is not a notification name")]
+pub struct InvalidNotificationName(String);
+
+impl FromStr for NotificationName {
+    type Err = InvalidNotificationName;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() || s.chars().any(char::is_control) {
+            return Err(InvalidNotificationName(s.to_owned()));
+        }
+        Ok(Self(s.to_owned()))
+    }
+}
+
+impl TryFrom<String> for NotificationName {
+    type Error = InvalidNotificationName;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<NotificationName> for String {
+    fn from(name: NotificationName) -> Self {
+        name.0
+    }
+}
+
+impl fmt::Display for NotificationName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// An event a config invented, and whatever it was triggered with.
+///
+/// A name and a map, rather than a name and an opaque blob: `--trigger demo
+/// VAR=Test` means `$VAR` is set for the script, so the variables are the
+/// event's fields and there is nothing to unpack on the way out. Values are
+/// strings because that is what an environment variable is.
+///
+/// Ordered rather than hashed, so `$INFO`'s JSON has the same key order every
+/// time -- a script diffing it, or a person reading a log, should not see it
+/// shuffle between two identical triggers.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Custom {
+    pub name: String,
+    /// A field of its own rather than `#[serde(flatten)]`. Flattening makes
+    /// serde write a map of unknown length, which the old postcard transport
+    /// could not encode at all -- every `--trigger demo VAR=1` failed on the
+    /// wire before it left the CLI. `MessagePack` buffers such a map and encodes
+    /// it, so flattening is now merely a choice rather than impossible; this
+    /// stays a named field because `$INFO`'s JSON is written against it.
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
+}
+
+impl Custom {
+    /// Named after the event alone, carrying nothing.
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            vars: BTreeMap::new(),
+        }
+    }
+
+    fn fields(&self) -> BTreeMap<String, String> {
+        self.vars.clone()
+    }
+}
+
 impl Event {
-    /// The environment a script is handed, beyond `RSBAR_NAME`.
+    /// The environment a script is handed, beyond `NAME`.
     ///
-    /// `RSBAR_SENDER` is the event's name. `RSBAR_INFO` is the payload as one
-    /// value — the field itself when there is exactly one, a JSON object when
-    /// there are several, empty when there are none — which is what a config
-    /// already reaches for. Every field also arrives under its own name, so a
-    /// script that wants the volume can read `RSBAR_VOLUME` instead of parsing.
+    /// `SENDER` is the event's name. `INFO` is the payload as one value — the
+    /// field itself when there is exactly one, a JSON object when there are
+    /// several, empty when there are none — which is what a config already
+    /// reaches for. Every field also arrives under its own name, so a script
+    /// that wants the volume can read `VOLUME` instead of parsing.
+    ///
+    /// Exactly the names `SketchyBar` sets, and no others: a config's plugin
+    /// scripts are written against it, and the whole point of matching its
+    /// CLI is that those scripts run unchanged. There used to be an
+    /// `RSBAR_`-prefixed twin of each, on the theory that a bare `NAME` is
+    /// easy for something else in the environment to have set — but a script
+    /// that reads the prefixed one is a script that no longer runs under
+    /// `SketchyBar`, which is the one thing this is not allowed to cost.
     #[must_use]
     pub fn env(&self) -> BTreeMap<String, String> {
         let fields = self.fields();
@@ -486,25 +483,15 @@ impl Event {
             }
         };
 
-        // Under both spellings: a config's plugin scripts are written against
-        // `SketchyBar`, which passes `SENDER`/`INFO` unprefixed, and the whole
-        // point of matching its CLI is that those scripts run unchanged. The
-        // `RSBAR_` names stay because a bare `NAME` in the environment is easy
-        // for something else to have set, and a script that wants to be sure
-        // can ask for the one nothing else uses.
         let mut env = BTreeMap::from([
             ("SENDER".to_owned(), self.kind().name().to_owned()),
-            ("RSBAR_SENDER".to_owned(), self.kind().name().to_owned()),
-            ("INFO".to_owned(), info.clone()),
-            ("RSBAR_INFO".to_owned(), info),
+            ("INFO".to_owned(), info),
         ]);
-        env.extend(fields.into_iter().flat_map(|(name, value)| {
-            let upper = name.to_uppercase();
-            [
-                (upper.clone(), value.clone()),
-                (format!("RSBAR_{upper}"), value),
-            ]
-        }));
+        env.extend(
+            self.env_fields()
+                .into_iter()
+                .map(|(name, value)| (name.into_owned(), value)),
+        );
         env
     }
 }
@@ -547,6 +534,7 @@ impl FromStr for Kind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_mach_ports::Codec as _;
 
     #[test]
     fn built_in_names_round_trip() {
@@ -577,9 +565,9 @@ mod tests {
     #[test]
     fn a_single_field_becomes_info_directly() {
         let env = Event::VolumeChanged(VolumeChange { volume: 42 }).env();
-        assert_eq!(env["RSBAR_SENDER"], "volume_changed");
-        assert_eq!(env["RSBAR_INFO"], "42");
-        assert_eq!(env["RSBAR_VOLUME"], "42");
+        assert_eq!(env["SENDER"], "volume_changed");
+        assert_eq!(env["INFO"], "42");
+        assert_eq!(env["VOLUME"], "42");
     }
 
     #[test]
@@ -589,9 +577,9 @@ mod tests {
             space: 7,
         })
         .env();
-        assert_eq!(env["RSBAR_DISPLAY"], "2");
-        assert_eq!(env["RSBAR_SPACE"], "7");
-        let info = &env["RSBAR_INFO"];
+        assert_eq!(env["DISPLAY"], "2");
+        assert_eq!(env["SPACE"], "7");
+        let info = &env["INFO"];
         assert!(
             info.contains("\"display\""),
             "several fields render as an object: {info}"
@@ -601,19 +589,40 @@ mod tests {
     #[test]
     fn an_empty_payload_still_sets_info_so_a_script_never_sees_it_unset() {
         let env = Event::SystemWoke(SystemWoke {}).env();
-        assert_eq!(env["RSBAR_INFO"], "");
+        assert_eq!(env["INFO"], "");
     }
 
     #[test]
-    fn a_custom_event_carries_its_own_name_and_data() {
+    fn a_custom_events_variables_reach_the_script_by_name() {
+        // `--trigger demo VAR=Test` means the script reads `$VAR`, not one
+        // `$DATA` holding `{"VAR":"Test"}` for it to parse back out.
+        let event = Event::Custom(Custom {
+            name: "demo".into(),
+            vars: BTreeMap::from([
+                ("VAR".to_owned(), "Test".to_owned()),
+                ("OTHER".to_owned(), "2".to_owned()),
+            ]),
+        });
+        assert_eq!(event.kind(), Kind::Custom("demo".into()));
+
+        let env = event.env();
+        assert_eq!(env["SENDER"], "demo");
+        assert_eq!(env["VAR"], "Test");
+        assert_eq!(env["OTHER"], "2");
+        // And under the prefixed spelling too, for a script that wants the
+        // name nothing else could have set.
+        assert_eq!(env["VAR"], "Test");
+    }
+
+    #[test]
+    fn a_custom_event_with_one_variable_puts_it_in_info() {
         let event = Event::Custom(Custom {
             name: "my.event".into(),
-            data: Json::parse_or_string("hi"),
+            vars: BTreeMap::from([("value".to_owned(), "hi".to_owned())]),
         });
-        assert_eq!(event.kind(), Kind::Custom("my.event".into()));
         let env = event.env();
-        assert_eq!(env["RSBAR_SENDER"], "my.event");
-        assert_eq!(env["RSBAR_INFO"], "hi");
+        assert_eq!(env["SENDER"], "my.event");
+        assert_eq!(env["INFO"], "hi");
     }
 
     #[test]
@@ -625,10 +634,7 @@ mod tests {
 
     #[test]
     fn custom_tags_match_by_name() {
-        let mine = Event::Custom(Custom {
-            name: "mine".into(),
-            data: Json::Null,
-        });
+        let mine = Event::Custom(Custom::new("mine"));
         assert!(Kind::Custom("mine".into()).matches(&mine));
         assert!(!Kind::Custom("yours".into()).matches(&mine));
         assert!(!Kind::VolumeChanged.matches(&mine));
@@ -664,6 +670,13 @@ mod tests {
     }
 
     #[test]
+    fn only_a_scoped_kind_carries_an_item_to_read_back() {
+        assert_eq!(Kind::MouseClicked(()).map(|()| 7).item(), Some(&7));
+        assert_eq!(Kind::SystemWoke.map(|()| 7).item(), None);
+        assert_eq!(Kind::<i32>::Custom("mine".into()).item(), None);
+    }
+
+    #[test]
     fn a_click_reports_its_button_and_modifiers_by_name() {
         let click = Event::MouseClicked(MouseClick {
             button: MouseButton::Right,
@@ -672,8 +685,8 @@ mod tests {
             y: 8.0,
         });
         let env = click.env();
-        assert_eq!(env["RSBAR_BUTTON"], "right");
-        assert_eq!(env["RSBAR_MODIFIERS"], "shift,cmd");
+        assert_eq!(env["BUTTON"], "right");
+        assert_eq!(env["MODIFIERS"], "shift,cmd");
     }
 
     #[test]
@@ -683,12 +696,178 @@ mod tests {
     }
 
     #[test]
+    fn a_determinate_field_still_flattens_into_the_environment() {
+        let env = Event::PowerSourceChanged(PowerChange {
+            power_source: PowerSource::Ac {
+                adapter_watts: Some(96),
+                charging: true,
+                time_to_full_minutes: Some(41),
+            },
+            watts: Some(30),
+            charge: Some(80),
+        })
+        .env();
+        assert_eq!(env["POWER_SOURCE"], "AC");
+        assert_eq!(env["ADAPTER_WATTS"], "96");
+        assert_eq!(env["CHARGING"], "true");
+        assert_eq!(env["TIME_TO_FULL_MINUTES"], "41");
+        // The other side's number is present and empty, never missing.
+        assert_eq!(env["TIME_TO_EMPTY_MINUTES"], "");
+        assert_eq!(env["WATTS"], "30");
+        assert_eq!(env["CHARGE"], "80");
+        // `INFO` keys stay lower-case while the variables are upper-cased,
+        // and an expanded field appears in both.
+        let info = &env["INFO"];
+        assert!(info.contains("\"adapter_watts\":\"96\""), "{info}");
+        assert!(info.contains("\"power_source\":\"AC\""), "{info}");
+    }
+
+    #[test]
+    fn a_variant_that_cannot_be_charging_says_so_rather_than_leaving_a_hole() {
+        let env = Event::PowerSourceChanged(PowerChange {
+            power_source: PowerSource::Battery {
+                time_to_empty_minutes: Some(212),
+            },
+            watts: Some(12),
+            charge: Some(64),
+        })
+        .env();
+        assert_eq!(env["POWER_SOURCE"], "BATTERY");
+        assert_eq!(env["TIME_TO_EMPTY_MINUTES"], "212");
+        // On battery is discharging by definition, and saying `false` is
+        // worth more to a script than an empty it would have to interpret.
+        assert_eq!(env["CHARGING"], "false");
+        assert_eq!(env["ADAPTER_WATTS"], "");
+        assert_eq!(env["TIME_TO_FULL_MINUTES"], "");
+    }
+
+    #[test]
+    fn an_unknown_power_source_still_sets_every_name() {
+        let env = Event::PowerSourceChanged(PowerChange::default()).env();
+        assert_eq!(env["POWER_SOURCE"], "UNKNOWN");
+        for name in [
+            "ADAPTER_WATTS",
+            "CHARGING",
+            "TIME_TO_FULL_MINUTES",
+            "TIME_TO_EMPTY_MINUTES",
+            "WATTS",
+            "CHARGE",
+        ] {
+            assert_eq!(env[name], "", "{name} is present and empty, never missing");
+        }
+    }
+
+    #[test]
+    fn no_variable_is_prefixed() {
+        // The `RSBAR_` twins are gone: a script that reads one is a script
+        // that no longer runs under SketchyBar.
+        let env = Event::VolumeChanged(VolumeChange { volume: 42 }).env();
+        assert!(
+            env.keys().all(|name| !name.starts_with("RSBAR_")),
+            "{env:?}"
+        );
+    }
+
+    /// A nested enum outside the `events!` list: the derive is the whole
+    /// implementation, and `Quality` is deliberately not a payload.
+    #[derive(Debug, Clone, Copy, Default, EnvFields)]
+    enum Quality {
+        Good {
+            confidence: u8,
+        },
+        /// Stale by definition, so it says so rather than leaving a hole.
+        #[env(stale = true)]
+        Stale {
+            age_seconds: u32,
+        },
+        #[default]
+        Unknown,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, EnvFields)]
+    struct Reading {
+        #[env(flatten)]
+        quality: Quality,
+        samples: u32,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, EnvFields)]
+    struct Sample {
+        #[env(flatten)]
+        reading: Reading,
+        id: u32,
+    }
+
+    impl fmt::Display for Quality {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(match self {
+                Self::Good { .. } => "good",
+                Self::Stale { .. } => "stale",
+                Self::Unknown => "unknown",
+            })
+        }
+    }
+
+    impl fmt::Display for Reading {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{} ({})", self.quality, self.samples)
+        }
+    }
+
+    field_via_display!(Quality, Reading);
+
+    #[test]
+    fn nesting_projects_every_level_up_to_one_flat_environment() {
+        let env = Sample {
+            reading: Reading {
+                quality: Quality::Stale { age_seconds: 90 },
+                samples: 3,
+            },
+            id: 7,
+        }
+        .env_fields();
+        assert_eq!(env["ID"], "7");
+        assert_eq!(env["SAMPLES"], "3");
+        // Two levels down, under its own name rather than a prefixed one.
+        assert_eq!(env["QUALITY"], "stale");
+        assert_eq!(env["AGE_SECONDS"], "90");
+        // The constant the variant implies rather than stores.
+        assert_eq!(env["STALE"], "true");
+        // The other variant's field, present and empty.
+        assert_eq!(env["CONFIDENCE"], "");
+        // And the nested value's own name is there too.
+        assert_eq!(env["READING"], "stale (3)");
+    }
+
+    #[test]
+    fn an_inactive_variants_names_are_empty_rather_than_absent() {
+        let fields = Sample::default().fields();
+        // Lower-case here, which is what `INFO`'s JSON is built from.
+        for name in ["confidence", "age_seconds", "stale"] {
+            assert_eq!(fields[name], "", "{name} is present and empty");
+        }
+        assert_eq!(fields["quality"], "unknown");
+
+        let good = Reading {
+            quality: Quality::Good { confidence: 90 },
+            samples: 1,
+        }
+        .fields();
+        assert_eq!(good["confidence"], "90");
+        assert_eq!(good["age_seconds"], "");
+        assert_eq!(good["stale"], "");
+    }
+
+    #[test]
     fn events_round_trip_through_the_wire_format() {
         let event = Event::SpaceChanged(SpaceChange {
             display: 1,
             space: 9,
         });
-        let bytes = postcard::to_allocvec(&event).unwrap();
-        assert_eq!(postcard::from_bytes::<Event>(&bytes).unwrap(), event);
+        let bytes = crate::wire::MessagePack.encode(&event).unwrap();
+        assert_eq!(
+            crate::wire::MessagePack.decode::<Event>(&bytes).unwrap(),
+            event
+        );
     }
 }

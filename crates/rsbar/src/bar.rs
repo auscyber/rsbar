@@ -89,53 +89,72 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Applies a patch, reporting whether anything about the geometry moved —
-    /// the caller has to reshape the windows if so.
+    /// Applies a patch, reporting which pieces of window server work it made
+    /// necessary.
+    ///
+    /// Every arm asks [`Changes`](rsbar_protocol::Changes) what the patch
+    /// would *change*, never what it wrote: a `--bar blur_radius=12` on a bar
+    /// already blurred to 12 used to insert [`Changes::BLUR`] and provoke a
+    /// window server call for nothing, and the same went for every other
+    /// non-boolean field here. The flags stay coarser than the fields on
+    /// purpose — each one stands for a distinct call the caller then makes,
+    /// and several fields can imply the same call.
     pub fn apply(&mut self, patch: &BarPatch) -> Changes {
+        use rsbar_protocol::{Boolish, Changes as _};
+
         let mut changes = Changes::empty();
-        if let Some(h) = patch.height {
+        if let Some(h) = patch.height.and_then(|h| h.changes(&self.height)) {
             self.height = h;
             changes.insert(Changes::GEOMETRY);
         }
-        if let Some(e) = patch.edge {
+        if let Some(e) = patch.edge.and_then(|e| e.changes(&self.edge)) {
             self.edge = e;
             changes.insert(Changes::GEOMETRY);
         }
-        if let Some(m) = patch.margin {
+        if let Some(m) = patch.margin.and_then(|m| m.changes(&self.margin)) {
             self.margin = m;
             changes.insert(Changes::GEOMETRY);
         }
-        if let Some(y) = patch.y_offset {
+        if let Some(y) = patch.y_offset.and_then(|y| y.changes(&self.y_offset)) {
             self.y_offset = y;
             changes.insert(Changes::GEOMETRY);
         }
-        if let Some(c) = patch.color {
+        if let Some(c) = patch.color.and_then(|c| c.changes(&self.color)) {
             self.color = c;
         }
-        if let Some(r) = patch.corner_radius {
+        if let Some(r) = patch
+            .corner_radius
+            .and_then(|r| r.changes(&self.corner_radius))
+        {
             self.corner_radius = r;
         }
-        if let Some(r) = patch.blur_radius {
+        if let Some(r) = patch.blur_radius.and_then(|r| r.changes(&self.blur_radius)) {
             self.blur_radius = r;
             changes.insert(Changes::BLUR);
         }
-        if let Some(hidden) = patch.hidden {
-            self.hidden = hidden;
+        if let Some(hidden) = patch.hidden.and_then(|c| c.changes(&Boolish(self.hidden))) {
+            self.hidden = hidden.get();
             changes.insert(Changes::VISIBILITY);
         }
-        if let Some(topmost) = patch.topmost {
-            self.topmost = topmost;
+        if let Some(topmost) = patch
+            .topmost
+            .and_then(|c| c.changes(&Boolish(self.topmost)))
+        {
+            self.topmost = topmost.get();
             changes.insert(Changes::LEVEL);
         }
-        if let Some(sticky) = patch.sticky {
-            self.sticky = sticky;
+        if let Some(sticky) = patch.sticky.and_then(|c| c.changes(&Boolish(self.sticky))) {
+            self.sticky = sticky.get();
             changes.insert(Changes::STICKY);
         }
-        if let Some(show) = patch.show_in_fullscreen {
-            self.show_in_fullscreen = show;
+        if let Some(show) = patch
+            .show_in_fullscreen
+            .and_then(|c| c.changes(&Boolish(self.show_in_fullscreen)))
+        {
+            self.show_in_fullscreen = show.get();
             changes.insert(Changes::FULLSCREEN);
         }
-        if let Some(w) = patch.notch_width {
+        if let Some(w) = patch.notch_width.and_then(|w| w.changes(&self.notch_width)) {
             // Only the centre-left/centre-right item layout reads this — the
             // panel window's own frame does not change, so this deliberately
             // does not set `Changes::GEOMETRY`. `Settings` being a `ResMut`
@@ -143,30 +162,39 @@ impl Settings {
             // `layout`'s next full repaint.
             self.notch_width = w;
         }
-        if let Some(o) = patch.notch_offset {
+        if let Some(o) = patch
+            .notch_offset
+            .and_then(|o| o.changes(&self.notch_offset))
+        {
             self.notch_offset = o;
             changes.insert(Changes::GEOMETRY);
         }
-        if let Some(h) = patch.notch_display_height {
+        if let Some(h) = patch
+            .notch_display_height
+            .and_then(|h| h.changes(&self.notch_display_height))
+        {
             self.notch_display_height = h;
             changes.insert(Changes::GEOMETRY);
         }
-        if let Some(p) = patch.padding_left {
+        if let Some(p) = patch
+            .padding_left
+            .and_then(|p| p.changes(&self.padding_left))
+        {
             self.padding_left = p;
         }
-        if let Some(p) = patch.padding_right {
+        if let Some(p) = patch
+            .padding_right
+            .and_then(|p| p.changes(&self.padding_right))
+        {
             self.padding_right = p;
         }
-        if let Some(spec) = patch.display.as_ref() {
-            // Guarded, unlike every other field here: rebuilding every panel
-            // — tearing down and recreating window server windows — is real
-            // work, and a `SetBar` that only touched an unrelated field would
-            // otherwise pay for it on every request.
-            let target = *spec;
-            if target != self.display {
-                self.display = target;
-                changes.insert(Changes::DISPLAYS);
-            }
+        if let Some(target) = patch.display.and_then(|d| d.changes(&self.display)) {
+            // Rebuilding every panel — tearing down and recreating window
+            // server windows — is the most expensive thing on this list, and
+            // it is why every field here is now guarded rather than only this
+            // one.
+            self.display = target;
+            changes.insert(Changes::DISPLAYS);
         }
         changes
     }
@@ -208,11 +236,16 @@ impl Settings {
             y_offset: self.y_offset,
             corner_radius: self.corner_radius,
             blur_radius: self.blur_radius,
-            topmost: self.topmost,
-            hidden: self.hidden,
+            topmost: self.topmost.into(),
+            hidden: self.hidden.into(),
             displays,
-            sticky: self.sticky,
-            show_in_fullscreen: self.show_in_fullscreen,
+            // Settable and, until now, unreportable: a config could set the
+            // paddings and the display target and never read them back.
+            padding_left: self.padding_left,
+            padding_right: self.padding_right,
+            display: self.display,
+            sticky: self.sticky.into(),
+            show_in_fullscreen: self.show_in_fullscreen.into(),
             notch_width: self.notch_width,
             notch_offset: self.notch_offset,
             notch_display_height: self.notch_display_height,
@@ -288,9 +321,10 @@ impl Panels {
     ///
     /// Returns the window server's error if a window cannot be created or
     /// configured.
+    #[skylight::main_thread]
     pub fn rebuild(&mut self, settings: &Settings) -> skylight::Result<()> {
         let mut panels = Vec::new();
-        for (index, display) in display::active().into_iter().enumerate() {
+        for (index, display) in display::active(proof.marker()).into_iter().enumerate() {
             let ordinal = u32::try_from(index + 1).unwrap_or(u32::MAX);
             if !settings.display.matches(ordinal) {
                 continue;
@@ -309,7 +343,7 @@ impl Panels {
                     panel
                 }
                 None => Panel {
-                    window: new_window(frame, &display, settings, self.clickable)?,
+                    window: new_window(proof, frame, &display, settings, self.clickable)?,
                     display,
                     frame,
                     ordinal,
@@ -342,7 +376,17 @@ impl Panels {
             .iter()
             .map(|p| settings.frame_for(&p.display))
             .collect();
-        skylight::batched(|| -> skylight::Result<()> {
+        // The proof comes from a panel this already holds -- a `Window` could
+        // not exist here otherwise -- rather than from a check of its own.
+        // Read off before the loop borrows the panels back.
+        let Some(proof) = self
+            .panels
+            .first()
+            .map(|panel| skylight::MainThreadProof::marker(&panel.window))
+        else {
+            return Ok(());
+        };
+        skylight::batched(proof, || -> skylight::Result<()> {
             for (panel, frame) in self.panels.iter_mut().zip(frames) {
                 panel.window.set_frame(frame)?;
                 panel.frame = frame;
@@ -461,12 +505,16 @@ fn bar_level(settings: &Settings) -> std::ffi::c_int {
     }
 }
 
+#[skylight::main_thread]
 fn new_window(
     frame: CGRect,
     display: &Display,
     settings: &Settings,
     clickable: bool,
 ) -> skylight::Result<Window> {
+    // No marker written: the attribute supplies it, checking once on entry.
+    // A `Window` is `!Send`, so proving the thread here proves it for the rest
+    // of this window's life -- see `skylight::Window`.
     let window = Window::new(frame)?;
     window.set_scale(display.scale)?;
     window.set_opaque(false)?;
@@ -560,13 +608,7 @@ pub fn stroke_rounded_rect(
     CGContext::stroke_path(Some(ctx));
 }
 
-/// Draws a captured image into a top-left oriented context.
-///
-/// The context is flipped so that a caller works in the same space as the
-/// frames it laid out, and `CGContext::draw_image` takes its rect in the
-/// context's own space — so the flip has to be undone around the image, or a
-/// mirrored menu bar item comes out upside down.
-/// The same, with the drawing confined to `visible`.
+/// Draws a captured image, confined to `visible`.
 ///
 /// A captured menu bar item is mostly transparent margin, and `rect` is the
 /// whole capture — so without the clip the margin of one alias reaches across
@@ -578,6 +620,12 @@ pub fn draw_image_clipped(ctx: &CGContext, rect: CGRect, visible: CGRect, image:
     CGContext::restore_g_state(Some(ctx));
 }
 
+/// Draws a captured image into a top-left oriented context.
+///
+/// The context is flipped so that a caller works in the same space as the
+/// frames it laid out, and `CGContext::draw_image` takes its rect in the
+/// context's own space — so the flip has to be undone around the image, or a
+/// mirrored menu bar item comes out upside down.
 pub fn draw_image(ctx: &CGContext, rect: CGRect, image: &CGImage) {
     CGContext::save_g_state(Some(ctx));
     CGContext::translate_ctm(Some(ctx), 0.0, rect.origin.y + rect.size.height);
@@ -585,4 +633,58 @@ pub fn draw_image(ctx: &CGContext, rect: CGRect, image: &CGImage) {
     let upright = CGRect::new(CGPoint::new(rect.origin.x, 0.0), rect.size);
     CGContext::draw_image(Some(ctx), upright, Some(image));
     CGContext::restore_g_state(Some(ctx));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Changes, Settings};
+    use rsbar_protocol::{BarPatch, BoolChange, Boolish};
+
+    /// The regression this whole per-field pass exists to prevent: a `--bar`
+    /// re-stating what the bar already is must not provoke a single window
+    /// server call.
+    #[test]
+    fn setting_a_property_to_what_it_already_is_implies_no_work() {
+        let mut settings = Settings::default();
+        let before = settings.clone();
+        let patch = BarPatch {
+            height: Some(before.height),
+            edge: Some(before.edge),
+            color: Some(before.color),
+            margin: Some(before.margin),
+            blur_radius: Some(before.blur_radius),
+            corner_radius: Some(before.corner_radius),
+            display: Some(before.display),
+            hidden: Some(Boolish(before.hidden).into()),
+            topmost: Some(Boolish(before.topmost).into()),
+            sticky: Some(Boolish(before.sticky).into()),
+            show_in_fullscreen: Some(Boolish(before.show_in_fullscreen).into()),
+            notch_offset: Some(before.notch_offset),
+            ..BarPatch::default()
+        };
+        assert_eq!(settings.apply(&patch), Changes::empty());
+        assert_eq!(settings, before);
+    }
+
+    #[test]
+    fn a_real_change_implies_only_its_own_work() {
+        let mut settings = Settings::default();
+        let patch = BarPatch {
+            blur_radius: Some(settings.blur_radius + 12),
+            ..BarPatch::default()
+        };
+        assert_eq!(settings.apply(&patch), Changes::BLUR);
+    }
+
+    #[test]
+    fn a_flip_is_always_work_because_it_cannot_be_a_no_op() {
+        let mut settings = Settings::default();
+        let patch = BarPatch {
+            hidden: Some(BoolChange::Toggle),
+            ..BarPatch::default()
+        };
+        let was = settings.hidden;
+        assert_eq!(settings.apply(&patch), Changes::VISIBILITY);
+        assert_eq!(settings.hidden, !was);
+    }
 }

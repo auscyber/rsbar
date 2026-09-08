@@ -59,21 +59,6 @@ unsafe extern "C" {
     ) -> CGError;
 }
 
-fn parse_kind(name: &str) -> Option<Kind> {
-    Some(match name {
-        "brightness_changed" => Kind::BrightnessChanged,
-        "wifi_changed" => Kind::WifiChanged,
-        "space_changed" => Kind::SpaceChanged,
-        "space_windows_changed" => Kind::SpaceWindowsChanged,
-        "media_changed" => Kind::MediaChanged,
-        "power_source_changed" => Kind::PowerSourceChanged,
-        other => {
-            eprintln!("unknown kind: {other}");
-            return None;
-        }
-    })
-}
-
 /// Nudges the main display's brightness up, then back down, two seconds in —
 /// enough of a real change for `DisplayServicesRegisterForBrightnessChangeNotifications`
 /// to fire, and small enough not to leave the screen somewhere odd.
@@ -100,8 +85,23 @@ fn trigger_brightness() {
 fn trigger_space_switch() {
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_secs(2));
-        // SAFETY: takes no arguments and always succeeds.
-        let cid = unsafe { skylight::ffi::SLSMainConnectionID() };
+        // Everything below is the window server's space API, which answers the
+        // main thread only -- so it is *sent* there rather than done here. The
+        // compiler enforced this: a `ConnectionId` is `!Send`, so none of it
+        // could have been written in this closure.
+        skylight::MainOnly::dispatch(switch_space);
+    });
+}
+
+/// The switch itself, on the thread the window server talks to.
+///
+/// The sleeps in here do park the run loop, which a daemon must never do; this
+/// is a probe driven by hand and the point is to watch the switch happen.
+#[skylight::main_thread]
+fn switch_space() {
+    // SAFETY: takes no arguments beyond the proof, and always succeeds.
+    let cid = unsafe { skylight::ffi::SLSMainConnectionID(proof) };
+    {
         // SAFETY: `cid` is this process's connection id; the call hands back
         // a +1 `CFString` or null.
         let Some(uuid) =
@@ -163,15 +163,25 @@ fn trigger_space_switch() {
             SLSManagedDisplaySetCurrentSpace(cid, CFRetained::as_ptr(&uuid).as_ptr(), current)
         };
         println!("[trigger] SLSManagedDisplaySetCurrentSpace -> {status:?}");
-    });
+    }
 }
 
+#[skylight::main(also(install, Registry::new))]
 fn main() {
     tracing_subscriber::fmt::init();
     let arg = std::env::args().nth(1).unwrap_or_default();
-    let Some(kind) = parse_kind(&arg) else {
+    // The CLI's own spelling, not a table kept beside it: a private list here
+    // could only ever be a stale subset, and was — it had no `volume_changed`,
+    // so the probe could not exercise the source most likely to need it.
+    let Ok(kind) = arg.parse::<Kind>() else {
+        eprintln!("unknown event: {arg}");
         eprintln!(
-            "usage: source_probe <brightness_changed|wifi_changed|space_changed|space_windows_changed|media_changed|power_source_changed>"
+            "usage: source_probe <event>, one of:\n  {}",
+            Kind::built_in()
+                .iter()
+                .map(Kind::name)
+                .collect::<Vec<_>>()
+                .join("\n  ")
         );
         std::process::exit(1);
     };
@@ -180,14 +190,27 @@ fn main() {
     let config = rsbar::config::shared();
     let mut registry = Registry::new(config, waker.clone());
 
+    // Asked of the registry, not of a table kept here: after a source is
+    // renamed or two are merged, a private copy of this mapping would still
+    // compile and quietly report the wrong source. `display_changed` already
+    // has two providers, which a `&'static str` could not have said at all.
+    let providers: Vec<rsbar::sources::SourceId> = registry.providers_of(&kind).to_vec();
+    if providers.is_empty() {
+        eprintln!("no source provides {kind}");
+        std::process::exit(1);
+    }
+    let running = |registry: &Registry| {
+        providers
+            .iter()
+            .map(|id| format!("{} = {}", id.0, registry.running(*id)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
     let who = Entity::from_raw_u32(1).expect("valid entity index");
     let mut watch = registry.watch(who, &kind);
     registry.settle();
-    println!(
-        "registered: {} (running = {})",
-        kind,
-        registry.running(rsbar::sources::SourceId(source_id_for(&kind)))
-    );
+    println!("registered: {} (running = {})", kind, running(&registry));
 
     // PROBE_RESTART=1 exercises the lazy stop/start cycle the registry puts
     // every source through: drop the only claim (stopping it), then take a
@@ -197,18 +220,20 @@ fn main() {
     if std::env::var("PROBE_RESTART").as_deref() == Ok("1") {
         std::thread::sleep(Duration::from_millis(500));
         drop(watch);
+        // Two passes, because the first only marks the source stale — see
+        // `sources::Liveness`. A claim taken between the two revives the
+        // registration in place, which is the point of the phase.
         registry.settle();
         println!(
-            "dropped the claim; running = {}",
-            registry.running(rsbar::sources::SourceId(source_id_for(&kind)))
+            "dropped the claim; still registered = {} (marked, a pass from stopping)",
+            running(&registry)
         );
+        registry.settle();
+        println!("swept; running = {}", running(&registry));
         std::thread::sleep(Duration::from_millis(500));
         watch = registry.watch(who, &kind);
         registry.settle();
-        println!(
-            "re-claimed; running = {}",
-            registry.running(rsbar::sources::SourceId(source_id_for(&kind)))
-        );
+        println!("re-claimed; running = {}", running(&registry));
     }
 
     match kind {
@@ -252,15 +277,4 @@ fn main() {
     }
     drop(watch);
     println!("done");
-}
-
-fn source_id_for(kind: &Kind) -> &'static str {
-    match kind {
-        Kind::BrightnessChanged => "brightness",
-        Kind::WifiChanged => "wifi",
-        Kind::SpaceChanged | Kind::SpaceWindowsChanged => "spaces",
-        Kind::MediaChanged => "media",
-        Kind::PowerSourceChanged => "power",
-        _ => "?",
-    }
 }

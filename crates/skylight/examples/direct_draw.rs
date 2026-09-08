@@ -13,7 +13,8 @@ fn main() {
         CGSize::new(600.0, 120.0),
     );
 
-    let window = Window::new(frame).expect("create");
+    let mtm = objc2::MainThreadMarker::new().expect("an example runs on the main thread");
+    let window = Window::new(frame, mtm).expect("create");
     window.set_scale(1.0).expect("scale");
     window.set_opaque(false).expect("opaque");
     window.set_alpha(1.0).expect("alpha");
@@ -24,7 +25,7 @@ fn main() {
     window.order_above(None).expect("order");
 
     unsafe {
-        let cid = ffi::SLSMainConnectionID();
+        let cid = ffi::SLSMainConnectionID(mtm);
         let ctx = ffi::SLWindowContextCreate(cid, window.id(), ptr::null_mut());
         assert!(!ctx.is_null(), "no context");
         let ctx = &*ctx;

@@ -2,19 +2,25 @@
 //!
 //! [`crate::api::install`] is written entirely against [`Dispatcher`], and
 //! entirely `async`: nothing here blocks a thread waiting on a reply. The IPC
-//! implementation ([`crate::ipc::IpcDispatcher`]) is this crate's; an
-//! embedded implementation, calling straight into the daemon's own request
-//! handling with no IPC at all, is the daemon's to write against the same
-//! trait. Both make the exact same Lua table behave identically from a
-//! script's point of view.
+//! implementation ([`crate::ipc::IpcDispatcher`]) is this crate's, and so is
+//! the no-IPC one ([`crate::direct::DirectDispatcher`]) a host that *is* the
+//! daemon uses instead. Both make the exact same Lua table behave identically
+//! from a script's point of view.
 //!
-//! Neither method requires `Send`: a call always originates from, and its
-//! future is always polled on, the single thread hosting the `Lua` state —
-//! Lua's C API is not reentrant across threads, so there is never a second
-//! thread that could need to touch a [`Dispatcher`]. This is also why the
-//! futures are boxed as local (`dyn Future<Output = _> + '_`, not `+ Send`):
-//! it lets an implementation hold non-`Send` state (an `Rc`, a borrowed
-//! connection) with no wrapper required.
+//! # Why `Send`, and what it does not mean
+//!
+//! mlua is built here with `feature = "send"`, so a registered callback must
+//! be `Send` and a `UserData` must be `Send + Sync`. A [`Dispatcher`] is
+//! reached from both, so it inherits the requirement, and its futures are
+//! [`BoxFuture`] rather than local.
+//!
+//! That is not a claim that anything here runs concurrently. Lua's C API is
+//! not reentrant and mlua guards the VM with a reentrant mutex, so exactly one
+//! thread is ever inside a chunk. What `Send` buys is that the *whole* Lua
+//! state, the dispatcher included, can live on a thread the host chooses —
+//! which for the daemon means a thread that is not the one that draws.
+//! Concurrency comes from the work a config waits on (a subprocess, a timer,
+//! the next event) being off that thread, not from two chunks running at once.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -24,14 +30,14 @@ use rsbar_protocol::{Event, ItemName, Kind, Request, Response};
 
 use crate::error::Result;
 
-/// A future tied to the dispatcher it came from, not required to be `Send`.
-pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+/// A future tied to the dispatcher it came from.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// What [`Dispatcher::subscribe`] hands back: every [`Event`] the daemon
 /// pushes for that item, in order, for as long as the subscription lasts.
-pub type BoxedEventStream = Pin<Box<dyn Stream<Item = Event>>>;
+pub type BoxedEventStream = Pin<Box<dyn Stream<Item = Event> + Send>>;
 
-pub trait Dispatcher {
+pub trait Dispatcher: Send + Sync {
     /// Sends `request` and waits for the daemon's answer, without blocking
     /// the calling thread while it waits.
     ///
@@ -40,7 +46,7 @@ pub trait Dispatcher {
     /// Returns [`crate::error::ApiError::Rejected`] if the daemon understood
     /// the request but refused it, and a transport error if it could not be
     /// delivered at all.
-    fn call(&self, request: Request) -> LocalBoxFuture<'_, Result<Response>>;
+    fn call(&self, request: Request) -> BoxFuture<'_, Result<Response>>;
 
     /// Registers `name` for `events`, replacing whatever it was previously
     /// subscribed to (mirrors [`Request::Subscribe`]), and resolves to a
@@ -58,5 +64,5 @@ pub trait Dispatcher {
         &self,
         name: ItemName,
         events: Vec<Kind>,
-    ) -> LocalBoxFuture<'_, Result<BoxedEventStream>>;
+    ) -> BoxFuture<'_, Result<BoxedEventStream>>;
 }

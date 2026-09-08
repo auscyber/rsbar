@@ -75,7 +75,15 @@ fn alias_box(padding: &Padding, ink_width: f64) -> (f64, f64) {
 }
 
 /// How wide an alias's mirrored image is, or nothing if it is not an alias.
-fn alias_width(captures: &Captures, entity: Entity, padding: &Padding) -> Option<f64> {
+///
+/// Shared with [`crate::popup`] rather than private here: an alias inside a
+/// popup is measured by the same rule as one on the bar, and it has to be.
+/// An alias carries no icon and usually no label, so measuring one with
+/// [`width`] alone answers `padding.left + padding.right` — which for a
+/// config clawing back the system's own margins is *negative*, and a
+/// horizontal popup laying those out walks backwards and stacks every item on
+/// top of the last.
+pub(crate) fn alias_width(captures: &Captures, entity: Entity, padding: &Padding) -> Option<f64> {
     let mirrored = captures.get(entity)?;
     // The inked width, not the captured window's. A menu bar extra's window
     // carries the system's own inter-item spacing — on the clock, only 81% of
@@ -898,7 +906,7 @@ fn draw_slider(ctx: &objc2_core_graphics::CGContext, rect: CGRect, slider: &Slid
 
     let knob = crate::text::Text::new(
         slider.knob.string.clone(),
-        crate::text::Font::resolve(&slider.knob.font),
+        &crate::text::Font::resolve(&slider.knob.font),
     );
     let knob_w = knob.metrics().width;
     let raw_offset = filled_w - knob_w / 2.0;
@@ -947,7 +955,7 @@ fn paint_panels(
         let total = placed.len();
         let mut drawn = 0usize;
         if !unchanged {
-            skylight::draw_damaged(panel.window.id(), size, torn.as_deref(), |ctx| {
+            skylight::draw_damaged(&panel.window, size, torn.as_deref(), |ctx| {
                 fill_rounded_rect(
                     ctx,
                     CGRect::new(CGPoint::new(0.0, 0.0), size),

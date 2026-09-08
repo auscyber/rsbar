@@ -56,8 +56,7 @@ use objc2_core_graphics::{
     CGWindowListCopyWindowInfo, CGWindowListOption, kCGWindowLayer, kCGWindowName, kCGWindowNumber,
     kCGWindowOwnerName,
 };
-use skylight::ffi::{self, ConnectionId, WindowId};
-use std::ffi::c_void;
+use skylight::ffi::{self, WindowId};
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
@@ -204,27 +203,32 @@ const CANDIDATES: &[(u32, &str)] = &[
     (1508, "FrontmostApplicationChanged"),
 ];
 
-extern "C-unwind" fn on_event(
-    event: u32,
-    data: *mut c_void,
-    len: usize,
-    _context: *mut c_void,
-    _cid: ConnectionId,
-) {
+/// The process connection, on the thread the window server answers.
+#[skylight::main_thread]
+fn connection() -> ffi::ConnectionId {
+    // SAFETY: takes no arguments beyond the proof.
+    unsafe { ffi::SLSMainConnectionID(proof.marker()) }
+}
+
+/// A plain Rust function. `NotifyProcedure` turns it into the C entry point,
+/// hands it the state the registration passed, and has already made the
+/// payload a slice — so there is no `extern "C"`, no `void*` and no
+/// pointer-plus-length arithmetic here.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "the handler's shape is fixed by `NotifyProcedure`; this probe keeps no state"
+)]
+fn on_event(_state: &(), event: ffi::Event<'_>) {
     let name = CANDIDATES
         .iter()
-        .find(|(id, _)| *id == event)
+        .find(|(id, _)| *id == event.id)
         .map_or("?", |(_, name)| name);
-    let bytes = if data.is_null() || len == 0 {
-        Vec::new()
-    } else {
-        // SAFETY: the window server gave us `len` bytes at `data` for the
-        // duration of this callback.
-        unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) }.to_vec()
-    };
     println!(
-        "[{:?}] event {event} ({name}) len={len} bytes={bytes:02x?}",
-        Instant::now()
+        "[{:?}] event {} ({name}) len={} bytes={:02x?}",
+        Instant::now(),
+        event.id,
+        event.payload.len(),
+        event.payload,
     );
 }
 
@@ -268,6 +272,9 @@ fn dict_i64(dict: &CFDictionary, key: &CFString) -> Option<i64> {
     dict_value(dict, key)?.downcast_ref::<CFNumber>()?.as_i64()
 }
 
+skylight::notify!(ON_EVENT = on_event(&()));
+
+#[skylight::main(also(connection))]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (owner, name) = if args.len() >= 2 {
@@ -284,24 +291,35 @@ fn main() {
 
     // SAFETY: `connection_id` reads the process-wide connection, a plain FFI
     // getter.
-    let cid = unsafe { ffi::SLSMainConnectionID() };
+    let cid = connection();
+
+    // The state every handler here shares: nothing. An `Arc<()>` still goes
+    // through the same path a real one does, so the probe exercises what the
+    // daemon does.
+    let no_state = std::sync::Arc::new(());
 
     for &(event, name) in CANDIDATES {
-        // SAFETY: `on_event` matches `NotifyProc`'s signature; no context is
-        // needed since this probe is single-purpose and global anyway.
+        if let Err(err) =
+            skylight::register_notify(ON_EVENT, event, std::sync::Arc::clone(&no_state))
+        {
+            println!("register(global) {event} ({name}) failed: {err}");
+        }
+        // Also register the connection-scoped form, in case scoping to our own
+        // connection is what is silently dropping delivery. Still raw: the safe
+        // path covers the connection-less call the daemon uses, and this exists
+        // only to compare against it.
+        // SAFETY: the trampoline matches `NotifyProc`, and the context is a
+        // reference to the same `Arc`, kept alive by `no_state` here.
         let status = unsafe {
-            ffi::SLSRegisterConnectionNotifyProc(cid, on_event, event, std::ptr::null_mut())
+            ffi::SLSRegisterConnectionNotifyProc(
+                cid,
+                ON_EVENT,
+                event,
+                std::sync::Arc::as_ptr(&no_state).cast_mut().cast(),
+            )
         };
         if status != objc2_core_graphics::CGError::Success {
             println!("register(connection) {event} ({name}) failed: {status:?}");
-        }
-        // Also register the connection-less form `spaces.rs` and SketchyBar
-        // itself use, in case scoping to our own connection is what's
-        // silently dropping delivery.
-        // SAFETY: same contract as above, minus the connection argument.
-        let status = unsafe { ffi::SLSRegisterNotifyProc(on_event, event, std::ptr::null_mut()) };
-        if status != objc2_core_graphics::CGError::Success {
-            println!("register(global) {event} ({name}) failed: {status:?}");
         }
     }
 

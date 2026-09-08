@@ -462,22 +462,23 @@ mod tests {
     fn an_item_state_renders_geometry_and_style() {
         let state = ItemState {
             popup: rsbar_protocol::PopupState {
-                drawing: false,
-                horizontal: false,
+                drawing: false.into(),
+                horizontal: false.into(),
                 align: rsbar_protocol::PopupAlign::Left,
-                topmost: true,
+                topmost: true.into(),
                 height: 0.0,
                 y_offset: 0.0,
                 background: rsbar_protocol::Background::default(),
             },
             name: ItemName::new("clock").unwrap(),
             geometry: Geometry {
-                drawing: true,
+                drawing: true.into(),
                 position: Position::Right,
                 y_offset: 0.0,
                 padding_left: 2.0,
                 padding_right: 2.0,
                 width: None,
+                display: rsbar_protocol::DisplayTarget::All,
                 background: Background::default(),
             },
             icon: Run::default(),
@@ -486,11 +487,15 @@ mod tests {
                 script: None,
                 click_script: None,
                 update_freq: 0,
-                updates: true,
+                updates: true.into(),
             },
             events: Vec::<Kind>::new(),
             alias: None,
             members: Vec::new(),
+            associated_space: None,
+            percentage: 0,
+            knob: Run::default(),
+            highlight_color: rsbar_protocol::Color::default(),
         };
         let json = to_sketchybar_json(&state);
         assert!(json.contains(r#""geometry":{"#));

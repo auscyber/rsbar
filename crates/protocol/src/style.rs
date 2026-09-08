@@ -1,6 +1,5 @@
 //! Colours and font specifications.
 
-use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::str::FromStr;
@@ -100,12 +99,47 @@ impl Serialize for Color {
     }
 }
 
+/// One of the two shapes a colour arrives in, and nothing more: telling them
+/// apart is all `untagged` is asked to do here.
+///
+/// The reading itself is [`Color`]'s own, below, so a malformed colour still
+/// gets the sentence that says what a colour looks like. An `untagged` enum
+/// that parsed as well as dispatched would answer every mistake with "data
+/// did not match any variant", which is only the right answer for a value
+/// that is neither a string nor a number — and that is the one case this
+/// leaves to it.
+///
+/// `Text` first because it is what the daemon itself writes: `--query` prints
+/// `0xaarrggbb` as a string and a config feeds it straight back.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ColorRepr {
+    Text(String),
+    /// What a Lua config writes: `colors.red = 0xffff0000`, a bare number.
+    Argb(u32),
+    /// The same, from an interpreter that holds every number as a double.
+    Real(f64),
+}
+
 /// Accepts anything [`FromStr`] does, so a value written back by the daemon
-/// and one typed by a config both parse.
+/// and one typed by a config both parse — and, because a Lua config writes
+/// `0xaarrggbb` as a *number* rather than a string, a plain integer too.
 impl<'de> Deserialize<'de> for Color {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
-        text.parse().map_err(D::Error::custom)
+        match ColorRepr::deserialize(deserializer)? {
+            ColorRepr::Text(text) => text.parse().map_err(serde::de::Error::custom),
+            ColorRepr::Argb(value) => Ok(Self(value)),
+            ColorRepr::Real(value) => {
+                let whole = value.fract() == 0.0 && value >= 0.0 && value <= f64::from(u32::MAX);
+                if !whole {
+                    return Err(serde::de::Error::custom(format!(
+                        "`{value}` is not an ARGB colour: expected a whole number in 0..=0xffffffff"
+                    )));
+                }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                Ok(Self(value as u32))
+            }
+        }
     }
 }
 
@@ -167,12 +201,74 @@ impl Serialize for FontSpec {
     }
 }
 
-/// [`FontSpec::parse`] never fails — a short or empty spec just keeps the
-/// defaults — so this never does either.
+/// One of the two shapes a font arrives in. Same division of labour as
+/// [`ColorRepr`]: `untagged` says which shape, and [`FontSpec`] itself makes
+/// sense of what is in it.
+///
+/// `Flat` first because it is what the daemon writes and what a config
+/// usually types. A table cannot match it and a string cannot match `Parts`,
+/// so the order is about which is tried first, not which wins.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FontRepr {
+    Flat(String),
+    /// `font = { family = "Hack", style = "Bold", size = 14 }`, which every
+    /// `SketchyBar` Lua config writes because its own helper takes a font
+    /// that way. A part left out keeps the default for that part alone.
+    Parts {
+        family: Option<String>,
+        style: Option<String>,
+        size: Option<Size>,
+    },
+}
+
+/// A font size as either spelling: the number a Lua config writes, and the
+/// string argv can only ever carry.
+///
+/// It exists because `f64` is not ours to teach. `#[serde(untagged)]` buffers
+/// what it is dispatching on, and a buffered `"14"` handed to an `f64` is an
+/// error however the format originally held it — so a foreign primitive
+/// underneath an untagged enum loses the CLI's `label.font.size=14`. One
+/// number of our own is the whole fix.
+#[derive(Debug, Clone, Copy)]
+struct Size(f64);
+
+impl<'de> Deserialize<'de> for Size {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Number(f64),
+            Text(String),
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Number(size) => Ok(Self(size)),
+            Repr::Text(text) => text
+                .parse()
+                .map(Self)
+                .map_err(|_| serde::de::Error::custom(format!("`{text}` is not a font size"))),
+        }
+    }
+}
+
+/// Never fails on a short or missing part — [`FontSpec::parse`] does not
+/// either, and a config that names a family and no style means the default
+/// style, not an error.
 impl<'de> Deserialize<'de> for FontSpec {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
-        Ok(Self::parse(&text))
+        let default = Self::default();
+        Ok(match FontRepr::deserialize(deserializer)? {
+            FontRepr::Flat(text) => Self::parse(&text),
+            FontRepr::Parts {
+                family,
+                style,
+                size,
+            } => Self {
+                family: family.unwrap_or(default.family),
+                style: style.unwrap_or(default.style),
+                size: size.map_or(default.size, |Size(size)| size),
+            },
+        })
     }
 }
 

@@ -59,73 +59,10 @@
 #![allow(clippy::too_many_lines)]
 
 use objc2_app_kit::NSWorkspace;
-use objc2_application_services::{AXError, AXObserver, AXUIElement, AXValue, AXValueType};
-use objc2_core_foundation::{
-    CFArray, CFRetained, CFRunLoop, CFString, CFType, CGPoint, CGRect, CGSize, Type,
-    kCFRunLoopDefaultMode,
-};
-use std::ffi::c_void;
-use std::ptr::NonNull;
+use objc2_application_services::AXUIElement;
+use objc2_core_foundation::{CFArray, CFRetained, CFRunLoop, Type, kCFRunLoopDefaultMode};
+use skylight::ax;
 use std::time::{Duration, Instant};
-
-fn attribute(element: &AXUIElement, name: &str) -> Option<CFRetained<CFType>> {
-    let attr = CFString::from_str(name);
-    let mut value: *const CFType = std::ptr::null();
-    let err = unsafe { element.copy_attribute_value(&attr, NonNull::from(&mut value)) };
-    if err != AXError::Success {
-        return None;
-    }
-    let ptr = NonNull::new(value.cast_mut())?;
-    Some(unsafe { CFRetained::from_raw(ptr) })
-}
-fn copy_element(element: &AXUIElement, name: &str) -> Option<CFRetained<AXUIElement>> {
-    attribute(element, name)?.downcast::<AXUIElement>().ok()
-}
-fn copy_array(element: &AXUIElement, name: &str) -> Option<CFRetained<CFArray>> {
-    attribute(element, name)?.downcast::<CFArray>().ok()
-}
-unsafe fn array_element(array: &CFArray, i: isize) -> Option<&AXUIElement> {
-    let ptr = unsafe { array.value_at_index(i) };
-    let ptr = NonNull::new(ptr.cast_mut())?.cast::<CFType>();
-    let ty = unsafe { ptr.as_ref() };
-    ty.downcast_ref::<AXUIElement>()
-}
-fn attribute_string(element: &AXUIElement, name: &str) -> Option<String> {
-    Some(
-        attribute(element, name)?
-            .downcast::<CFString>()
-            .ok()?
-            .to_string(),
-    )
-}
-fn attribute_value<const N: usize>(
-    element: &AXUIElement,
-    name: &str,
-    the_type: AXValueType,
-) -> Option<[u8; N]> {
-    let value = attribute(element, name)?.downcast::<AXValue>().ok()?;
-    let mut buf = [0u8; N];
-    let ok = unsafe { value.value(the_type, NonNull::from(&mut buf).cast()) };
-    ok.then_some(buf)
-}
-fn attribute_point(element: &AXUIElement, name: &str) -> Option<CGPoint> {
-    let bytes = attribute_value::<{ size_of::<CGPoint>() }>(element, name, AXValueType::CGPoint)?;
-    Some(unsafe { std::mem::transmute::<[u8; size_of::<CGPoint>()], CGPoint>(bytes) })
-}
-fn attribute_size(element: &AXUIElement, name: &str) -> Option<CGSize> {
-    let bytes = attribute_value::<{ size_of::<CGSize>() }>(element, name, AXValueType::CGSize)?;
-    Some(unsafe { std::mem::transmute::<[u8; size_of::<CGSize>()], CGSize>(bytes) })
-}
-fn attribute_frame(element: &AXUIElement) -> Option<CGRect> {
-    if let Some(bytes) =
-        attribute_value::<{ size_of::<CGRect>() }>(element, "AXFrame", AXValueType::CGRect)
-    {
-        return Some(unsafe { std::mem::transmute::<[u8; size_of::<CGRect>()], CGRect>(bytes) });
-    }
-    let position = attribute_point(element, "AXPosition")?;
-    let size = attribute_size(element, "AXSize")?;
-    Some(CGRect::new(position, size))
-}
 
 /// Finds `(pid, element)` for the extras-menu-bar child titled `name` under
 /// the running application named `owner`.
@@ -141,27 +78,28 @@ fn find(owner: &str, name: &str) -> Option<(i32, CFRetained<AXUIElement>)> {
             continue;
         }
         // SAFETY: pid is a live process id.
-        let element = unsafe { AXUIElement::new_application(pid) };
-        let Some(extras) = copy_element(&element, "AXExtrasMenuBar") else {
+        let element = ax::application(ax::Trusted::now()?, pid);
+        let Some(extras) = ax::attribute::<CFRetained<AXUIElement>>(&element, "AXExtrasMenuBar")
+        else {
             println!("  no AXExtrasMenuBar for pid={pid}");
             continue;
         };
-        let Some(children) =
-            copy_array(&extras, "AXVisibleChildren").or_else(|| copy_array(&extras, "AXChildren"))
+        let Some(children) = ax::attribute::<CFRetained<CFArray>>(&extras, "AXVisibleChildren")
+            .or_else(|| ax::attribute::<CFRetained<CFArray>>(&extras, "AXChildren"))
         else {
             println!("  no children for pid={pid}");
             continue;
         };
         println!("  {} extras children", children.count());
         for i in 0..children.count() {
-            let Some(child) = (unsafe { array_element(&children, i) }) else {
+            let Some(child) = ax::array_element(&children, i) else {
                 continue;
             };
-            let title = attribute_string(child, "AXTitle");
-            let desc = attribute_string(child, "AXDescription");
-            let frame = attribute_frame(child);
-            let value = attribute_string(child, "AXValue");
-            let role = attribute_string(child, "AXRole");
+            let title = ax::attribute::<String>(child, "AXTitle");
+            let desc = ax::attribute::<String>(child, "AXDescription");
+            let frame = ax::frame(child);
+            let value = ax::attribute::<String>(child, "AXValue");
+            let role = ax::attribute::<String>(child, "AXRole");
             println!(
                 "    child[{i}] role={role:?} title={title:?} desc={desc:?} value={value:?} frame={frame:?}"
             );
@@ -169,7 +107,7 @@ fn find(owner: &str, name: &str) -> Option<(i32, CFRetained<AXUIElement>)> {
             if identity == Some(name) {
                 println!(
                     "found element: identity={identity:?} role={:?} frame={frame:?}",
-                    attribute_string(child, "AXRole")
+                    ax::attribute::<String>(child, "AXRole")
                 );
                 return Some((pid, child.retain()));
             }
@@ -225,28 +163,33 @@ const NOTIFICATIONS: &[&str] = &[
     "AXLoadComplete",
 ];
 
-extern "C-unwind" fn on_notification(
-    _observer: NonNull<AXObserver>,
-    element: NonNull<AXUIElement>,
-    notification: NonNull<CFString>,
-    _refcon: *mut c_void,
-) {
-    // SAFETY: the callback contract guarantees a live CFString for the
-    // duration of this call, and `element` is a live AXUIElement for the
-    // duration of this call too.
-    let name = unsafe { notification.as_ref() }.to_string();
-    let element = unsafe { element.as_ref() };
-    let desc = attribute_string(element, "AXDescription");
-    let title = attribute_string(element, "AXTitle");
-    let role = attribute_string(element, "AXRole");
-    let value = attribute_string(element, "AXValue");
-    let mut owner_pid: i32 = 0;
-    let pid_err = unsafe { element.pid(NonNull::from(&mut owner_pid)) };
+/// Every notification the probe registered, printed as it arrives.
+///
+/// The context is what this probe is really demonstrating alongside the
+/// daemon's own use: `ax::Observer` hands the callback a `&Started` rather
+/// than a `*mut c_void` to cast back, so nothing here writes a cast at all.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the shape `ax::Observer` calls back with"
+)]
+fn on_notification(notified: ax::Notified<'_, Started>) {
+    let element = notified.element;
     println!(
-        "[{:?}] AX notification fired: {name} owner_pid={owner_pid} ({pid_err:?}) role={role:?} title={title:?} desc={desc:?} value={value:?}",
-        Instant::now()
+        "[{:?}] AX notification fired: {} owner_pid={:?} ({:?} since start) role={:?} title={:?} \
+         desc={:?} value={:?}",
+        Instant::now(),
+        notified.notification,
+        ax::pid_of(element),
+        notified.context.0.elapsed(),
+        ax::attribute::<String>(element, "AXRole"),
+        ax::attribute::<String>(element, "AXTitle"),
+        ax::attribute::<String>(element, "AXDescription"),
+        ax::attribute::<String>(element, "AXValue"),
     );
 }
+
+/// When the probe started, so each notification prints how long it took.
+struct Started(Instant);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -266,7 +209,7 @@ fn main() {
 
     println!(
         "accessibility_trusted = {}",
-        rsbar::alias::accessibility_trusted()
+        rsbar::alias::accessibility_trusted().is_ok()
     );
 
     let Some((pid, element)) = find(&owner, &name) else {
@@ -277,7 +220,7 @@ fn main() {
 
     // Does the item itself have children (a sub-element that might accept a
     // notification even though the AXMenuBarItem parent flatly refuses one)?
-    let children = copy_array(&element, "AXChildren");
+    let children = ax::attribute::<CFRetained<CFArray>>(&element, "AXChildren");
     println!(
         "item AXChildren: {:?}",
         children.as_ref().map(|c| c.count())
@@ -285,83 +228,67 @@ fn main() {
     let mut child_elements: Vec<CFRetained<AXUIElement>> = Vec::new();
     if let Some(children) = &children {
         for i in 0..children.count() {
-            let Some(child) = (unsafe { array_element(children, i) }) else {
+            let Some(child) = ax::array_element(children, i) else {
                 continue;
             };
             println!(
                 "  child[{i}] role={:?} title={:?} desc={:?} value={:?}",
-                attribute_string(child, "AXRole"),
-                attribute_string(child, "AXTitle"),
-                attribute_string(child, "AXDescription"),
-                attribute_string(child, "AXValue"),
+                ax::attribute::<String>(child, "AXRole"),
+                ax::attribute::<String>(child, "AXTitle"),
+                ax::attribute::<String>(child, "AXDescription"),
+                ax::attribute::<String>(child, "AXValue"),
             );
             child_elements.push(child.retain());
         }
     }
 
-    let mut observer_ptr: *mut AXObserver = std::ptr::null_mut();
-    // SAFETY: `pid` is live; `observer_ptr` is a valid out-pointer.
-    let status =
-        unsafe { AXObserver::create(pid, Some(on_notification), NonNull::from(&mut observer_ptr)) };
-    println!("AXObserver::create -> {status:?}");
-    let Some(observer_ptr) = NonNull::new(observer_ptr) else {
-        eprintln!("observer is null");
-        std::process::exit(1);
+    let Some(access) = ax::Trusted::now() else {
+        println!("no Accessibility grant; nothing to observe");
+        return;
     };
-    // SAFETY: a non-null result from AXObserverCreate carries a +1 reference.
-    let observer = unsafe { CFRetained::from_raw(observer_ptr) };
+    let mut observer =
+        match ax::Observer::create(access, pid, Started(Instant::now()), on_notification) {
+            Ok(observer) => observer,
+            Err(err) => {
+                eprintln!("could not create an observer: {err}");
+                std::process::exit(1);
+            }
+        };
 
-    // SAFETY: `observer` stays alive for the process's remaining lifetime.
-    let source = unsafe { observer.run_loop_source() };
-    if let Some(run_loop) = CFRunLoop::current() {
-        // SAFETY: `source` is a valid run loop source; `kCFRunLoopDefaultMode`
-        // matches how this probe pumps below.
-        unsafe {
-            run_loop.add_source(Some(source.as_ref()), kCFRunLoopDefaultMode);
-        }
-    }
-
-    for notif_name in notifications {
-        let notif = CFString::from_str(notif_name);
-        // SAFETY: `element` and `notif` are both live for the call; refcon is
-        // unused by this probe.
-        let status = unsafe { observer.add_notification(&element, &notif, std::ptr::null_mut()) };
-        println!("[on item] add_notification({notif_name}) -> {status:?}");
-    }
-
-    for (i, child) in child_elements.iter().enumerate() {
-        for notif_name in notifications {
-            let notif = CFString::from_str(notif_name);
-            // SAFETY: `child` and `notif` are both live for the call.
-            let status = unsafe { observer.add_notification(child, &notif, std::ptr::null_mut()) };
-            println!("[on child[{i}]] add_notification({notif_name}) -> {status:?}");
-        }
-    }
-
-    // SAFETY: pid is live.
-    let app_element = unsafe { AXUIElement::new_application(pid) };
-    for notif_name in notifications {
-        let notif = CFString::from_str(notif_name);
-        let status =
-            unsafe { observer.add_notification(&app_element, &notif, std::ptr::null_mut()) };
-        println!("[on app] add_notification({notif_name}) -> {status:?}");
-    }
-    if let Some(extras) = copy_element(&app_element, "AXExtrasMenuBar") {
-        for notif_name in notifications {
-            let notif = CFString::from_str(notif_name);
-            let status =
-                unsafe { observer.add_notification(&extras, &notif, std::ptr::null_mut()) };
-            println!("[on extras bar] add_notification({notif_name}) -> {status:?}");
-        }
-    }
-
+    // Everything plausible, so the probe can tell which registration is the
+    // one that actually delivers: the item itself, its children, the owning
+    // application, its extras bar, and the system-wide element.
+    let app_element = ax::application(access, pid);
+    let extras = ax::attribute::<CFRetained<AXUIElement>>(&app_element, "AXExtrasMenuBar");
     // SAFETY: takes no arguments.
     let system_wide = unsafe { AXUIElement::new_system_wide() };
-    for notif_name in notifications {
-        let notif = CFString::from_str(notif_name);
-        let status =
-            unsafe { observer.add_notification(&system_wide, &notif, std::ptr::null_mut()) };
-        println!("[on system-wide] add_notification({notif_name}) -> {status:?}");
+
+    let mut targets: Vec<(&str, &AXUIElement)> = vec![
+        ("item", &element),
+        ("app", &app_element),
+        ("system-wide", &system_wide),
+    ];
+    if let Some(extras) = extras.as_deref() {
+        targets.push(("extras bar", extras));
+    }
+    targets.extend(child_elements.iter().map(|c| ("child", &**c)));
+
+    for (where_, target) in targets {
+        for notif_name in notifications {
+            match observer.watch(target, notif_name) {
+                Ok(()) => println!("[on {where_}] watch({notif_name}) -> ok"),
+                Err(err) => println!("[on {where_}] watch({notif_name}) -> {err}"),
+            }
+        }
+    }
+    println!("{} notifications registered", observer.watching());
+
+    if let Some(run_loop) = CFRunLoop::current() {
+        // SAFETY: the source is valid and `kCFRunLoopDefaultMode` matches how
+        // this probe pumps below.
+        unsafe {
+            run_loop.add_source(Some(&observer.run_loop_source()), kCFRunLoopDefaultMode);
+        }
     }
 
     println!(

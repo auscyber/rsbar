@@ -1,9 +1,8 @@
 //! Enumerating displays and finding their backing scale.
 
-use objc2::MainThreadMarker;
 use objc2_app_kit::NSScreen;
 use objc2_core_foundation::CGRect;
-use objc2_core_graphics::{CGDirectDisplayID, CGDisplayBounds, CGGetActiveDisplayList};
+use objc2_core_graphics::{CGDirectDisplayID, CGDisplayBounds};
 use objc2_foundation::NSString;
 
 /// A display the bar can sit on.
@@ -22,32 +21,21 @@ pub struct Display {
 /// Mirrored displays report the same bounds; they are left in, because each
 /// still needs its own window for the bar to appear on both.
 #[must_use]
+#[skylight::main_thread]
 pub fn active() -> Vec<Display> {
-    const MAX_DISPLAYS: u32 = 16;
-    let mut ids = [0 as CGDirectDisplayID; MAX_DISPLAYS as usize];
-    let mut count: u32 = 0;
+    let ids = match skylight::display::active() {
+        Ok(ids) => ids.into_iter().map(skylight::Display::id).collect(),
+        Err(error) => {
+            tracing::warn!(%error, "could not enumerate displays; assuming the main one");
+            vec![objc2_core_graphics::CGMainDisplayID()]
+        }
+    };
 
-    // SAFETY: `ids` has room for MAX_DISPLAYS, and `count` is a valid out-pointer.
-    let result = unsafe { CGGetActiveDisplayList(MAX_DISPLAYS, ids.as_mut_ptr(), &raw mut count) };
-    if result != objc2_core_graphics::CGError::Success {
-        tracing::warn!(
-            ?result,
-            "could not enumerate displays; assuming the main one"
-        );
-        let id = objc2_core_graphics::CGMainDisplayID();
-        return vec![Display {
+    ids.into_iter()
+        .map(|id| Display {
             id,
             bounds: CGDisplayBounds(id),
-            scale: scale_for(id),
-        }];
-    }
-
-    ids[..count as usize]
-        .iter()
-        .map(|&id| Display {
-            id,
-            bounds: CGDisplayBounds(id),
-            scale: scale_for(id),
+            scale: scale_for(proof, id),
         })
         .collect()
 }
@@ -59,12 +47,8 @@ pub fn active() -> Vec<Display> {
 /// `AppKit`. Falls back to 2.0, since guessing retina on a retina machine is
 /// the less visible mistake: a too-high scale looks correct, a too-low one is
 /// visibly soft.
+#[skylight::main_thread(pass)]
 fn scale_for(id: CGDirectDisplayID) -> f64 {
-    let Some(mtm) = MainThreadMarker::new() else {
-        tracing::warn!("backing scale queried off the main thread; assuming 2.0");
-        return 2.0;
-    };
-
     let key = NSString::from_str("NSScreenNumber");
     let screens = NSScreen::screens(mtm);
     for index in 0..screens.count() {

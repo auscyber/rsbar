@@ -6,9 +6,9 @@
 //!
 //! Two deliberate choices:
 //!
-//! A script runs on a worker thread, not the main one. Anything else lets a
-//! slow script stall drawing, and the whole point of the main thread here is
-//! that it stays responsive.
+//! A script runs as a task on the shared runtime, not the main thread.
+//! Anything else lets a slow script stall drawing, and the whole point of the
+//! main thread here is that it stays responsive.
 //!
 //! The exit status is advisory. The daemon links `AppKit`, which may install
 //! its own `SIGCHLD` disposition and reap our child before we get to it; the
@@ -16,34 +16,22 @@
 //! the pipes produced is the truth, and a lost reap is logged at debug rather
 //! than reported as a failure.
 //!
-//! # `sbar.exec` and captured output — task #16
+//! # `sbar.exec`
 //!
-//! The other half of task #16 asked for a daemon-side "run a command, capture
-//! its stdout, hand it back" primitive behind `sbar.exec(cmd, callback)`, on
-//! the reasoning that it should live once here rather than per client.
-//! `rsbar-lua`'s `exec_fn` (`crates/rsbar-lua/src/api.rs`) already covers the
-//! config's actual need for this, entirely on its own side: it spawns through
-//! `tokio::process::Command` in the Lua process itself and never calls the
-//! `Dispatcher`, by its own module doc's admission. Two things make that the
-//! right call rather than a gap to close here: real `SketchyBar` has no
-//! `exec` primitive at all — grep its C sources — so this is a Lua-config
-//! convenience, not a bar feature a daemon owns; and every actual `sbar.exec`
-//! call in the real config (`~/dendritic/sketchybar`, `menus.lua`,
-//! `right.lua`) already works today through that local path with no daemon
-//! involvement needed. Adding a `Request::Exec` here with nothing that calls
-//! it would be dead plumbing for a problem already solved. If a future
-//! client cannot spawn its own subprocess (a sandboxed config format, say),
-//! the primitive to add is a straight `sh -c` capture kept coherent with
-//! `exec_fn`'s own semantics (lossy UTF-8 stdout, a warning rather than a
-//! hard failure on a nonzero exit) — but that also needs a new
-//! `rsbar_protocol::Request` variant, which is not this file's crate to add.
+//! There is no `Request::Exec` here on purpose. `rsbar-lua`'s `exec_fn`
+//! already spawns `sbar.exec` calls directly via `tokio::process::Command`
+//! on the Lua side and never reaches this `Dispatcher` — and real
+//! `SketchyBar` has no `exec` primitive either, so this is not a gap to
+//! close, just a client-side convenience.
 
 use crate::components::ItemHandle;
 use rsbar_protocol::Event;
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::process::Stdio;
+use std::sync::Arc;
+use tokio::io::AsyncReadExt as _;
+use tokio::process::Command;
+use tokio::sync::Semaphore;
+use tokio::sync::mpsc::{self, UnboundedSender};
 
 /// One script to run, with the context its environment describes.
 pub struct Job {
@@ -63,46 +51,43 @@ pub struct Job {
     pub event: Arc<Event>,
 }
 
-/// A fixed pool of workers.
+/// A fixed pool of concurrent scripts.
 ///
-/// Bounded on purpose: an unbounded pool lets a misconfigured one-second
+/// Bounded on purpose: unbounded concurrency lets a misconfigured one-second
 /// script fork without limit until the machine gives up.
 pub struct Runner {
-    tx: Sender<Job>,
+    tx: UnboundedSender<Job>,
 }
 
 impl Runner {
-    /// Starts `workers` threads. They exit when the runner is dropped.
+    /// Starts a dispatcher task that runs up to `workers` scripts at once. It
+    /// stops when the runner is dropped, which closes the channel.
     ///
     /// # Panics
     ///
-    /// Panics if a worker thread cannot be spawned, which means the process is
-    /// already out of resources.
+    /// Never in practice: the task keeps its own `Semaphore` handle alive, so
+    /// `acquire_owned` can only fail by that semaphore closing, which nothing
+    /// here does.
     #[must_use]
     pub fn start(workers: usize) -> Self {
-        let (tx, rx) = channel::<Job>();
-        let rx = Arc::new(Mutex::new(rx));
+        let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
+        let permits = Arc::new(Semaphore::new(workers.max(1)));
 
-        for index in 0..workers.max(1) {
-            let rx: Arc<Mutex<Receiver<Job>>> = Arc::clone(&rx);
-            std::thread::Builder::new()
-                .name(format!("rsbar-script-{index}"))
-                .spawn(move || {
-                    loop {
-                        // The lock is released before running, so one long
-                        // script does not block the others from taking work.
-                        let job = {
-                            let Ok(guard) = rx.lock() else { break };
-                            guard.recv()
-                        };
-                        match job {
-                            Ok(job) => run(&job),
-                            Err(_) => break,
-                        }
-                    }
-                })
-                .expect("failed to spawn a script worker");
-        }
+        crate::pool::spawn(async move {
+            while let Some(job) = rx.recv().await {
+                // Acquired before spawning, so the loop itself stops taking
+                // work once every slot is busy, rather than piling up tasks
+                // parked on the semaphore.
+                let permit = Arc::clone(&permits)
+                    .acquire_owned()
+                    .await
+                    .expect("the semaphore is never closed");
+                crate::pool::spawn(async move {
+                    run(&job).await;
+                    drop(permit);
+                });
+            }
+        });
 
         Self { tx }
     }
@@ -133,17 +118,38 @@ fn direct_argv(script: &str) -> Option<Vec<&str>> {
     (!argv.is_empty()).then_some(argv)
 }
 
-/// `PATH` with this daemon reachable as `sketchybar`, which is the name a
-/// config's plugin scripts call to set their own item. See [`crate::shim`].
-fn shim_path() -> Option<(&'static str, std::ffi::OsString)> {
-    thread_local! {
-        static PATH: Option<std::ffi::OsString> =
-            crate::shim::directory().map(|_| rsbar_protocol::shimmed_path());
+/// `PATH` for anything the daemon spawns, with the directory this binary
+/// lives in on the front of it.
+///
+/// A config and its plugin scripts talk back by running `rsbard`, so that
+/// name has to resolve. The daemon knows exactly where it is; nothing else
+/// reliably does — a development build sits in `target/debug`, an installed
+/// one in whatever prefix it was put in, and neither is on a login shell's
+/// `PATH` by accident. Prepending our own directory is the whole fix: no
+/// generated wrapper, no second binary, just the real `rsbard` findable under
+/// its real name.
+///
+/// Front rather than back, so a stale `rsbard` installed elsewhere cannot
+/// shadow the daemon that is actually running.
+#[must_use]
+pub fn child_path() -> std::ffi::OsString {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let Some(directory) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    else {
+        return inherited;
+    };
+
+    let mut path = std::ffi::OsString::from(directory);
+    if !inherited.is_empty() {
+        path.push(":");
+        path.push(&inherited);
     }
-    PATH.with(|path| path.clone().map(|path| ("PATH", path)))
+    path
 }
 
-fn run(job: &Job) {
+async fn run(job: &Job) {
     let mut command = if let Some(argv) = direct_argv(&job.script) {
         let mut command = Command::new(argv[0]);
         command.args(&argv[1..]);
@@ -156,10 +162,9 @@ fn run(job: &Job) {
 
     let mut child = match command
         .env("NAME", job.item.name().as_str())
-        .env("RSBAR_NAME", job.item.name().as_str())
         .envs(job.event.env())
         .env("RSBAR_SERVICE", rsbar_protocol::service_name())
-        .envs(shim_path())
+        .env("PATH", child_path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -176,10 +181,10 @@ fn run(job: &Job) {
     if let Some(mut pipe) = child.stderr.take() {
         // Read to EOF before waiting: a child that fills the pipe buffer
         // blocks forever if nobody drains it.
-        let _ = pipe.read_to_string(&mut stderr);
+        let _ = pipe.read_to_string(&mut stderr).await;
     }
 
-    match child.wait() {
+    match child.wait().await {
         Ok(status) if !status.success() => {
             tracing::warn!(item = %job.item, ?status, stderr = %stderr.trim(), "script failed");
         }
