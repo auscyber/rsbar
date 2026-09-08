@@ -23,5 +23,6 @@ pub mod shim;
 pub mod sources;
 pub mod subscribers;
 pub mod text;
+pub mod tracking;
 
 pub use rsbar_protocol::style;
