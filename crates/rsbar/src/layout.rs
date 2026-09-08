@@ -333,6 +333,18 @@ fn brackets_over(
     size: CGSize,
     ordinal: u32,
 ) -> Vec<(Entity, CGRect)> {
+    // Indexed once rather than scanned per bracket. Walking every placed item
+    // for every bracket, and every name in its member list for each of those,
+    // is the one quadratic corner of layout -- and a real config has a dozen
+    // brackets over a hundred and forty items.
+    let mut frames: HashMap<&rsbar_protocol::ItemName, CGRect> =
+        HashMap::with_capacity(placed.len());
+    for (entity, frame) in placed {
+        if let Ok(row) = items.get(*entity) {
+            frames.insert(&row.name.0, *frame);
+        }
+    }
+
     let mut out = Vec::new();
     for bracket in items.iter() {
         let Some(members) = bracket.members else {
@@ -342,13 +354,10 @@ fn brackets_over(
             continue;
         }
         let mut span: Option<(f64, f64)> = None;
-        for (member, frame) in placed {
-            let Ok(row) = items.get(*member) else {
+        for member in &members.0 {
+            let Some(frame) = frames.get(member) else {
                 continue;
             };
-            if !members.0.contains(&row.name.0) {
-                continue;
-            }
             let (left, right) = (frame.origin.x, frame.origin.x + frame.size.width);
             span = Some(match span {
                 Some((l, r)) => (l.min(left), r.max(right)),
