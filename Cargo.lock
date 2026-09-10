@@ -57,6 +57,8 @@ dependencies = [
 [[package]]
 name = "async-mach-ports"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa4c7c42e6a48cf62480fdb12cc87e01587d5c3c1bc24e86b21a09d8158cdd85"
 dependencies = [
  "bitflags",
  "futures-lite",
@@ -422,6 +424,82 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9"
 dependencies = [
  "unicode-segmentation",
+]
+
+[[package]]
+name = "coolabah"
+version = "0.1.0"
+dependencies = [
+ "async-executor",
+ "async-mach-ports",
+ "bevy_app",
+ "bevy_ecs",
+ "bevy_tasks",
+ "bevy_time",
+ "bitflags",
+ "block2",
+ "coolabah-protocol",
+ "futures-lite",
+ "lexopt",
+ "libc",
+ "notify",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-application-services",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-core-text",
+ "objc2-foundation",
+ "regex",
+ "serde",
+ "skylight",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "coolabah-lua"
+version = "0.1.0"
+dependencies = [
+ "async-mach-ports",
+ "coolabah-protocol",
+ "futures-lite",
+ "futures-util",
+ "mlua",
+ "regex",
+ "serde",
+ "serde_path_to_error",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "coolabah-protocol"
+version = "0.1.0"
+dependencies = [
+ "async-mach-ports",
+ "bitflags",
+ "coolabah-protocol-macros",
+ "libc",
+ "postcard",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "coolabah-protocol-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1293,82 +1371,6 @@ checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
 dependencies = [
  "rmp",
  "serde",
-]
-
-[[package]]
-name = "rsbar"
-version = "0.1.0"
-dependencies = [
- "async-executor",
- "async-mach-ports",
- "bevy_app",
- "bevy_ecs",
- "bevy_tasks",
- "bevy_time",
- "bitflags",
- "block2",
- "futures-lite",
- "lexopt",
- "libc",
- "notify",
- "objc2",
- "objc2-app-kit",
- "objc2-application-services",
- "objc2-core-foundation",
- "objc2-core-graphics",
- "objc2-core-text",
- "objc2-foundation",
- "regex",
- "rsbar-protocol",
- "serde",
- "skylight",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "rsbar-lua"
-version = "0.1.0"
-dependencies = [
- "async-mach-ports",
- "futures-lite",
- "futures-util",
- "mlua",
- "regex",
- "rsbar-protocol",
- "serde",
- "serde_path_to_error",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "rsbar-protocol"
-version = "0.1.0"
-dependencies = [
- "async-mach-ports",
- "bitflags",
- "libc",
- "postcard",
- "rmp-serde",
- "rsbar-protocol-macros",
- "serde",
- "serde_json",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "rsbar-protocol-macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]

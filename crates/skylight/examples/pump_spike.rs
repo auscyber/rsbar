@@ -34,23 +34,33 @@ fn main() {
 
     let mtm = objc2::MainThreadMarker::new().expect("an example runs on the main thread");
     let window = Window::new(frame, mtm).expect("create");
-    window.set_scale(2.0).expect("scale");
-    window.set_opaque(false).expect("opaque");
-    window.set_alpha(1.0).expect("alpha");
-    window.set_level(level::STATUS).expect("level");
-    window
-        .set_tags((WindowTags::BAR - WindowTags::AVOIDS_CAPTURE) | WindowTags::IGNORE_FOR_EVENTS)
-        .expect("tags");
-    window.order_above(None).expect("order");
 
-    skylight::draw(&window, frame.size, |ctx| {
-        CGContext::set_rgb_fill_color(Some(ctx), 0.05, 0.05, 0.08, 0.9);
-        CGContext::fill_rect(Some(ctx), CGRect::new(CGPoint::new(0.0, 0.0), frame.size));
-        CGContext::set_rgb_fill_color(Some(ctx), 0.4, 1.0, 0.5, 1.0);
-        CGContext::fill_rect(
-            Some(ctx),
-            CGRect::new(CGPoint::new(24.0, 10.0), CGSize::new(200.0, 20.0)),
-        );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("build a runtime");
+    rt.block_on(async {
+        let connected = skylight::acquire().await;
+        window.set_scale(&connected, 2.0).expect("scale");
+        window.set_opaque(&connected, false).expect("opaque");
+        window.set_alpha(&connected, 1.0).expect("alpha");
+        window.set_level(&connected, level::STATUS).expect("level");
+        window
+            .set_tags(
+                &connected,
+                (WindowTags::BAR - WindowTags::AVOIDS_CAPTURE) | WindowTags::IGNORE_FOR_EVENTS,
+            )
+            .expect("tags");
+        window.order_above(&connected, None).expect("order");
+
+        skylight::draw(&connected, mtm, &window, frame.size, |ctx| {
+            CGContext::set_rgb_fill_color(Some(ctx), 0.05, 0.05, 0.08, 0.9);
+            CGContext::fill_rect(Some(ctx), CGRect::new(CGPoint::new(0.0, 0.0), frame.size));
+            CGContext::set_rgb_fill_color(Some(ctx), 0.4, 1.0, 0.5, 1.0);
+            CGContext::fill_rect(
+                Some(ctx),
+                CGRect::new(CGPoint::new(24.0, 10.0), CGSize::new(200.0, 20.0)),
+            );
+        });
     });
 
     let start = std::time::Instant::now();

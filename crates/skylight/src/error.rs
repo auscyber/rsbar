@@ -61,6 +61,8 @@ pub enum Error {
     Brightness(CGError),
     #[error("failed to enumerate the active displays: {0:?}")]
     DisplayList(CGError),
+    #[error("failed to read a property of a window this process does not own: {0:?}")]
+    ForeignWindow(CGError),
 }
 
 /// Turns the window server's success-or-code convention into a `Result`.

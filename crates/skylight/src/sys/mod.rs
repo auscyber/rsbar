@@ -1,30 +1,37 @@
 //! Window server calls this crate did not have, ported from `rift`'s
 //! `src/sys/` — a window manager's binding layer for the same private API.
 //!
-//! Separate from [`crate::ffi`] rather than added to it. `ffi` is what the bar
+//! This is the crate's general layer, and every module in it is `pub`: a
+//! window manager reaches for these directly, the way `paneru` would, rather
+//! than through anything shaped around a status bar. [`crate::Foreign`] wraps
+//! [`window`]'s window-reading calls into a plain `Send` handle for the common
+//! case; a caller after something these blocks declare but that type does not
+//! cover — a space, a display, a notification — calls the raw declaration
+//! itself.
+//!
+//! Separate from [`crate::ffi`] rather than added to it. `ffi` is what a bar
 //! *needs*: the calls behind [`crate::Window`], the capture pool and the two
 //! sources that talk to the window server, every one of them reached by
-//! something above it. What is here is the second category — calls a status bar
-//! plausibly wants and nothing in this tree has asked for yet — so keeping them
+//! something above it. What is here is the second category — calls a status
+//! bar plausibly wants and nothing in this tree has asked for yet, alongside
+//! calls a window manager wants far more than a bar does — so keeping them
 //! apart is what stops "declared" from reading as "used".
 //!
 //! # Which block a call goes in
 //!
-//! The same rule [`crate::ffi`] follows, and for the same reason: the window
-//! server answers *mutations* only for the thread its run loop turns on, so
-//! those go in a `#[skylight_macros::main_thread_ffi]` block, and reads go in a
-//! plain one taking a [`SharedConnectionId`](crate::ffi::SharedConnectionId).
-//! Each block below says which it is and why. A call whose first argument is a
-//! [`ConnectionId`](crate::ffi::ConnectionId) needs no proof argument on top —
-//! that type is main-thread-only itself, so holding one to pass *is* the proof,
-//! and the attribute leaves such a declaration alone.
+//! The same rule [`crate::ffi`] follows: a call that mutates a window this
+//! process does not exclusively own the timing of goes in a
+//! `#[skylight_macros::main_thread_ffi]` block, and a plain read goes in an
+//! ordinary one taking a [`ConnectionId`](crate::ffi::ConnectionId). Each
+//! block below says which it is and why. A declaration whose first argument is
+//! already a `ConnectionId` is left exactly as declared either way — see
+//! [`skylight_macros::main_thread_ffi`]'s own doc comment for what that does
+//! and does not prove.
 //!
-//! Everything read-only here is declared for [`SharedConnectionId`]. That is
-//! not a claim that any of it is called from a worker today — none of it is
-//! called at all — it is the claim that none of it mutates window server state,
-//! which is the same standing `SLSGetActiveSpace` and `SLSSpaceGetType` already
-//! have in `ffi`'s second block. A caller on the main thread reaches them with
-//! `cid.shared()`.
+//! Everything read-only here takes a [`ConnectionId`](crate::ffi::ConnectionId)
+//! directly rather than [`crate::Connected`]: these are declared, not wrapped,
+//! so a caller that already holds a connected guard passes `connected.id()`
+//! the same as any other raw call.
 //!
 //! # Provenance
 //!
@@ -89,7 +96,7 @@
 //!   change's scope).
 //! * **`display_churn.rs`** is the one file whose *idea* was taken rather than
 //!   its code: three process-wide atomics tracking whether a reconfiguration
-//!   is in flight. `rsbar`'s `sources::displays` keeps the same idea without
+//!   is in flight. `coolabah`'s `sources::displays` keeps the same idea without
 //!   the state or the timers: it fingerprints the display layout and reports
 //!   only when the fingerprint moves. See that module for why a bar can skip
 //!   the settle loop a window manager cannot.

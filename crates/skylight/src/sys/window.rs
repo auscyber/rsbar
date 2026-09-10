@@ -286,9 +286,10 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-// The window server answers this one only for its own thread: it changes a
-// window's appearance. It takes a `ConnectionId` first, so the attribute leaves
-// it as declared -- having one to pass is already the proof.
+// Changes a window's appearance, on the same footing as `ffi`'s own
+// window-mutating block. Left exactly as declared, like every other
+// `ConnectionId`-first call here -- see `main_thread_ffi`'s own doc comment
+// for why that is not a claim about the thread.
 #[link(name = "SkyLight", kind = "framework")]
 #[skylight_macros::main_thread_ffi]
 unsafe extern "C" {

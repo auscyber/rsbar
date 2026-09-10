@@ -1,3 +1,12 @@
+# miri ships only with nightly, and this project's toolchain comes from
+# nixpkgs -- there is no rustup here, so `cargo +nightly` means nothing. A
+# second toolchain, used by the `miri` script alone, keeps the build's own
+# rustc and cargo exactly where they were.
+#
+# Derived here rather than passed in: devenv resolves every argument a module
+# declares, defaulted or not, so an optional one is still an error when the
+# `devenv` CLI reads this file directly. `inputs` is supplied on both paths --
+# by `devenv.yaml` for the CLI, by `flake.nix` under flake-parts.
 {
   pkgs,
   lib,
@@ -7,14 +16,16 @@
 }:
 
 let
-  # miri only ships with nightly, and this project's toolchain comes from
-  # nixpkgs -- there is no rustup here, so `cargo +nightly` means nothing.
-  # A second toolchain, used by the `miri` script alone, keeps the build's
-  # own rustc/cargo exactly where they were.
-  rust = (pkgs.extend (import inputs.rust-overlay)).rust-bin;
-  nightly = rust.selectLatestNightlyWith (
-    toolchain: toolchain.default.override { extensions = [ "miri" "rust-src" ]; }
-  );
+  nightly =
+    (pkgs.extend (import inputs.rust-overlay)).rust-bin.selectLatestNightlyWith (
+      toolchain:
+      toolchain.default.override {
+        extensions = [
+          "miri"
+          "rust-src"
+        ];
+      }
+    );
 in
 {
   # https://devenv.sh/basics/
@@ -27,6 +38,10 @@ in
   packages = [
     pkgs.git
     pkgs.cargo-flamegraph
+    # `coolabah-lua` links LuaJIT rather than vendoring it -- see its Cargo.toml.
+    # `pkg-config` is how mlua's build script finds this one.
+    pkgs.luajit
+    pkgs.pkg-config
   ];
 
   # https://devenv.sh/languages/
@@ -42,7 +57,7 @@ in
   languages.rust.enable = true;
   claude.code.enable = true;
 
-  # `miri test -p rsbar-protocol` and friends. Its own target directory, so a
+  # `miri test -p coolabah-protocol` and friends. Its own target directory, so a
   # miri run never invalidates the ordinary build cache.
   scripts.miri.exec = ''
     export PATH=${nightly}/bin:$PATH

@@ -22,7 +22,7 @@
 //! * **`rift`-only.** Carried because a plausible name is better than a
 //!   number, and marked because nothing corroborates it.
 //!
-//! What no tier gives you is the payload. Only the four numbers `rsbar`'s
+//! What no tier gives you is the payload. Only the four numbers `coolabah`'s
 //! `spaces` source already uses have had their payloads read here, and only as
 //! far as "the first eight bytes are a space id". Four of those — [`SPACE_CHANGED`],
 //! [`SPACE_WINDOW_CREATED`], [`SPACE_WINDOW_DESTROYED`] and
@@ -123,7 +123,7 @@ pub const TRANSITION_DID_FINISH: u32 = 1700;
 
 /// A window joined a space. **Registered by `SketchyBar`**
 /// (`app_windows.c:293`); `rift` names it `SpaceWindowCreated`. Already used
-/// by `rsbar`'s `spaces` source.
+/// by `coolabah`'s `spaces` source.
 ///
 /// The payload leads with the space id as a `u64`, which is the one payload
 /// shape verified in this tree.
@@ -142,13 +142,13 @@ pub const SPACE_CREATED: u32 = 1327;
 pub const SPACE_DESTROYED: u32 = 1328;
 
 /// Several windows changed space at once. **Named by `rift`
-/// (`SpaceWindowBatchReassociated`) and `paneru`**; already used by `rsbar`'s
+/// (`SpaceWindowBatchReassociated`) and `paneru`**; already used by `coolabah`'s
 /// `spaces` source, which reads the leading `u64` as the space id.
 pub const SPACE_WINDOW_BATCH_REASSOCIATED: u32 = 1339;
 
 /// The active space changed. **Registered by `SketchyBar` in two places and by
 /// every other implementation**; `rift` names it `WorkspaceDidChange`. Already
-/// used by `rsbar`'s `spaces` source, and the single most load-bearing number
+/// used by `coolabah`'s `spaces` source, and the single most load-bearing number
 /// in this file.
 pub const SPACE_CHANGED: u32 = 1401;
 
@@ -161,7 +161,7 @@ pub const SPACE_WILL_CHANGE: u32 = 1400;
 /// The frontmost application changed. **Registered by `SketchyBar`**
 /// (`sketchybar.c:220`); `rift` names it `FrontmostApplicationChanged`.
 ///
-/// `rsbar` gets this from `NSWorkspaceDidActivateApplicationNotification`
+/// `coolabah` gets this from `NSWorkspaceDidActivateApplicationNotification`
 /// instead, which is public and carries the application object. This is here
 /// for completeness, not as an alternative worth switching to.
 pub const FRONT_APP_CHANGED: u32 = 1508;
@@ -176,10 +176,10 @@ pub const ALL: u32 = 0xFFFF_FFFF;
 
 #[cfg(test)]
 mod tests {
-    /// `rsbar`'s `spaces` source spells four of these out for itself, and the
+    /// `coolabah`'s `spaces` source spells four of these out for itself, and the
     /// two spellings have to agree or one of them is wrong. Written as the
     /// literals that source uses rather than by importing it — `skylight` does
-    /// not depend on `rsbar`, and could not — so this is a tripwire for an
+    /// not depend on `coolabah`, and could not — so this is a tripwire for an
     /// edit to either side.
     #[test]
     fn the_four_numbers_the_spaces_source_uses_are_the_ones_it_uses() {

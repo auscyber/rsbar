@@ -435,7 +435,7 @@ pub fn extras_menu_children_within(
 /// Nothing in the daemon calls this: a walk of every running application
 /// under that default measured 2.6 s here, of which one unresponsive
 /// application was 1.5 s. It is kept as the *baseline* that number is
-/// measured against — `rsbar/examples/alias_probe.rs` times both forms side
+/// measured against — `coolabah/examples/alias_probe.rs` times both forms side
 /// by side, and an argument for a timeout that cannot be re-run is an
 /// argument nobody can check.
 #[must_use]

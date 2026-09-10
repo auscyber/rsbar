@@ -1,0 +1,107 @@
+[package]
+name = "coolabah-lua"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The coolabah Lua API: a host-agnostic `install()` plus an IPC client, used both by the daemon's embedded runtime and by the standalone `require(\"coolabah\")` module."
+publish = false
+
+# `rlib` is what the daemon links against to host the API in-process.
+# `cdylib` is the loadable Lua module a foreign interpreter's `require` can
+# dlopen (built with the `module` feature — see below).
+[lib]
+name = "coolabah_lua"
+crate-type = ["rlib", "cdylib"]
+
+# The recommended way to run a config: a small binary that hosts a vendored
+# LuaJIT itself, pre-loads `package.loaded.coolabah` and runs the given script.
+# No dynamic module loading involved, which sidesteps the two-Lua-runtimes
+# hazard described below.
+[[bin]]
+name = "coolabah-lua"
+path = "src/bin/coolabah_lua.rs"
+# A Lua to link, not a *vendored* one. `vendored` is a build strategy -- compile
+# our own -- and the default here, so a plain `cargo build` still needs nothing
+# installed. A packaged build supplies LuaJIT from outside instead
+# (`--no-default-features --features luajit`), which is what `nix/package.nix`
+# does: mlua's own build cannot vendor inside a read-only store, because
+# LuaJIT's makefile writes into the source tree it was handed.
+required-features = ["luajit"]
+
+# Building this crate happens in one of two, mutually exclusive, shapes:
+#
+#   cargo build -p coolabah-lua --features vendored,luajit
+#     The default for the bin above and for anything embedding this crate as
+#     an rlib (the daemon): mlua compiles its own LuaJIT and links it in.
+#
+#   cargo build -p coolabah-lua --no-default-features --features module,luajit --lib
+#     The cdylib for `require("coolabah")` from an *existing* Lua/LuaJIT process
+#     (a text editor's scripting host, say). `module` leaves the `lua_*`
+#     symbols undefined so they resolve against the host's own interpreter at
+#     load time — required here, because linking a second, independent copy of
+#     the Lua runtime into the same process and pointing it at a `lua_State*`
+#     the *other* copy created is unsound. mlua enforces that `vendored` and
+#     `module` are never both enabled.
+[features]
+# LuaJIT, linked from outside. `vendored` — mlua compiling its own copy — is
+# still available but is no longer the default, because it cannot work where
+# the source it is handed is read-only: LuaJIT's makefile writes into its own
+# tree, which is what a packaged build (`nix/package.nix`) hands it. One
+# strategy for both paths beats two, so the dev shell supplies LuaJIT instead
+# and `devenv.nix` lists it.
+#
+# Building outside that shell therefore needs a LuaJIT that `pkg-config` can
+# find; `--features vendored` is the escape hatch if you would rather not
+# install one.
+default = ["luajit"]
+vendored = ["mlua/vendored"]
+luajit = ["mlua/luajit"]
+lua54 = ["mlua/lua54"]
+module = ["mlua/module"]
+
+[dependencies]
+# `async`: every verb in `api.rs` awaits the dispatcher instead of blocking.
+# `serde`: a query result (`ItemState`, `BarState`) is already
+# `Serialize` in exactly the shape a config should see, `Color`/`FontSpec`
+# included — `lua.to_value` builds the Lua table from that directly instead
+# of a second, hand-maintained copy of the same field list.
+# `send`: `Lua` becomes `Send + Sync` behind a reentrant mutex, which is what
+# lets the daemon host the VM on a thread that is not the one that draws. It
+# does not make Lua itself concurrent -- the VM still runs one thread at a
+# time -- it makes the *handle* movable, and in exchange requires every
+# callback this crate registers to be `Send` and every `UserData` to be
+# `Send + Sync`. That is why `Dispatcher`'s futures are `BoxFuture` rather
+# than local, and why nothing here holds an `Rc`.
+mlua = { version = "0.12", default-features = false, features = ["async", "send", "serde"] }
+coolabah-protocol = { workspace = true }
+async-mach-ports = { workspace = true }
+futures-lite = { workspace = true }
+# `SelectAll`, for merging every subscribed item's event stream into one
+# `coolabah.run()` loop without spawning a task per item.
+futures-util = { version = "0.3", default-features = false, features = ["std", "alloc"] }
+# Only the bin needs an actual runtime (`rt`) to drive `exec_async`, plus
+# `process` for `coolabah.exec` spawning a shell command.
+tokio = { workspace = true, features = ["rt", "process", "time"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+# `coolabah.set`/bracket membership accept `SketchyBar`'s `/pattern/` item-name
+# regexes; the daemon is what actually resolves one against its own live item
+# list (`Selector::Pattern`), but compiling it here too, and discarding the
+# result, is what turns a malformed pattern into a named error at the call
+# site instead of a daemon rejection three requests later.
+regex = "1"
+# `ItemState`/`BarState` are already `Serialize` in exactly the shape a query
+# result should hand back to a config — see `convert::serde_table`.
+serde = { workspace = true }
+# Diagnostics only, and deliberately not a second reader: it wraps `mlua`'s
+# own deserializer to remember which key it was on when a value failed, so a
+# config author is told `popup.drawing` and not just what the value was. The
+# CLI names the property from its own `ArgsError` path; this is what makes the
+# Lua side say the same thing.
+serde_path_to_error = "0.1.20"
+
+[lints]
+workspace = true

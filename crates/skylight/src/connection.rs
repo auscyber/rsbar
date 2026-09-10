@@ -85,8 +85,13 @@ pub struct Connected {
 
 impl Connected {
     /// The connection this is exclusive use of.
+    ///
+    /// `pub`, not `pub(crate)`: a caller outside this crate reaching for a
+    /// raw [`crate::sys`] call — one of the ones this crate has not wrapped —
+    /// needs the id to pass it, on the same footing as [`crate::capture`] and
+    /// [`crate::true_rect`] inside this crate.
     #[must_use]
-    pub(crate) const fn id(&self) -> ffi::ConnectionId {
+    pub const fn id(&self) -> ffi::ConnectionId {
         self.id
     }
 }

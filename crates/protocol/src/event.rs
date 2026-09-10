@@ -10,7 +10,7 @@
 //! carry one — and [`Event`] is what a source emits.
 
 use crate::Json;
-use rsbar_protocol_macros::{EnvFields, Spelling, events};
+use coolabah_protocol_macros::{EnvFields, Spelling, events};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -322,7 +322,7 @@ impl EventName {
 pub enum InvalidEventName {
     #[error(transparent)]
     NotAName(#[from] InvalidEvent),
-    #[error("`{0}` is a built-in event; only a name rsbar does not already define can be added")]
+    #[error("`{0}` is a built-in event; only a name coolabah does not already define can be added")]
     BuiltIn(String),
 }
 
@@ -461,7 +461,7 @@ impl Event {
     /// Exactly the names `SketchyBar` sets, and no others: a config's plugin
     /// scripts are written against it, and the whole point of matching its
     /// CLI is that those scripts run unchanged. There used to be an
-    /// `RSBAR_`-prefixed twin of each, on the theory that a bare `NAME` is
+    /// `COOLABAH_`-prefixed twin of each, on the theory that a bare `NAME` is
     /// easy for something else in the environment to have set — but a script
     /// that reads the prefixed one is a script that no longer runs under
     /// `SketchyBar`, which is the one thing this is not allowed to cost.
@@ -759,11 +759,11 @@ mod tests {
 
     #[test]
     fn no_variable_is_prefixed() {
-        // The `RSBAR_` twins are gone: a script that reads one is a script
+        // The `COOLABAH_` twins are gone: a script that reads one is a script
         // that no longer runs under SketchyBar.
         let env = Event::VolumeChanged(VolumeChange { volume: 42 }).env();
         assert!(
-            env.keys().all(|name| !name.starts_with("RSBAR_")),
+            env.keys().all(|name| !name.starts_with("COOLABAH_")),
             "{env:?}"
         );
     }

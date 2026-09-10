@@ -72,7 +72,7 @@ fn main() {
     // empty" path calls something whose zero answer skips the rest -- and
     // skips the `kCGErrorInvalidOperation` abort edge with it. A process that
     // never established a connection may take that shortcut and prove nothing,
-    // so establish one, the way `rsbard` has by the time it stops a source.
+    // so establish one, the way `coolabah` has by the time it stops a source.
     let cid = connection();
     println!("connection: {cid:?}");
 

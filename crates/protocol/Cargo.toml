@@ -1,6 +1,6 @@
 [package]
-name = "rsbar-protocol"
-description = "Wire types shared by the rsbar daemon, CLI and Lua module."
+name = "coolabah-protocol"
+description = "Wire types shared by the coolabah daemon, CLI and Lua module."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-rsbar-protocol-macros = { workspace = true }
+coolabah-protocol-macros = { workspace = true }
 async-mach-ports = { workspace = true }
 rmp-serde = "1.3"
 bitflags = { workspace = true }

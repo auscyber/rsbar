@@ -74,12 +74,19 @@ impl Drop for SavedState<'_> {
 /// window server for.
 ///
 /// Everything drawn is published when `f` returns; nothing is visible before.
-/// Taking the window itself, not its id: a [`Window`] can only have been made
-/// on the main thread and cannot leave it, so the argument is the proof and
-/// there is nothing for a caller to pass or declare. See [`Window`]'s own doc
-/// comment for the two halves of that.
-pub fn draw<R>(window: &Window, size: CGSize, f: impl FnOnce(&CGContext) -> R) -> Option<R> {
-    draw_damaged(window, size, None, f)
+/// Takes both a connection and a thread proof, because they answer different
+/// questions now that a [`Window`] is neither: `connected` is the lock this
+/// call's window server round trips need, and `proof` is what says this is
+/// the thread the drawing itself, and the `CGContext`/`CALayer` calls under
+/// it, belong on.
+pub fn draw<R>(
+    connected: &crate::Connected,
+    proof: impl crate::MainThreadProof,
+    window: &Window,
+    size: CGSize,
+    f: impl FnOnce(&CGContext) -> R,
+) -> Option<R> {
+    draw_damaged(connected, proof, window, size, None, f)
 }
 
 /// The same, over part of the window only.
@@ -95,14 +102,16 @@ pub fn draw<R>(window: &Window, size: CGSize, f: impl FnOnce(&CGContext) -> R) -
 /// every item back means every item is re-rasterised whenever any one of them
 /// changes, and a clock ticking once a second is enough to make the static
 /// items beside it shimmer.
-/// As [`draw`], the window itself is the main-thread proof.
+/// As [`draw`], `connected` and `proof` answer different questions.
 pub fn draw_damaged<R>(
+    connected: &crate::Connected,
+    _proof: impl crate::MainThreadProof,
     window: &Window,
     size: CGSize,
     damage: Option<&[CGRect]>,
     f: impl FnOnce(&CGContext) -> R,
 ) -> Option<R> {
-    let cid = crate::window::connection_id();
+    let cid = connected.id();
     let context = Context::create(cid, window.id())?;
     let ctx = context.get();
 
@@ -150,9 +159,15 @@ pub fn draw_damaged<R>(
 /// The y-flip is not optional. A window server context has its origin at the
 /// bottom left; `CALayer` geometry runs top-down. Without the flip the bar
 /// renders upside down.
-/// As [`draw`], the window itself is the main-thread proof.
-pub fn present(window: &Window, size: CGSize, layer: &CALayer) {
-    let cid = crate::window::connection_id();
+/// As [`draw`], `connected` and `proof` answer different questions.
+pub fn present(
+    connected: &crate::Connected,
+    _proof: impl crate::MainThreadProof,
+    window: &Window,
+    size: CGSize,
+    layer: &CALayer,
+) {
+    let cid = connected.id();
     let Some(context) = Context::create(cid, window.id()) else {
         return;
     };

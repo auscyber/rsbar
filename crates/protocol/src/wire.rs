@@ -2,7 +2,7 @@
 //!
 //! `async-mach-ports` carries no format of its own: a port is handed a
 //! [`Codec`](async_mach_ports::Codec) when it is created and uses it for
-//! everything that crosses it. Which one rsbar uses is a protocol decision, so
+//! everything that crosses it. Which one coolabah uses is a protocol decision, so
 //! it is made here, once, and the daemon, the CLI and the Lua module all reach
 //! for the same aliases rather than each naming a format.
 //!
@@ -22,7 +22,7 @@
 //! the shape from the type rather than the bytes — turns a type whose
 //! `Serialize` and `Deserialize` disagree into wrong data rather than an error.
 //! Three such bugs in this crate went undetected that way. Self-description
-//! costs roughly two to three times the bytes on a small message; an rsbar
+//! costs roughly two to three times the bytes on a small message; an coolabah
 //! request is tens of bytes either way, sent at human speed, so that is not a
 //! cost worth a class of silent bugs.
 
@@ -30,7 +30,7 @@ use async_mach_ports::{Error, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-/// The rsbar wire format: `MessagePack`, with struct fields written as names.
+/// The coolabah wire format: `MessagePack`, with struct fields written as names.
 ///
 /// `rmp_serde::to_vec` would write a struct as a bare positional array, which
 /// is exactly as opaque as postcard was and would give up everything this

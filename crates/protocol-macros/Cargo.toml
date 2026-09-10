@@ -1,6 +1,6 @@
 [package]
-name = "rsbar-protocol-macros"
-description = "The declaration macros behind rsbar-protocol's event vocabulary."
+name = "coolabah-protocol-macros"
+description = "The declaration macros behind coolabah-protocol's event vocabulary."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

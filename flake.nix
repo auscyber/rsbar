@@ -1,11 +1,21 @@
 {
-  description = "rsbar — a macOS menu bar daemon, and a Lua host for its configs";
+  description = "coolabah — a macOS menu bar daemon, and a Lua host for its configs";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
 
     devenv.url = "github:cachix/devenv";
+
+    # How devenv learns the working directory under a flake, where `./.` is a
+    # store path and tells it nothing. `.envrc` overrides this input with a
+    # file holding the real path; the default is empty, and an empty value
+    # means "not in a devenv shell", which is exactly right for `nix build`.
+    # See https://devenv.sh/guides/using-with-flakes/
+    devenv-root = {
+      url = "file+file:///dev/null";
+      flake = false;
+    };
 
     crane.url = "github:ipetkov/crane";
 
@@ -29,8 +39,8 @@
 
       flake = {
         homeManagerModules = rec {
-          rsbar = import ./nix/hm-module.nix inputs.self;
-          default = rsbar;
+          coolabah = import ./nix/hm-module.nix inputs.self;
+          default = coolabah;
         };
       };
 
@@ -43,30 +53,33 @@
         }:
         let
           rustToolchain =
-            (import inputs.rust-overlay { inherit pkgs; }).rust-bin.stable.latest.default;
+            (pkgs.extend inputs.rust-overlay.overlays.default).rust-bin.stable.latest.default;
+
 
           craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-          rsbar = pkgs.callPackage ./nix/package.nix {
+          coolabah = pkgs.callPackage ./nix/package.nix {
             inherit craneLib;
             src = inputs.self;
           };
         in
         {
           packages = {
-            inherit rsbar;
-            default = rsbar;
+            inherit coolabah;
+            default = coolabah;
           };
 
           checks = {
-            inherit (rsbar.passthru) clippy tests;
+            inherit (coolabah.passthru) clippy tests;
           };
 
           devenv.shells.default = {
             imports = [ ./devenv.nix ];
-            # `devenv.nix` reaches for `inputs.rust-overlay`; under flake-parts
-            # the flake's own inputs are what it gets.
-            _module.args.inputs = inputs;
+            devenv.root =
+              let
+                root = builtins.readFile inputs.devenv-root.outPath;
+              in
+              lib.mkIf (root != "") root;
           };
         };
     };

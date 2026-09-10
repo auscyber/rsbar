@@ -7,11 +7,11 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
-repository = "https://github.com/auscyber/rsbar"
+repository = "https://github.com/auscyber/coolabah"
 
 [workspace.dependencies]
-rsbar-protocol = { path = "crates/protocol" }
-rsbar-protocol-macros = { path = "crates/protocol-macros" }
+coolabah-protocol = { path = "crates/protocol" }
+coolabah-protocol-macros = { path = "crates/protocol-macros" }
 skylight = { path = "crates/skylight" }
 skylight-macros = { path = "crates/skylight-macros" }
 
@@ -95,5 +95,5 @@ strip = false
 # A real `.dSYM`, not the default split DWARF. On macOS `unpacked` leaves the
 # debug info in the `.o` files and records absolute paths to them in the
 # binary; when that mapping does not line up, Instruments symbolicates nothing
-# and every rsbar frame in the flamegraph is a bare hex address, silently.
+# and every coolabah frame in the flamegraph is a bare hex address, silently.
 split-debuginfo = "packed"

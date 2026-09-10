@@ -274,7 +274,7 @@ fn reader(patch: &Ident, scalar: Option<&Ident>) -> TokenStream {
                 fn deserialize<D: ::serde::Deserializer<'de>>(
                     deserializer: D,
                 ) -> ::std::result::Result<Self, D::Error> {
-                    deserializer.deserialize_map(::rsbar_protocol::patch::Reader::<Self>::new())
+                    deserializer.deserialize_map(::coolabah_protocol::patch::Reader::<Self>::new())
                 }
             }
         };
@@ -319,7 +319,7 @@ fn reader(patch: &Ident, scalar: Option<&Ident>) -> TokenStream {
                 map: A,
             ) -> ::std::result::Result<#patch, A::Error> {
                 ::serde::de::Visitor::visit_map(
-                    ::rsbar_protocol::patch::Reader::<#patch>::new(),
+                    ::coolabah_protocol::patch::Reader::<#patch>::new(),
                     map,
                 )
             }
@@ -473,7 +473,7 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
         // `Option<M>` uniformly: `Some(())` for a leaf that moved, and the
         // nested record for a field that is itself patched.
         let moved_ty = quote! {
-            <#ty as ::rsbar_protocol::Changes<#target_ty>>::Moved
+            <#ty as ::coolabah_protocol::Changes<#target_ty>>::Moved
         };
         record.push(quote! {
             #(#docs)*
@@ -498,7 +498,7 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
                 &self,
                 current: &#target_ty,
             ) -> ::std::option::Option<::std::borrow::Cow<'_, #target_ty>> {
-                ::rsbar_protocol::Changes::changed(self.#ident.as_ref()?, current)
+                ::coolabah_protocol::Changes::changed(self.#ident.as_ref()?, current)
             }
 
             #[doc = #writing]
@@ -514,7 +514,7 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
             moved.#ident = self
                 .#ident
                 .as_ref()
-                .and_then(|change| ::rsbar_protocol::Changes::moved(change, &current.#ident))
+                .and_then(|change| ::coolabah_protocol::Changes::moved(change, &current.#ident))
                 .map(|(value, detail)| {
                     next.#ident = ::std::borrow::Cow::into_owned(value);
                     detail
@@ -525,7 +525,7 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
                 self.#ident = ::std::option::Option::Some(
                     match self.#ident.take() {
                         ::std::option::Option::Some(mine) => {
-                            use ::rsbar_protocol::patch::Fold as _;
+                            use ::coolabah_protocol::patch::Fold as _;
                             mine.folded(value)
                         }
                         ::std::option::Option::None => value,
@@ -535,13 +535,13 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
         });
 
         if *flatten {
-            nested_keys.push(quote!(<#ty as ::rsbar_protocol::patch::Fields>::KEYS));
+            nested_keys.push(quote!(<#ty as ::coolabah_protocol::patch::Fields>::KEYS));
             // Tried on a copy, so a key none of them claims does not leave an
             // empty sub-patch behind that `Default` would then differ from.
             flat_arms.push(quote! {
                 {
                     let mut child = self.#ident.take().unwrap_or_default();
-                    let claimed = ::rsbar_protocol::patch::Patch::absorb(&mut child, key, map)?;
+                    let claimed = ::coolabah_protocol::patch::Patch::absorb(&mut child, key, map)?;
                     if claimed || child != ::std::default::Default::default() {
                         self.#ident = ::std::option::Option::Some(child);
                     }
@@ -603,7 +603,7 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
                         self.#ident = ::std::option::Option::Some(
                             match self.#ident.take() {
                                 ::std::option::Option::Some(mine) => {
-                                    use ::rsbar_protocol::patch::Fold as _;
+                                    use ::coolabah_protocol::patch::Fold as _;
                                     mine.folded(value)
                                 }
                                 ::std::option::Option::None => value,
@@ -652,7 +652,7 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
         } else {
             built.push(quote! {
                 #ident: match self.#ident.as_ref() {
-                    ::std::option::Option::Some(change) => ::rsbar_protocol::Changes::changes(
+                    ::std::option::Option::Some(change) => ::coolabah_protocol::Changes::changes(
                         change,
                         &<#target_ty as ::std::default::Default>::default(),
                     )
@@ -686,7 +686,7 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
          \n\
          # Errors\n\
          \n\
-         Returns [`Missing`](rsbar_protocol::patch::Missing) naming every\n\
+         Returns [`Missing`](coolabah_protocol::patch::Missing) naming every\n\
          required property this patch does not set."
     );
     Ok(quote! {
@@ -709,14 +709,14 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
 
         #(#seeds)*
 
-        impl ::rsbar_protocol::patch::Fields for #patch {
+        impl ::coolabah_protocol::patch::Fields for #patch {
             const WHAT: &'static str = #what;
             const KEYS: &'static [&'static str] = &[#(#own_keys),*];
             const NESTED: &'static [&'static [&'static str]] = &[#(#nested_keys),*];
             const GAPS: &'static [(&'static str, &'static str)] = &[#(#gaps),*];
         }
 
-        impl<'de> ::rsbar_protocol::patch::Patch<'de> for #patch {
+        impl<'de> ::coolabah_protocol::patch::Patch<'de> for #patch {
             fn absorb<A: ::serde::de::MapAccess<'de>>(
                 &mut self,
                 key: &str,
@@ -742,7 +742,7 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
             /// rather than replacing what is under it whole.
             ///
             /// Inherent rather than an impl of
-            /// [`Fold`](rsbar_protocol::patch::Fold), so it wins method
+            /// [`Fold`](coolabah_protocol::patch::Fold), so it wins method
             /// resolution against that trait's blanket "the later value
             /// replaces the earlier" — which is the right answer for a leaf
             /// and the wrong one for a patch.
@@ -763,9 +763,9 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
             /// The same, as the error a front end shows, or `None` when
             /// nothing is missing.
             #[must_use]
-            pub fn missing(&self) -> ::std::option::Option<::rsbar_protocol::patch::Missing> {
-                ::rsbar_protocol::patch::Missing::new(
-                    <Self as ::rsbar_protocol::patch::Fields>::WHAT,
+            pub fn missing(&self) -> ::std::option::Option<::coolabah_protocol::patch::Missing> {
+                ::coolabah_protocol::patch::Missing::new(
+                    <Self as ::coolabah_protocol::patch::Fields>::WHAT,
                     self.absent_fields(),
                 )
             }
@@ -774,7 +774,7 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
             pub fn construct(
                 &self,
                 #(#skipped_args),*
-            ) -> ::std::result::Result<#target, ::rsbar_protocol::patch::Missing> {
+            ) -> ::std::result::Result<#target, ::coolabah_protocol::patch::Missing> {
                 if let ::std::option::Option::Some(missing) = self.missing() {
                     return ::std::result::Result::Err(missing);
                 }
@@ -803,7 +803,7 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
             }
         }
 
-        impl ::rsbar_protocol::Changes<#target> for #patch {
+        impl ::coolabah_protocol::Changes<#target> for #patch {
             type Moved = #record_name;
 
             /// Owned by construction: a whole new value has to be built, and

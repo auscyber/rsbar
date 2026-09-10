@@ -118,6 +118,12 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
             let #name = ::skylight::MainThread::new(unsafe {
                 ::objc2::MainThreadMarker::new_unchecked()
             });
+            // Establishes the process's one window server connection here,
+            // where main-thread proof is free, rather than leaving it to
+            // whichever call happens to be first. A consumer that only ever
+            // reads windows through `skylight::sys` and never builds a
+            // `skylight::Window` would otherwise never establish it at all.
+            let _ = ::skylight::establish(&#name);
             #passed
             #block
         }
@@ -130,11 +136,13 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// Matched on the last one or two path segments, so `Window::new`,
 /// `skylight::Window::new` and `crate::Window::new` all count. Everything else
-/// in this crate either needs no proof or carries it in an argument it already
-/// takes — `draw(&window, ..)` is proof by virtue of the window.
+/// in this crate either needs no proof, carries it in an argument it already
+/// takes (`draw(&connected, proof, &window, ..)`, spelled out because the
+/// argument list already mixes a lock and a marker), or — like
+/// [`::skylight::batched`] — acquires [`::skylight::Connected`] itself
+/// instead of being handed proof.
 const SUPPLIED: &[(&[&str], Where)] = &[
     (&["Window", "new"], Where::Last),
-    (&["batched"], Where::First),
     (&["without_implicit_animations"], Where::First),
 ];
 
@@ -142,8 +150,8 @@ const SUPPLIED: &[(&[&str], Where)] = &[
 ///
 /// Not a convention this could assume: proof reads best last after a plain
 /// value (`Window::new(frame, proof)`) and first before a closure
-/// (`batched(proof, || ..)`), because a closure wants to be the argument the
-/// eye ends on.
+/// (`without_implicit_animations(proof, || ..)`), because a closure wants to
+/// be the argument the eye ends on.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Where {
     First,
@@ -156,15 +164,19 @@ enum Where {
 /// Goes on an `unsafe extern` block and applies to everything in it that does
 /// not already carry proof: each such declaration is made private and given a
 /// public wrapper of the same name that takes proof first. A declaration whose
-/// first argument is a `ConnectionId` is left alone — that type is
-/// main-thread-only itself, so having one to pass *is* the proof. Which is why the calls that need proof and
-/// the calls that do not live in two separate blocks — the split is the
-/// statement, rather than a marker to be read one line at a time.
+/// first argument is a `ConnectionId` is left exactly as declared instead —
+/// not because that type is proof of anything (it is a plain `Send` id; see
+/// its own doc comment), but because the wrapper's only job is to occupy an
+/// argument slot the raw declaration lacks, and one that already takes a
+/// connection has nowhere to put a second thing to remember. Correctness for
+/// those calls is whatever this crate's own callers already establish —
+/// [`crate::Connected`] for a call that has to be exclusive, the connection
+/// simply existing for one that does not — not this attribute.
 ///
 /// ```ignore
 /// #[skylight::main_thread_ffi]
 /// unsafe extern "C" {
-///     pub fn SLSDisableUpdate(cid: ConnectionId) -> CGError;
+///     pub fn SLSSetWindowAlpha(cid: ConnectionId, wid: WindowId, alpha: f32) -> CGError;
 /// }
 ///
 /// // A block of its own, and the comment above it says why.
@@ -173,9 +185,10 @@ enum Where {
 /// }
 /// ```
 ///
-/// So `ffi::SLSDisableUpdate(proof, cid)` is the only way to reach it, from
-/// inside this crate as much as outside — which matters, because this crate
-/// is where the 85 `unsafe` blocks that call these live.
+/// So `ffi::SLSMainConnectionID(proof)` — the one declaration in this block
+/// with no `ConnectionId` argument to be left alone by — is only reachable
+/// with proof, from inside this crate as much as outside; the same goes for
+/// every other wrapped declaration.
 ///
 /// # Why the block and not each declaration
 ///
@@ -211,10 +224,11 @@ pub fn main_thread_ffi(attr: TokenStream, item: TokenStream) -> TokenStream {
             continue;
         };
 
-        // A call whose first argument is the connection is already gated: a
-        // `ConnectionId` is main-thread-only itself, so having one to pass is
-        // the proof, and a second argument saying the same thing would be
-        // noise. Left exactly as declared.
+        // A call whose first argument is the connection has nowhere to put a
+        // wrapper's proof parameter without it being a second thing to
+        // remember that says nothing the first didn't -- see this macro's own
+        // doc comment for what actually makes these calls safe to reach.
+        // Left exactly as declared.
         if first_is_connection(&declared.sig) {
             continue;
         }
@@ -353,40 +367,43 @@ pub fn derive_main_thread_only(item: TokenStream) -> TokenStream {
 ///
 /// ```ignore
 /// #[main_thread]
-/// fn open(frame: CGRect) -> skylight::Result<Window> {
-///     let window = Window::new(frame)?;   // proof supplied by the attribute
-///     window.set_alpha(1.0)?;             // proof came with the value
-///     skylight::batched(|| { /* .. */ }); // supplied too
+/// fn open(frame: CGRect, connected: &skylight::Connected) -> skylight::Result<Window> {
+///     let window = Window::new(frame)?;         // proof supplied by the attribute
+///     window.set_alpha(connected, 1.0)?;        // `connected` is a lock, not proof — passed like any other argument
+///     skylight::without_implicit_animations(|| { /* .. */ }); // proof supplied too
 ///     Ok(window)
 /// }
 ///
 /// // and a caller passes the proof it was given:
-/// let window = open(mtm, frame)?;
+/// let window = open(mtm, frame, connected)?;
 /// ```
 ///
 /// The marker is also bound as `mtm` for anything the list below does not
 /// cover — `#[main_thread(marker)]` names it something else.
 ///
 /// The list is not closed: `#[main_thread(also(open_panel, Sheet::new))]`
-/// adds calls of your own, whose proof is taken to be their last argument. It has to be
-/// said per function rather than registered once, because a macro cannot keep
-/// state a later crate's compilation would see — each crate is its own rustc
-/// invocation with its own expansion, in an order nothing promises.
+/// adds calls of your own, whose proof is taken to be their first argument —
+/// after `self`, for a method. It has to be said per function rather than
+/// registered once, because a macro cannot keep state a later crate's
+/// compilation would see — each crate is its own rustc invocation with its
+/// own expansion, in an order nothing promises.
 ///
 /// # What it rewrites, and the one thing to know about it
 ///
-/// A fixed list: `Window::new`, `batched`, `without_implicit_animations` —
-/// every call in this crate that takes proof and has no argument able to
-/// carry it. Matching is **by name**, on the last one or two path segments,
-/// because an attribute macro runs before name resolution and cannot ask what
-/// a path means. A local `Window::new` of your own, inside an annotated
-/// function, would be rewritten too. Within a codebase that imports
-/// `skylight::Window` that has not come up, and the failure is a compile
-/// error about arity rather than anything silent.
+/// A fixed list: `Window::new`, `without_implicit_animations` — every call in
+/// this crate that takes proof and has no argument able to carry it.
+/// [`::skylight::Connected`]-taking calls are not in it: a lock is something a
+/// caller has to have acquired, not something this attribute can conjure, so
+/// those are always written out by hand. Matching is **by name**, on the last
+/// one or two path segments, because an attribute macro runs before name
+/// resolution and cannot ask what a path means. A local `Window::new` of your
+/// own, inside an annotated function, would be rewritten too. Within a
+/// codebase that imports `skylight::Window` that has not come up, and the
+/// failure is a compile error about arity rather than anything silent.
 ///
-/// Method calls are never rewritten. They do not need to be: a
-/// `skylight::Window` can only have been made on the main thread and cannot
-/// leave it, so every method on one is already proof of where it is.
+/// Method calls are never rewritten — `Window::new` is a free function, and
+/// every method on the value it returns takes a `&Connected` it has to be
+/// handed, not proof this attribute could supply.
 ///
 /// # Why the parameter, rather than a check
 ///

@@ -38,10 +38,10 @@ impl Entry {
             } else {
                 quote!(fields)
             };
-            quote!(fields.extend(::rsbar_protocol::event::EnvFields::#call(#value));)
+            quote!(fields.extend(::coolabah_protocol::event::EnvFields::#call(#value));)
         });
         quote! {
-            fields.insert(#key, ::rsbar_protocol::event::Field::to_field(#value));
+            fields.insert(#key, ::coolabah_protocol::event::Field::to_field(#value));
             #project
         }
     }
@@ -67,7 +67,7 @@ impl Entry {
             };
             quote! {
                 fields.extend(
-                    ::rsbar_protocol::event::EnvFields::#call(
+                    ::coolabah_protocol::event::EnvFields::#call(
                         &<#ty as ::std::default::Default>::default(),
                     )
                     .into_keys()
@@ -100,7 +100,7 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
     let ident = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     Ok(quote! {
-        impl #impl_generics ::rsbar_protocol::event::EnvFields for #ident #ty_generics
+        impl #impl_generics ::coolabah_protocol::event::EnvFields for #ident #ty_generics
             #where_clause
         {
             fn fields(

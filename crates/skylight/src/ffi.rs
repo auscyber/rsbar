@@ -41,6 +41,17 @@ impl ConnectionId {
     pub(crate) const fn new(id: c_int) -> Self {
         Self(id)
     }
+
+    /// Wraps a raw number the window server itself handed back as a
+    /// connection id — [`crate::sys::window::SLSGetWindowOwner`]'s out
+    /// parameter, which names another window's owner rather than this
+    /// process's own connection. That id is not exclusive-use in the sense
+    /// [`crate::Connected`] is; it is only ever a value to pass on to a
+    /// further read, such as `SLSConnectionGetPID`.
+    #[must_use]
+    pub const fn from_raw(id: c_int) -> Self {
+        Self(id)
+    }
 }
 
 /// A window server window number — the same value `NSWindow.windowNumber` and

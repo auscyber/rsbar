@@ -21,9 +21,10 @@ objc2-quartz-core = { workspace = true, features = ["CALayer", "CATransaction", 
 # runtime. `callback::Events` implements it so a source's future composes with
 # whatever drives it.
 futures-core = { workspace = true }
-# `callback::relay`'s queue. A sender that is synchronous, infallible for want
-# of room and callable from any thread is exactly what a C callback needs, and
-# writing one again is how the 316-line version of this module happened.
+# `callback::relay`'s queue, and `connection`'s exclusive-use lock over the
+# one window server connection. The workspace's feature set (`rt-multi-thread`
+# included) comes along with `workspace = true`, which is what lets an example
+# build a runtime to call the async entry points this crate now has.
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

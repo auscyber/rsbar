@@ -71,7 +71,7 @@
 //! cross-checked against a reference implementation actually using them for
 //! this purpose.
 //!
-//! Checked live instead, through `rsbar`'s own bar rather than an isolated
+//! Checked live instead, through `coolabah`'s own bar rather than an isolated
 //! window (`skylight/examples/window_tags.rs` has the detail) — see
 //! [`WindowTags::STICKY`] and [`WindowTags::FRIEND_OF_FULLSCREEN`] for what
 //! that check found.

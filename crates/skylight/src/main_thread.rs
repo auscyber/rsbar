@@ -7,19 +7,22 @@
 //!
 //! It starts at [`macro@crate::main`], which mints the process's one marker in
 //! `fn main` — where Rust already guarantees the thread, so there is nothing
-//! to ask. From there it travels three ways:
+//! to ask. From there it travels two ways:
 //!
 //! - **by value**, as an argument, which is what [`macro@crate::main_thread`]
 //!   adds to a signature and binds in a body;
-//! - **inside a value**, because a [`crate::Window`] can only have been built
-//!   with proof and is `!Send` — so every method on one, and every function
-//!   taking one like `draw` or `present`, has its proof already;
 //! - **through a run loop callout**, because a source registered on the main
 //!   thread is only ever called out on it.
 //!
-//! Which leaves the two calls with nothing able to carry it — making a window,
-//! and suspending the whole display's compositing — and inside
-//! [`macro@crate::main_thread`] even those are not written out:
+//! A [`crate::Window`] used to be the third way — built with proof and `!Send`,
+//! so every method on it carried its own. It no longer does: what a method on
+//! a window needs is exclusive use of the one connection, which is
+//! [`crate::Connected`], acquired with [`crate::acquire`] rather than shown as
+//! a type. The two that remain proof-only — making a window, and
+//! `without_implicit_animations`, which touches Core Animation's own
+//! main-thread-only transaction state — are the ones
+//! [`macro@crate::main_thread`] still writes proof into without it being
+//! spelled out:
 //!
 //! ```no_run
 //! use objc2_core_foundation::CGRect;
@@ -27,11 +30,12 @@
 //!
 //! #[skylight::main_thread]
 //! fn open(frame: CGRect) -> skylight::Result<Window> {
-//!     let window = Window::new(frame)?;                // supplied by the attribute
-//!     window.set_alpha(1.0)?;                          // proof came with the value
-//!     skylight::batched(|| window.order_out());        // supplied too
-//!     skylight::draw(&window, frame.size, |_ctx| ());  // the window *is* the proof
+//!     let window = Window::new(frame)?;              // supplied by the attribute
+//!     skylight::without_implicit_animations(|| {});  // supplied too
 //!     Ok(window)
+//!     // Everything else on `window` takes a `skylight::Connected` — see
+//!     // `skylight::connection` for why that is a lock to acquire rather
+//!     // than proof this attribute could hand over.
 //! }
 //!
 //! #[skylight::main(also(open))]
@@ -148,7 +152,7 @@ impl MainThread {
 /// `Deref` is spent on the marker — that is the conversion a caller wants ten
 /// times as often — so the loop comes out through `AsRef` instead. Anything
 /// taking `impl AsRef<CFRunLoop>` accepts a `MainThread` directly, which is
-/// what `crate` and `rsbar`'s registration calls do, so a caller passes `mtm`
+/// what `crate` and `coolabah`'s registration calls do, so a caller passes `mtm`
 /// and not `mtm.run_loop()`.
 impl AsRef<objc2_core_foundation::CFRunLoop> for MainThread {
     fn as_ref(&self) -> &objc2_core_foundation::CFRunLoop {
@@ -188,19 +192,19 @@ unsafe impl MainThreadProof for MainThread {
 /// an unsatisfied bound gets you the note below, which says what is actually
 /// wrong and how to fix it.
 ///
-/// Two things are proof, and they are the two ways a caller can already be
-/// holding one:
-///
-/// - a [`MainThreadMarker`], which cannot be obtained off the main thread;
-/// - a [`Window`], which cannot have been *made* off it and cannot leave it.
+/// Two things are proof today, both markers rather than values with their own
+/// state: [`MainThreadMarker`], which cannot be obtained off the main thread,
+/// and [`MainThread`], which wraps one with a run loop already read off it.
+/// [`crate::Window`] used to be a third, but no longer is — see this module's
+/// own doc comment for why that moved to a lock instead.
 ///
 /// # Safety
 ///
 /// Unsafe to implement, safe to use — the invariant belongs to whoever adds a
 /// type to that list, not to the callers who then trust it. Implement this only
 /// for a type that **cannot exist on any other thread**, and say why. `!Send`
-/// plus a constructor that took proof is the argument [`Window`] makes; a type
-/// that is merely *usually* on the main thread does not qualify, and the
+/// plus a constructor that took proof is the argument [`MainThread`] makes; a
+/// type that is merely *usually* on the main thread does not qualify, and the
 /// window server calls this authorises would be reached from a worker on the
 /// day it was not.
 #[diagnostic::on_unimplemented(
@@ -210,7 +214,7 @@ unsafe impl MainThreadProof for MainThread {
             show it is there",
     note = "add `#[skylight::main_thread]` to the enclosing function, which binds `mtm` and checks \
             once on entry -- or pass something that already carries the proof, such as a \
-            `&skylight::Window`"
+            `skylight::MainThread`"
 )]
 pub unsafe trait MainThreadProof {
     /// The main thread's run loop.
@@ -230,9 +234,9 @@ pub unsafe trait MainThreadProof {
 
     /// The marker behind the proof.
     ///
-    /// For handing on: a caller holding a [`Window`] can read the marker off
-    /// it and pass that where a borrow of the window would conflict, rather
-    /// than checking the thread again for something it has already proved.
+    /// For handing on: a caller holding a [`MainThread`] can read the marker
+    /// off it and pass that on its own, rather than checking the thread again
+    /// for something it has already proved.
     fn marker(&self) -> MainThreadMarker;
 }
 

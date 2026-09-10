@@ -31,7 +31,7 @@
 //!
 //! What this example cannot show — round-tripping a tag on an isolated
 //! off-screen window says nothing about what it does — was checked live
-//! through the real `rsbard` binary and two full builds of `rsbar::bar`
+//! through the real `coolabah` binary and two full builds of `coolabah::bar`
 //! differing only in `Settings::default()`'s `show_in_fullscreen`/`sticky`:
 //!
 //! - `show_in_fullscreen` (`FRIEND_OF_FULLSCREEN`): full A/B, both
@@ -51,8 +51,8 @@ use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::CGMainDisplayID;
 use skylight::{Window, WindowTags};
 
-fn report(step: &str, changed: bool, window: &Window) {
-    let tags = window.tags().expect("read tags back");
+fn report(step: &str, changed: bool, connected: &skylight::Connected, window: &Window) {
+    let tags = window.tags(connected);
     println!(
         "{step}: changed={changed}, sticky={}, never_sticky={}, friend_of_fullscreen={}",
         tags.contains(WindowTags::STICKY),
@@ -66,39 +66,66 @@ fn main() {
     let mtm = objc2::MainThreadMarker::new().expect("an example runs on the main thread");
     let window = Window::new(frame, mtm).expect("create window");
     println!("created window {}", window.id());
-    // Printed so a real space switch can be told apart from the switch
-    // animation settling back where it started — run this twice around a
-    // manual `ctrl+arrow` and compare.
-    // SAFETY: `window.connection()` is the live process connection.
-    let space = unsafe { skylight::ffi::SLSGetActiveSpace(window.connection()) };
-    println!("active space: {space}");
 
-    let changed = window.set_tags(WindowTags::BAR).expect("set BAR tags");
-    report("after set_tags(BAR)", changed, &window);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("build a runtime");
+    rt.block_on(async {
+        let connected = skylight::acquire().await;
 
-    let changed = window.set_sticky(true).expect("set sticky");
-    report("set_sticky(true)", changed, &window);
+        // Printed so a real space switch can be told apart from the switch
+        // animation settling back where it started — run this twice around a
+        // manual `ctrl+arrow` and compare.
+        // SAFETY: `connected.id()` is the live process connection.
+        let space = unsafe { skylight::ffi::SLSGetActiveSpace(connected.id()) };
+        println!("active space: {space}");
 
-    let changed = window.set_sticky(true).expect("set sticky again");
-    report("set_sticky(true) again", changed, &window);
+        let changed = window
+            .set_tags(&connected, WindowTags::BAR)
+            .expect("set BAR tags");
+        report("after set_tags(BAR)", changed, &connected, &window);
 
-    let changed = window.set_sticky(false).expect("clear sticky");
-    report("set_sticky(false)", changed, &window);
+        let changed = window.set_sticky(&connected, true).expect("set sticky");
+        report("set_sticky(true)", changed, &connected, &window);
 
-    let changed = window
-        .set_friend_of_fullscreen(true)
-        .expect("set friend_of_fullscreen");
-    report("set_friend_of_fullscreen(true)", changed, &window);
+        let changed = window
+            .set_sticky(&connected, true)
+            .expect("set sticky again");
+        report("set_sticky(true) again", changed, &connected, &window);
 
-    let changed = window
-        .set_friend_of_fullscreen(true)
-        .expect("set friend_of_fullscreen again");
-    report("set_friend_of_fullscreen(true) again", changed, &window);
+        let changed = window.set_sticky(&connected, false).expect("clear sticky");
+        report("set_sticky(false)", changed, &connected, &window);
 
-    let changed = window
-        .set_friend_of_fullscreen(false)
-        .expect("clear friend_of_fullscreen");
-    report("set_friend_of_fullscreen(false)", changed, &window);
+        let changed = window
+            .set_friend_of_fullscreen(&connected, true)
+            .expect("set friend_of_fullscreen");
+        report(
+            "set_friend_of_fullscreen(true)",
+            changed,
+            &connected,
+            &window,
+        );
+
+        let changed = window
+            .set_friend_of_fullscreen(&connected, true)
+            .expect("set friend_of_fullscreen again");
+        report(
+            "set_friend_of_fullscreen(true) again",
+            changed,
+            &connected,
+            &window,
+        );
+
+        let changed = window
+            .set_friend_of_fullscreen(&connected, false)
+            .expect("clear friend_of_fullscreen");
+        report(
+            "set_friend_of_fullscreen(false)",
+            changed,
+            &connected,
+            &window,
+        );
+    });
 
     let display = CGMainDisplayID();
     println!(

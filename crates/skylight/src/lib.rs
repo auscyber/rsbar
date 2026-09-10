@@ -1,9 +1,13 @@
 //! Bindings to the private window server API behind `SkyLight.framework`.
 //!
-//! A status bar needs three things `AppKit` will not give a borderless window:
-//! a level above the menu bar, presence on every space including over a
-//! fullscreen app, and a drawing surface with no view hierarchy attached. All
-//! three come from the window server directly.
+//! [`Window`] is for a caller that wants what `AppKit` will not give a
+//! borderless window: a level above the menu bar, presence on every space
+//! including over a fullscreen app, and a drawing surface with no view
+//! hierarchy attached — a status bar's three requirements, and all three come
+//! from the window server directly. [`Foreign`] and [`sys`] are for a caller
+//! that mostly wants to ask about *other* processes' windows instead — a
+//! window manager's more usual shape — and need no window of their own to do
+//! it.
 //!
 //! # Run loop
 //!
@@ -69,7 +73,7 @@ pub fn register_notify<S: Send + Sync + 'static>(
     event: u32,
     state: std::sync::Arc<S>,
 ) -> Result<callback::Callback<S>> {
-    callback::Callback::new(state, |context| {
+    callback::Callback::outliving(state, |context| {
         // SAFETY: `proc` is a trampoline built for the `S` behind `context`,
         // whose weak count the callback keeps for good.
         let status = unsafe { ffi::SLSRegisterNotifyProc(proc, event, context) };
@@ -95,4 +99,6 @@ pub fn register_notify<S: Send + Sync + 'static>(
 pub use render::{SavedState, draw, draw_damaged, present, without_implicit_animations};
 pub use skylight_macros::{MainThreadOnly, main, main_thread};
 pub use tags::WindowTags;
-pub use window::{Window, batched, capture, level, true_rect};
+pub use window::{
+    Foreign, Window, batched, batched_with, capture, level, true_rect, windows_on_spaces,
+};

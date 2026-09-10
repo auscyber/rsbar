@@ -1,4 +1,4 @@
-//! The wire vocabulary shared by the rsbar daemon, its CLI and its Lua module.
+//! The wire vocabulary shared by the coolabah daemon, its CLI and its Lua module.
 //!
 //! This crate is the protocol. Everything that crosses a process boundary is
 //! defined here exactly once, so a client cannot drift from the daemon.
@@ -7,20 +7,21 @@
 
 // So the code `#[derive(EnvFields)]` generates can name this crate by the one
 // path that works everywhere, here included.
-extern crate self as rsbar_protocol;
+extern crate self as coolabah_protocol;
 
 pub mod event;
 pub mod json;
+pub mod naming;
 pub mod patch;
 pub mod style;
 pub mod wire;
 
+pub use coolabah_protocol_macros::{Changes, EnvFields, Spelling, events};
 pub use event::{
     EnvFields, Event, EventName, Field, Kind, Modifiers, MouseButton, NotificationName, PowerSource,
 };
 pub use json::Json;
 pub use patch::Missing;
-pub use rsbar_protocol_macros::{Changes, EnvFields, Spelling, events};
 pub use style::{Color, FontSpec};
 
 use serde::de::DeserializeSeed;
@@ -34,7 +35,7 @@ use std::str::FromStr;
 /// Overridable so a development build can run beside an installed one.
 #[must_use]
 pub fn service_name() -> String {
-    std::env::var("RSBAR_SERVICE").unwrap_or_else(|_| "com.auscyber.rsbar".to_owned())
+    std::env::var(name!(env "SERVICE")).unwrap_or_else(|_| name!(service).to_owned())
 }
 
 /// Which side of the host item a popup's own edge lines up with --
@@ -407,7 +408,7 @@ impl ItemName {
     /// An alias names the menu bar item it mirrors — `Control Centre,Clock` —
     /// so a name has to carry a comma and a space, and the character set is
     /// only as narrow as the daemon's own handling requires. A name reaches a
-    /// script as the value of `RSBAR_NAME` and never as part of the command
+    /// script as the value of `COOLABAH_NAME` and never as part of the command
     /// string, so a shell never re-parses one; what it cannot survive is a
     /// control character, which an env var cannot carry.
     ///
@@ -575,7 +576,7 @@ mod parts {
     #[changes(derive(Debug, Clone, Default, PartialEq))]
     #[changes(scalar = text)]
     pub struct Run {
-        /// `SketchyBar` calls this property `string`; rsbar calls the field
+        /// `SketchyBar` calls this property `string`; coolabah calls the field
         /// `text` since that is what it is. The patch struct accepts both
         /// spellings, so neither client has to know which name won.
         #[serde(alias = "string")]
@@ -657,7 +658,7 @@ pub enum Query {
     MenuItems,
     /// The frontmost application's own menu titles, in on-screen order,
     /// starting with the Apple menu. Not mirrorable, only listable: see
-    /// `rsbar::menus`.
+    /// `coolabah::menus`.
     #[spell("app_menus", "app-menus")]
     AppMenus,
     /// The properties [`Request::SetDefault`] has stashed, applied to every
@@ -673,14 +674,14 @@ pub enum InvalidQuery {
     /// A real `SketchyBar` query this daemon does not support yet — distinct
     /// from [`Self::Unknown`] so a config gets told the difference between a
     /// typo and a thing genuinely not implemented.
-    #[error("`{0}` is a real SketchyBar query rsbar does not support yet: {1}")]
+    #[error("`{0}` is a real SketchyBar query coolabah does not support yet: {1}")]
     Unsupported(String, &'static str),
     #[error(transparent)]
     Name(#[from] InvalidName),
 }
 
 impl Query {
-    /// Every word the table did not claim: a query `SketchyBar` has and rsbar
+    /// Every word the table did not claim: a query `SketchyBar` has and coolabah
     /// does not, or an item name.
     ///
     /// The unsupported pair is refused here rather than spelled as variants,
@@ -690,7 +691,7 @@ impl Query {
         match text {
             "events" => Err(InvalidQuery::Unsupported(
                 text.to_owned(),
-                "rsbar does not track registered custom events",
+                "coolabah does not track registered custom events",
             )),
             "displays" => Err(InvalidQuery::Unsupported(
                 text.to_owned(),
@@ -778,7 +779,7 @@ pub enum Relative {
 /// bracket takes members instead of a position, and nothing on the daemon
 /// side can draw a space, graph or slider yet.
 ///
-/// `Alias` is spelled out separately from `Item` even though rsbar treats
+/// `Alias` is spelled out separately from `Item` even though coolabah treats
 /// them identically — the mirror target is set afterward, by a chained
 /// `--set <name> alias=...` — because that is what `--add` itself spells.
 /// Which component `--add` names, before it is known where it goes.
@@ -1074,12 +1075,12 @@ pub struct Geometry {
 #[changes(name = ScriptingPatch, what = "an item")]
 #[changes(derive(Debug, Clone, Default, PartialEq))]
 pub struct Scripting {
-    /// Run on every update. Receives `RSBAR_NAME`, `RSBAR_SENDER` and the
+    /// Run on every update. Receives `COOLABAH_NAME`, `COOLABAH_SENDER` and the
     /// event's payload as named variables. An empty string removes it.
     #[changes(as = String)]
     pub script: Option<String>,
-    /// Run when this item is clicked. Receives the same, plus `RSBAR_BUTTON`
-    /// and `RSBAR_MODIFIERS`. An empty string removes it.
+    /// Run when this item is clicked. Receives the same, plus `COOLABAH_BUTTON`
+    /// and `COOLABAH_MODIFIERS`. An empty string removes it.
     #[changes(as = String)]
     pub click_script: Option<String>,
     /// Seconds between routine updates. Zero means "only on subscribed
@@ -1155,7 +1156,7 @@ pub struct ItemState {
     /// `--query menu-items` lists. An empty string stops mirroring.
     ///
     /// A config may also write `alias = { color = ... }` to tint what it
-    /// mirrors; rsbar has no field for the tint, so that table is named and
+    /// mirrors; coolabah has no field for the tint, so that table is named and
     /// dropped — see [`patch::name_or_tinted`].
     #[changes(as = String, read_with = patch::name_or_tinted)]
     pub alias: Option<String>,
@@ -1793,7 +1794,7 @@ mod tests {
     #[test]
     fn run_patch_names_an_unknown_property_without_losing_the_rest() {
         // A stray key is reported and dropped rather than failing the whole
-        // patch: one property rsbar has no field for must not stop the other
+        // patch: one property coolabah has no field for must not stop the other
         // forty from coming up. See [`crate::patch`].
         let patch = serde_json::from_str::<RunPatch>(r#"{"wat": 1, "color": "0xffff0000"}"#)
             .expect("a stray key is named, not rejected");

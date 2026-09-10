@@ -127,7 +127,7 @@ pub(crate) fn expand(events: &Events) -> TokenStream {
                 Default,
                 ::serde::Serialize,
                 ::serde::Deserialize,
-                ::rsbar_protocol::EnvFields,
+                ::coolabah_protocol::EnvFields,
             )]
             pub struct #payload { #(#fields)* }
         }

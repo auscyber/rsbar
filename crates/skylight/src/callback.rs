@@ -47,8 +47,10 @@ pub struct Callback<S> {
     /// — which is `Send` whenever its events are. Nothing has to be asserted.
     stop: Option<Box<dyn FnOnce()>>,
     /// The `Weak` handed to the registration, as the pointer it was given.
-    /// Taken back on drop unless `reclaim` says it cannot be.
     context: *const S,
+    /// Whether dropping takes that reference back. False only for
+    /// [`Callback::outliving`].
+    reclaim: bool,
 }
 
 impl<S> Callback<S> {
@@ -90,12 +92,39 @@ impl<S> Callback<S> {
     where
         Stop: FnOnce() + 'static,
     {
-        Self::install(state, install)
+        Self::install(state, install, true)
+    }
+
+    /// [`Callback::new`] for a registration that can still fire after its
+    /// teardown has run.
+    ///
+    /// The weak reference is *not* taken back, so the control block outlives
+    /// this and a late callback finds a pointer it can still reconstruct: it
+    /// upgrades to `None` and does nothing. The cost is that allocation, for
+    /// the life of the process — which is the price of the guarantee, and only
+    /// worth paying where the guarantee is actually needed.
+    ///
+    /// One caller: `SLSRegisterNotifyProc`. `SLSRemoveNotifyProc` reports
+    /// success whether or not it matched anything, so there is no way to know
+    /// the procedure is really gone.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `install` fails with.
+    pub fn outliving<Stop, E>(
+        state: Arc<S>,
+        install: impl FnOnce(*mut c_void) -> Result<Stop, E>,
+    ) -> Result<Self, E>
+    where
+        Stop: FnOnce() + 'static,
+    {
+        Self::install(state, install, false)
     }
 
     fn install<Stop, E>(
         state: Arc<S>,
         install: impl FnOnce(*mut c_void) -> Result<Stop, E>,
+        reclaim: bool,
     ) -> Result<Self, E>
     where
         Stop: FnOnce() + 'static,
@@ -111,6 +140,7 @@ impl<S> Callback<S> {
                     state,
                     stop: Some(Box::new(stop)),
                     context: context.cast::<S>().cast_const(),
+                    reclaim,
                 })
             }
             Err(err) => {
@@ -175,13 +205,15 @@ impl<S> Callback<S> {
 impl<S> Drop for Callback<S> {
     fn drop(&mut self) {
         self.stop();
-        // SAFETY: `context` came from `Weak::into_raw` in `install` and went to
-        // exactly one registration, which `stop` above has just taken down --
-        // so nothing is inside `with` holding a reconstructed copy, and nothing
-        // can arrive to make one. Deregistering tears the whole thing down;
-        // leaving the control block behind was 48 bytes a registration for the
-        // life of the process.
-        drop(unsafe { Weak::from_raw(self.context) });
+        if self.reclaim {
+            // SAFETY: `context` came from `Weak::into_raw` in `install` and
+            // went to exactly one registration, which `stop` above has just
+            // taken down -- an authoritative teardown, on the thread delivery
+            // happens on, so nothing is inside `with` holding a reconstructed
+            // copy and nothing can arrive to make one. Leaving it behind cost
+            // 48 bytes a registration for the life of the process.
+            drop(unsafe { Weak::from_raw(self.context) });
+        }
         // `state` goes next, on its own: released after the teardown, never
         // before it.
     }
@@ -574,8 +606,14 @@ mod tests {
 
     #[test]
     fn a_dropped_registration_does_nothing_and_answers_what_was_declared() {
+        // `outliving`, because that is the whole of what this asserts: a
+        // registration that may still fire after teardown keeps its control
+        // block, so the late call finds a pointer it can reconstruct and
+        // upgrade to `None`. `Callback::new` reclaims instead, and calling a
+        // trampoline after dropping one of those is a use-after-free rather
+        // than a defined answer.
         let mut context = std::ptr::null_mut();
-        let watch = Callback::new(Arc::new(AtomicU32::new(7)), |ctx| {
+        let watch = Callback::outliving(Arc::new(AtomicU32::new(7)), |ctx| {
             context = ctx;
             Ok::<_, ()>(|| {})
         })

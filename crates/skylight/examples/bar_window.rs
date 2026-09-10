@@ -22,39 +22,51 @@ fn main() {
 
     let mtm = objc2::MainThreadMarker::new().expect("an example runs on the main thread");
     let window = Window::new(frame, mtm).expect("create window");
-    window.set_scale(2.0).expect("scale");
-    window.set_opaque(false).expect("opacity");
-    window.set_alpha(1.0).expect("alpha");
-    window.set_level(level::STATUS).expect("level");
-    // `WindowTags::BAR` includes AVOIDS_CAPTURE, which would also hide the bar
-    // from screencapture — so this smoke test can be verified visually.
-    window
-        .set_tags((WindowTags::BAR - WindowTags::AVOIDS_CAPTURE) | WindowTags::IGNORE_FOR_EVENTS)
-        .expect("tags");
 
-    let root = CALayer::new();
-    skylight::without_implicit_animations(mtm, || {
-        root.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), frame.size));
-        root.setContentsScale(2.0);
-        root.setBackgroundColor(Some(&CGColor::new_srgb(0.05, 0.05, 0.08, 0.85)));
+    // A plain current-thread runtime, just to acquire `Connected` -- nothing
+    // here needs a worker pool or a timer.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("build a runtime");
+    rt.block_on(async {
+        let connected = skylight::acquire().await;
+        window.set_scale(&connected, 2.0).expect("scale");
+        window.set_opaque(&connected, false).expect("opacity");
+        window.set_alpha(&connected, 1.0).expect("alpha");
+        window.set_level(&connected, level::STATUS).expect("level");
+        // `WindowTags::BAR` includes AVOIDS_CAPTURE, which would also hide the
+        // bar from screencapture — so this smoke test can be verified visually.
+        window
+            .set_tags(
+                &connected,
+                (WindowTags::BAR - WindowTags::AVOIDS_CAPTURE) | WindowTags::IGNORE_FOR_EVENTS,
+            )
+            .expect("tags");
 
-        // A second layer, so we can see that sublayers composite and that the
-        // y-flip in `present` puts things where they belong.
-        let pill = CALayer::new();
-        pill.setFrame(CGRect::new(
-            CGPoint::new(20.0, 8.0),
-            CGSize::new(120.0, 24.0),
-        ));
-        pill.setContentsScale(2.0);
-        pill.setCornerRadius(12.0);
-        pill.setBackgroundColor(Some(&CGColor::new_srgb(0.35, 0.65, 1.0, 1.0)));
-        root.addSublayer(&pill);
+        let root = CALayer::new();
+        skylight::without_implicit_animations(mtm, || {
+            root.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), frame.size));
+            root.setContentsScale(2.0);
+            root.setBackgroundColor(Some(&CGColor::new_srgb(0.05, 0.05, 0.08, 0.85)));
+
+            // A second layer, so we can see that sublayers composite and that
+            // the y-flip in `present` puts things where they belong.
+            let pill = CALayer::new();
+            pill.setFrame(CGRect::new(
+                CGPoint::new(20.0, 8.0),
+                CGSize::new(120.0, 24.0),
+            ));
+            pill.setContentsScale(2.0);
+            pill.setCornerRadius(12.0);
+            pill.setBackgroundColor(Some(&CGColor::new_srgb(0.35, 0.65, 1.0, 1.0)));
+            root.addSublayer(&pill);
+        });
+
+        // Order in *before* drawing: the window server hands out a drawing
+        // context for a window that is on screen.
+        window.order_above(&connected, None).expect("order in");
+        skylight::present(&connected, mtm, &window, frame.size, &root);
     });
-
-    // Order in *before* drawing: the window server hands out a drawing context
-    // for a window that is on screen.
-    window.order_above(None).expect("order in");
-    skylight::present(&window, frame.size, &root);
 
     println!(
         "window {} up on display {display} at {frame:?}",

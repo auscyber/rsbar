@@ -1,4 +1,4 @@
-//! The declaration macros behind `rsbar-protocol`'s event vocabulary.
+//! The declaration macros behind `coolabah-protocol`'s event vocabulary.
 //!
 //! A proc macro rather than `macro_rules!` for three things `macro_rules!`
 //! cannot do at all: expand to a single enum variant (so the `Kind` list no
@@ -7,7 +7,7 @@
 //! and its expression separately are gone), and upper-case an identifier (so
 //! the `const fn` that did it byte-wise is gone too).
 //!
-//! Nothing here is meant to be used directly: `rsbar-protocol` re-exports
+//! Nothing here is meant to be used directly: `coolabah-protocol` re-exports
 //! both macros, and the code they generate names that crate.
 
 mod changes;
@@ -42,7 +42,7 @@ pub fn events(input: TokenStream) -> TokenStream {
 /// `#[env(name = value)]` on a variant fills one in that it implies rather
 /// than stores.
 ///
-/// [the script environment]: ../rsbar_protocol/event/trait.EnvFields.html
+/// [the script environment]: ../coolabah_protocol/event/trait.EnvFields.html
 #[proc_macro_derive(EnvFields, attributes(env))]
 pub fn derive_env_fields(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as syn::DeriveInput);

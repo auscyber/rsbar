@@ -131,7 +131,7 @@ enum VariantArg {
     Spelling(LitStr),
     /// `parse = path`: `fn(&str) -> Result<Option<Self>, Err>`, for the one
     /// shape a prefix and a suffix cannot express — `Query::Item`, which has
-    /// to reject the queries `SketchyBar` has and rsbar does not before
+    /// to reject the queries `SketchyBar` has and coolabah does not before
     /// taking the word as an item name.
     Parse(Path),
     /// `rest = path`: `fn(&str) -> Result<Self, Err>`, and nothing after it.

@@ -16,7 +16,7 @@
 //! that could not have it, and each one grew a visitor answering `visit_str`
 //! and `visit_map` by hand instead.
 //!
-//! The wire is [`MessagePack`](rsbar_protocol::wire::MessagePack) now:
+//! The wire is [`MessagePack`](coolabah_protocol::wire::MessagePack) now:
 //! `to_vec_named` puts struct field names on the wire, so `deserialize_any`
 //! has something to describe and both `untagged` and `flatten` work. This file
 //! is kept as the standing proof of that, and of what it cost before, so that
@@ -24,7 +24,7 @@
 //! in whichever patch type is converted next.
 
 use async_mach_ports::Codec as _;
-use rsbar_protocol::wire::MessagePack;
+use coolabah_protocol::wire::MessagePack;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
